@@ -126,8 +126,16 @@ hipError_t hip_malloc(void** ptr, size_t size) {
     return hipMalloc(ptr, size);
 }
 
+hipError_t hip_malloc_managed(void** ptr, size_t size) {
+    return hipMallocManaged(ptr, size);
+}
+
 hipError_t hip_free(void* ptr) {
     return hipFree(ptr);
+}
+
+hipError_t hip_memset(void* ptr, int value, size_t size) {
+    return hipMemset(ptr, value, size);
 }
 
 // Memory copy
