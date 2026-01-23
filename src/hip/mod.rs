@@ -109,6 +109,16 @@ extern "C" {
     fn launch_sigmoid_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_squared_relu_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_softplus_decay_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    fn launch_layer_norm_f32(
+        input: *const f32,
+        weight: *const f32,
+        bias: *const f32,
+        output: *mut f32,
+        c: c_int,
+        n: c_int,
+        eps: f32,
+        stream: HipStream
+    ) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1294,6 +1304,126 @@ pub fn hip_softplus_decay(input: &[f32]) -> Result<Vec<f32>> {
     d_output.to_vec(&stream)
 }
 
+/// Launch the layer normalization kernel.
+///
+/// Layer normalization normalizes each vector of length C (channel dimension)
+/// independently. Used in RWKV7 for normalizing activations.
+///
+/// Formula: output = (input - mean) / sqrt(variance + eps) * weight + bias
+///
+/// # Arguments
+/// * `input` - Input tensor of shape [C, N, 1, 1] where C is the channel dimension
+/// * `weight` - Per-channel weight of shape [C, 1, 1, 1]
+/// * `bias` - Per-channel bias of shape [C, 1, 1, 1]
+/// * `output` - Output tensor of shape [C, N, 1, 1]
+/// * `eps` - Epsilon for numerical stability (typically 1e-5)
+/// * `stream` - HIP stream for asynchronous execution
+pub fn layer_norm_f32(
+    input: &TensorHip<f32>,
+    weight: &TensorHip<f32>,
+    bias: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    eps: f32,
+    stream: &Stream,
+) -> Result<()> {
+    // Input shape: [C, N, 1, 1]
+    let c = input.shape()[0];  // Channel dimension (normalize over this)
+    let n = input.shape()[1];  // Number of vectors
+
+    // Validate shapes
+    if output.shape()[0] != c || output.shape()[1] != n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected [{}, {}, 1, 1], got {}",
+                c, n, output.shape()
+            ),
+        });
+    }
+    if weight.shape()[0] != c || bias.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Weight/bias shape mismatch: expected [{}, 1, 1, 1], got weight={}, bias={}",
+                c, weight.shape(), bias.shape()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "layer_norm_f32 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_layer_norm_f32(
+            input.as_ptr(),
+            weight.as_ptr(),
+            bias.as_ptr(),
+            output.as_mut_ptr(),
+            c as c_int,
+            n as c_int,
+            eps,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute layer normalization on host data, returning results.
+/// This is a convenience function for testing.
+///
+/// # Arguments
+/// * `input` - Input data of shape [C, N, 1, 1] flattened (C*N elements)
+/// * `weight` - Weight data of shape [C, 1, 1, 1] (C elements)
+/// * `bias` - Bias data of shape [C, 1, 1, 1] (C elements)
+/// * `c` - Channel dimension (length of each vector to normalize)
+/// * `n` - Number of vectors to normalize
+/// * `eps` - Epsilon for numerical stability
+pub fn hip_layer_norm(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    c: usize,
+    n: usize,
+    eps: f32,
+) -> Result<Vec<f32>> {
+    // Validate sizes
+    if input.len() != c * n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {} ({}*{}), got {}",
+                c * n, c, n, input.len()
+            ),
+        });
+    }
+    if weight.len() != c || bias.len() != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Weight/bias size mismatch: expected {}, got weight={}, bias={}",
+                c, weight.len(), bias.len()
+            ),
+        });
+    }
+
+    let stream = Stream::null();
+
+    // Create tensors with proper shapes
+    let input_shape = TensorShape::new(c, n, 1, 1);
+    let param_shape = TensorShape::new(c, 1, 1, 1);
+
+    let d_input = TensorHip::from_slice(input, input_shape, &stream)?;
+    let d_weight = TensorHip::from_slice(weight, param_shape, &stream)?;
+    let d_bias = TensorHip::from_slice(bias, param_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(input_shape)?;
+
+    layer_norm_f32(&d_input, &d_weight, &d_bias, &mut d_output, eps, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1854,5 +1984,160 @@ mod tests {
         assert!((output[6] - (-0.5)).abs() < 0.01, "softplus_decay(100) should be ≈-0.5, got {}", output[6]);
 
         println!("Softplus decay stability test passed: all {} values are finite", output.len());
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.5 (Layer Normalization Kernel) ===
+
+    #[test]
+    fn test_layer_norm_basic() {
+        // Test basic layer normalization with a simple 2-vector case
+        // Input: 2 vectors of length 4
+        // Shape: [4, 2, 1, 1] where 4 is the channel dimension (fastest axis)
+
+        // Vector 0: [1.0, 2.0, 3.0, 4.0] -> mean=2.5, var=1.25
+        // Vector 1: [0.0, 4.0, 2.0, 6.0] -> mean=3.0, var=5.0
+        let input = vec![
+            1.0, 2.0, 3.0, 4.0,  // vector 0 (elements at offsets 0-3)
+            0.0, 4.0, 2.0, 6.0,  // vector 1 (elements at offsets 4-7)
+        ];
+
+        // Weight = 1.0 (no scaling)
+        let weight = vec![1.0, 1.0, 1.0, 1.0];
+        // Bias = 0.0 (no offset)
+        let bias = vec![0.0, 0.0, 0.0, 0.0];
+
+        let c = 4; // Channel dimension
+        let n = 2; // Number of vectors
+        let eps = 1e-5;
+
+        let output = hip_layer_norm(&input, &weight, &bias, c, n, eps)
+            .expect("layer_norm kernel failed");
+
+        // Expected for vector 0: (x - 2.5) / sqrt(1.25 + eps)
+        // std0 = sqrt(1.25) ≈ 1.118034
+        // normalized: [-1.342, -0.447, 0.447, 1.342]
+        let mean0 = 2.5f32;
+        let std0 = (1.25f32 + eps).sqrt();
+
+        // Expected for vector 1: (x - 3.0) / sqrt(5.0 + eps)
+        // std1 = sqrt(5.0) ≈ 2.236
+        // normalized: [-1.342, 0.447, -0.447, 1.342]
+        let mean1 = 3.0f32;
+        let std1 = (5.0f32 + eps).sqrt();
+
+        let expected = vec![
+            (1.0 - mean0) / std0, (2.0 - mean0) / std0, (3.0 - mean0) / std0, (4.0 - mean0) / std0,
+            (0.0 - mean1) / std1, (4.0 - mean1) / std1, (2.0 - mean1) / std1, (6.0 - mean1) / std1,
+        ];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-4;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={:.6}, expected={:.6}, diff={:.6}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Basic layer_norm test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_layer_norm_with_affine() {
+        // Test layer normalization with weight and bias
+        // Input: 1 vector of length 4
+        // Shape: [4, 1, 1, 1]
+
+        // Vector: [0.0, 2.0, 4.0, 6.0] -> mean=3.0, var=5.0
+        let input = vec![0.0, 2.0, 4.0, 6.0];
+
+        // Weight = [2.0, 1.0, 0.5, 0.0]
+        let weight = vec![2.0, 1.0, 0.5, 0.0];
+        // Bias = [1.0, 0.0, -1.0, 5.0]
+        let bias = vec![1.0, 0.0, -1.0, 5.0];
+
+        let c = 4;
+        let n = 1;
+        let eps = 1e-5;
+
+        let output = hip_layer_norm(&input, &weight, &bias, c, n, eps)
+            .expect("layer_norm with affine failed");
+
+        // normalized = (x - 3.0) / sqrt(5.0 + eps)
+        // then: output = normalized * weight + bias
+        let mean = 3.0f32;
+        let std = (5.0f32 + eps).sqrt();
+
+        let expected: Vec<f32> = (0..4).map(|i| {
+            let x = input[i];
+            let normalized = (x - mean) / std;
+            normalized * weight[i] + bias[i]
+        }).collect();
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-4;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={:.6}, expected={:.6}, diff={:.6}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Layer norm with affine test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_layer_norm_numerical_stability() {
+        // Test with values that could cause numerical issues
+        // Very small variance (constant input + small noise)
+        let c = 128;
+        let n = 4;
+
+        let mut input = vec![0.0f32; c * n];
+        // Fill with near-constant values
+        for i in 0..n {
+            for j in 0..c {
+                // Small variation around 1000.0
+                input[i * c + j] = 1000.0 + (j as f32) * 0.001;
+            }
+        }
+
+        let weight = vec![1.0f32; c];
+        let bias = vec![0.0f32; c];
+        let eps = 1e-5;
+
+        let output = hip_layer_norm(&input, &weight, &bias, c, n, eps)
+            .expect("layer_norm stability test failed");
+
+        // Verify no NaN or Inf values
+        for (i, &val) in output.iter().enumerate() {
+            assert!(
+                !val.is_nan(),
+                "NaN at index {} (vec={}, ch={})", i, i / c, i % c
+            );
+            assert!(
+                !val.is_infinite(),
+                "Inf at index {} (vec={}, ch={})", i, i / c, i % c
+            );
+        }
+
+        // Normalized values should have mean ≈ 0 and std ≈ 1 for each vector
+        for vec_idx in 0..n {
+            let start = vec_idx * c;
+            let end = start + c;
+            let vec_output = &output[start..end];
+
+            let sum: f32 = vec_output.iter().sum();
+            let mean = sum / (c as f32);
+
+            // Mean should be close to 0 (within tolerance due to FP32 accumulation)
+            // With 128 elements and FP32 arithmetic, numerical errors can accumulate
+            assert!(
+                mean.abs() < 1e-3,
+                "Vector {} mean not close to 0: {}", vec_idx, mean
+            );
+        }
+
+        println!("Layer norm stability test passed: {} values are finite with correct mean", output.len());
     }
 }

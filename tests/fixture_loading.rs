@@ -393,6 +393,98 @@ fn test_softplus_decay_fixture() {
     println!("softplus_decay fixture test passed: {} elements match", output.len());
 }
 
+/// Test layer normalization kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.5.
+#[test]
+#[cfg(feature = "hip")]
+fn test_layer_norm_basic_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/layer_norm/basic.npz")
+        .expect("Failed to load layer_norm basic fixture");
+
+    let input = fixture.f32("input");
+    let weight = fixture.f32("weight");
+    let bias = fixture.f32("bias");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+
+    // Shape is [C, N, 1, 1] where C is channel dimension
+    let c = shape[0];
+    let n = shape[1];
+
+    println!(
+        "Testing layer_norm basic: {} elements, shape {:?} (C={}, N={})",
+        input.len(),
+        shape,
+        c,
+        n
+    );
+
+    // Default epsilon for layer norm
+    let eps = 1e-5;
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_layer_norm(input, weight, bias, c, n, eps)
+        .expect("layer_norm kernel failed");
+
+    // Compare with fixture (< 1e-3 relative error per acceptance criteria)
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("layer_norm basic output doesn't match fixture");
+
+    println!("layer_norm basic fixture test passed: {} elements match", output.len());
+}
+
+/// Test layer normalization with RWKV7's epsilon value.
+/// This is an acceptance criteria test for bd-2sh.4.5.
+#[test]
+#[cfg(feature = "hip")]
+fn test_layer_norm_rwkv7_eps_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/layer_norm/rwkv7_eps.npz")
+        .expect("Failed to load layer_norm rwkv7_eps fixture");
+
+    let input = fixture.f32("input");
+    let weight = fixture.f32("weight");
+    let bias = fixture.f32("bias");
+    let expected = fixture.f32("expected");
+    let eps_arr = fixture.f32("eps");
+    let shape = fixture.shape4("input");
+
+    // Shape is [C, N, 1, 1]
+    let c = shape[0];
+    let n = shape[1];
+
+    // RWKV7 uses eps=1e-5 for LayerNorm (stored in fixture)
+    let eps = eps_arr[0];
+
+    println!(
+        "Testing layer_norm rwkv7_eps: {} elements, shape {:?} (C={}, N={}, eps={})",
+        input.len(),
+        shape,
+        c,
+        n,
+        eps
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_layer_norm(input, weight, bias, c, n, eps)
+        .expect("layer_norm rwkv7_eps kernel failed");
+
+    // Compare with fixture (< 1e-3 relative error per acceptance criteria)
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("layer_norm rwkv7_eps output doesn't match fixture");
+
+    println!("layer_norm rwkv7_eps fixture test passed: {} elements match", output.len());
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {
