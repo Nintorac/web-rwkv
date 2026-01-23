@@ -606,6 +606,49 @@ fn test_tanh_fixture() {
     println!("tanh fixture test passed: {} elements match", output.len());
 }
 
+/// Test token shift kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.9.
+#[test]
+#[cfg(feature = "hip")]
+fn test_token_shift_single_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/token_shift/single.npz")
+        .expect("Failed to load token_shift single fixture");
+
+    let x = fixture.f32("x");
+    let state_in = fixture.f32("state");
+    let mix = fixture.f32("mix");
+    let expected_output = fixture.f32("expected_output");
+    let expected_state = fixture.f32("expected_state");
+    let shape = fixture.shape4("x");
+
+    let c = shape[0];
+    let t = shape[1];
+
+    println!(
+        "Testing token_shift single: {} elements, shape {:?} (C={}, T={})",
+        x.len(),
+        shape,
+        c,
+        t
+    );
+
+    let (output, state_out) = web_rwkv::hip::hip_token_shift(x, state_in, mix, c, t)
+        .expect("token_shift kernel failed");
+
+    assert_tensors_close(&output, expected_output, 1e-3, 1e-4)
+        .expect("token_shift output doesn't match fixture");
+
+    assert_tensors_close(&state_out, expected_state, 1e-3, 1e-4)
+        .expect("token_shift state doesn't match fixture");
+
+    println!("token_shift single fixture test passed: {} elements match", output.len());
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {

@@ -560,6 +560,70 @@ hipError_t launch_tanh_f32(const float* input, float* output, int n, hipStream_t
     return hipGetLastError();
 }
 
+// ============================================================================
+// Token Shift Kernel
+// Implements token shift/time mixing for RWKV
+// Formula: output[t] = x[t] + mix * (prev[t] - x[t])
+// Where prev[0] = state_in, prev[t>0] = x[t-1]
+// This blends the current token with the previous token/state
+// State is updated to x[last] for the next batch
+// ============================================================================
+
+__global__ void kernel_token_shift_f32(
+    const float* __restrict__ x,          // [C, T, 1, 1] - input tensor
+    const float* __restrict__ state_in,   // [C, 1, 1, 1] - previous state
+    const float* __restrict__ mix,        // [C, 1, 1, 1] - mixing factor
+    float* __restrict__ output,           // [C, T, 1, 1] - shifted output
+    float* __restrict__ state_out,        // [C, 1, 1, 1] - new state (= x[:, T-1])
+    int C,                                 // Channel dimension
+    int T                                  // Number of tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= C) return;
+
+    float mix_val = mix[idx];
+    float prev = state_in[idx];
+
+    // Process each token in sequence
+    for (int t = 0; t < T; t++) {
+        int offset = t * C + idx;  // x is [C, T, 1, 1], so x[c, t] is at t*C + c
+        float curr = x[offset];
+
+        // Token shift: blend current with previous
+        // output = curr + mix * (prev - curr) = lerp(curr, prev, mix)
+        output[offset] = curr + mix_val * (prev - curr);
+
+        // Current becomes previous for next iteration
+        prev = curr;
+    }
+
+    // State out is the last token
+    state_out[idx] = prev;
+}
+
+hipError_t launch_token_shift_f32(
+    const float* x,
+    const float* state_in,
+    const float* mix,
+    float* output,
+    float* state_out,
+    int C,
+    int T,
+    hipStream_t stream
+) {
+    if (C <= 0 || T <= 0) {
+        return hipSuccess;
+    }
+
+    int block_size = 256;
+    int grid_size = (C + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_token_shift_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       x, state_in, mix, output, state_out, C, T);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

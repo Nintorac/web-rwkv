@@ -140,6 +140,16 @@ extern "C" {
         stream: HipStream
     ) -> HipError;
     fn launch_tanh_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    fn launch_token_shift_f32(
+        x: *const f32,
+        state_in: *const f32,
+        mix: *const f32,
+        output: *mut f32,
+        state_out: *mut f32,
+        c: c_int,
+        t: c_int,
+        stream: HipStream
+    ) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1677,6 +1687,113 @@ pub fn hip_tanh(input: &[f32]) -> Result<Vec<f32>> {
     d_output.to_vec(&stream)
 }
 
+/// Launch the token shift kernel.
+///
+/// Token shift implements RWKV's time-mixing operation:
+/// - output[t] = x[t] + mix * (prev[t] - x[t])
+/// - Where prev[0] = state_in, prev[t>0] = x[t-1]
+/// - state_out = x[T-1] (last token becomes state for next batch)
+///
+/// # Arguments
+/// * `x` - Input tensor of shape [C, T, 1, 1]
+/// * `state_in` - Previous state of shape [C, 1, 1, 1]
+/// * `mix` - Per-channel mixing factor of shape [C, 1, 1, 1]
+/// * `output` - Output tensor of shape [C, T, 1, 1]
+/// * `state_out` - New state of shape [C, 1, 1, 1]
+/// * `stream` - HIP stream
+pub fn token_shift_f32(
+    x: &TensorHip<f32>,
+    state_in: &TensorHip<f32>,
+    mix: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    state_out: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    let c = x.shape()[0];
+    let t = x.shape()[1];
+
+    if output.shape()[0] != c || output.shape()[1] != t {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected [{}, {}, 1, 1], got {}",
+                c, t, output.shape()
+            ),
+        });
+    }
+    if state_in.shape()[0] != c || state_out.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected [{}, 1, 1, 1]",
+                c
+            ),
+        });
+    }
+    if mix.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Mix shape mismatch: expected [{}, 1, 1, 1], got {}",
+                c, mix.shape()
+            ),
+        });
+    }
+
+    unsafe {
+        check(launch_token_shift_f32(
+            x.as_ptr(),
+            state_in.as_ptr(),
+            mix.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            c as c_int,
+            t as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute token shift on host data, returning (output, state_out).
+pub fn hip_token_shift(
+    x: &[f32],
+    state_in: &[f32],
+    mix: &[f32],
+    c: usize,
+    t: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if x.len() != c * t {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("x size mismatch: expected {}, got {}", c * t, x.len()),
+        });
+    }
+    if state_in.len() != c || mix.len() != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("state/mix size mismatch: expected {}", c),
+        });
+    }
+
+    let stream = Stream::null();
+
+    let x_shape = TensorShape::new(c, t, 1, 1);
+    let state_shape = TensorShape::new(c, 1, 1, 1);
+
+    let d_x = TensorHip::from_slice(x, x_shape, &stream)?;
+    let d_state_in = TensorHip::from_slice(state_in, state_shape, &stream)?;
+    let d_mix = TensorHip::from_slice(mix, state_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(x_shape)?;
+    let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
+
+    token_shift_f32(&d_x, &d_state_in, &d_mix, &mut d_output, &mut d_state_out, &stream)?;
+
+    let output = d_output.to_vec(&stream)?;
+    let state_out = d_state_out.to_vec(&stream)?;
+
+    Ok((output, state_out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2583,5 +2700,106 @@ mod tests {
         assert!((output[4] - 1.0).abs() < 1e-6, "tanh(100) should be ≈1");
 
         println!("Tanh edge cases test passed");
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.9 (Token Shift Kernel) ===
+
+    #[test]
+    fn test_token_shift_basic() {
+        // Test token shift with 2 channels and 3 tokens
+        // x shape: [2, 3, 1, 1]
+        let x = vec![
+            // Token 0: [1.0, 2.0]
+            1.0, 2.0,
+            // Token 1: [3.0, 4.0]
+            3.0, 4.0,
+            // Token 2: [5.0, 6.0]
+            5.0, 6.0,
+        ];
+
+        // Initial state: [0.0, 0.0]
+        let state_in = vec![0.0, 0.0];
+
+        // Mix factor: 0.5 (blend 50% of previous into current)
+        let mix = vec![0.5, 0.5];
+
+        let c = 2;
+        let t = 3;
+
+        let (output, state_out) = hip_token_shift(&x, &state_in, &mix, c, t)
+            .expect("token_shift kernel failed");
+
+        // Formula: output[t] = x[t] + mix * (prev - x[t])
+        // Token 0: x[0] + 0.5*(state - x[0]) = 1 + 0.5*(0-1) = [0.5, 1.0]
+        // Token 1: x[1] + 0.5*(x[0] - x[1]) = 3 + 0.5*(1-3) = [2.0, 3.0]
+        // Token 2: x[2] + 0.5*(x[1] - x[2]) = 5 + 0.5*(3-5) = [4.0, 5.0]
+        let expected = vec![
+            0.5, 1.0,  // Token 0
+            2.0, 3.0,  // Token 1
+            4.0, 5.0,  // Token 2
+        ];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Output mismatch at index {}: actual={:.6}, expected={:.6}",
+                i, actual, exp
+            );
+        }
+
+        // State out should be x[last] = [5.0, 6.0]
+        assert!((state_out[0] - 5.0).abs() < 1e-5, "state_out[0] should be 5.0");
+        assert!((state_out[1] - 6.0).abs() < 1e-5, "state_out[1] should be 6.0");
+
+        println!("Token shift basic test passed");
+    }
+
+    #[test]
+    fn test_token_shift_no_mix() {
+        // Test with mix=0 (pass through current, no blending)
+        let x = vec![1.0, 2.0, 3.0, 4.0];  // [2, 2]
+        let state_in = vec![10.0, 20.0];
+        let mix = vec![0.0, 0.0];
+
+        let (output, _) = hip_token_shift(&x, &state_in, &mix, 2, 2)
+            .expect("token_shift no mix failed");
+
+        // With mix=0: output = x + 0*(prev - x) = x
+        // So output equals x directly
+        let expected = vec![1.0, 2.0, 3.0, 4.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - exp).abs() < 1e-5,
+                "Mismatch at {}: {} vs {}", i, actual, exp
+            );
+        }
+        println!("Token shift no mix test passed");
+    }
+
+    #[test]
+    fn test_token_shift_full_mix() {
+        // Test with mix=1 (full blending with previous)
+        let x = vec![1.0, 2.0, 3.0, 4.0];  // [2, 2]
+        let state_in = vec![10.0, 20.0];
+        let mix = vec![1.0, 1.0];
+
+        let (output, _) = hip_token_shift(&x, &state_in, &mix, 2, 2)
+            .expect("token_shift full mix failed");
+
+        // With mix=1: output = x + 1*(prev - x) = prev
+        // Token 0: prev = state_in = [10.0, 20.0]
+        // Token 1: prev = x[0] = [1.0, 2.0]
+        let expected = vec![10.0, 20.0, 1.0, 2.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - exp).abs() < 1e-5,
+                "Mismatch at {}: {} vs {}", i, actual, exp
+            );
+        }
+        println!("Token shift full mix test passed");
     }
 }
