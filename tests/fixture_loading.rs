@@ -1300,7 +1300,7 @@ fn test_time_mix_wkv_fixture() {
     println!("  WKV7 state: {} elements", new_state.len());
 
     // Reshape output from [N, T, H, B] back to [C, T, B, 1] for comparison
-    fn reshape_nhb_to_c(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+    fn reshape_nhtb_to_c(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
         let mut result = vec![0.0f32; c * t * b];
         for batch in 0..b {
             for time in 0..t {
@@ -1317,7 +1317,7 @@ fn test_time_mix_wkv_fixture() {
         result
     }
 
-    let output_flat = reshape_nhb_to_c(&output, c, t, b, n, h);
+    let output_flat = reshape_nhtb_to_c(&output, c, t, b, n, h);
 
     // Validate WKV output
     // Allow slightly higher tolerance for numerical differences between Python ref and HIP kernel
@@ -1334,6 +1334,411 @@ fn test_time_mix_wkv_fixture() {
 
     println!("  WKV7 state validated");
     println!("Time-mix WKV7 fixture test passed!");
+}
+
+/// Test full RWKV7 block (time-mix + channel-mix) against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.5.3.
+///
+/// Full block computation:
+/// 1. Layer norm (ln1) -> Time-mix -> Residual
+/// 2. Layer norm (ln2) -> Channel-mix -> Residual
+#[test]
+#[cfg(feature = "hip")]
+fn test_full_block_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture_path = "tests/fixtures/layers/full_block/layer_0.npz";
+    if !Path::new(fixture_path).exists() {
+        eprintln!("Skipping test: full_block fixture not generated at {}", fixture_path);
+        return;
+    }
+
+    let fixture = TestFixture::load(fixture_path)
+        .expect("Failed to load full_block fixture");
+
+    // Load inputs
+    let input = fixture.f32("input");
+    let att_state_in = fixture.f32("att_state_in");
+    let att_token_shift_state = fixture.f32("att_token_shift_state");
+    let ffn_state_in = fixture.f32("ffn_state_in");
+
+    // Load layer norm weights
+    let ln1_weight = fixture.f32("ln1_weight");
+    let ln1_bias = fixture.f32("ln1_bias");
+    let ln2_weight = fixture.f32("ln2_weight");
+    let ln2_bias = fixture.f32("ln2_bias");
+
+    // Load time-mix weights
+    let x_r = fixture.f32("x_r");
+    let x_w = fixture.f32("x_w");
+    let x_k_att = fixture.f32("x_k_att");
+    let x_v = fixture.f32("x_v");
+    let x_a = fixture.f32("x_a");
+    let x_g = fixture.f32("x_g");
+    let w0 = fixture.f32("w0");
+    let w1 = fixture.f32("w1");
+    let w2 = fixture.f32("w2");
+    let a0 = fixture.f32("a0");
+    let a1 = fixture.f32("a1");
+    let a2 = fixture.f32("a2");
+    let g1 = fixture.f32("g1");
+    let g2 = fixture.f32("g2");
+    let k_k = fixture.f32("k_k");
+    let k_a = fixture.f32("k_a");
+    let r_k_weight = fixture.f32("r_k_weight");
+    let r_weight = fixture.f32("r_weight");
+    let k_weight = fixture.f32("k_weight");
+    let v_weight = fixture.f32("v_weight");
+    let o_weight = fixture.f32("o_weight");
+    let ln_x_weight = fixture.f32("ln_x_weight");
+    let ln_x_bias = fixture.f32("ln_x_bias");
+
+    // Load FFN weights
+    let x_k_ffn = fixture.f32("x_k_ffn");
+    let ffn_key_weight = fixture.f32("ffn_key_weight");
+    let ffn_value_weight = fixture.f32("ffn_value_weight");
+
+    // Load intermediates for validation
+    let expected_after_ln1 = fixture.f32("after_ln1");
+    let expected_w_proj = fixture.f32("w_proj");
+    let expected_a_proj = fixture.f32("a_proj");
+    let expected_g_proj = fixture.f32("g_proj");
+    let expected_r_proj = fixture.f32("r_proj");
+    let expected_k_proj = fixture.f32("k_proj");
+    let expected_v_proj = fixture.f32("v_proj");
+    let expected_kk = fixture.f32("kk");
+    let expected_k_ctrl = fixture.f32("k_ctrl");
+    let expected_wkv_out = fixture.f32("wkv_out");
+    let expected_wkv_bonus_out = fixture.f32("wkv_bonus_out");
+    let expected_after_time_mix = fixture.f32("after_time_mix");
+    let expected_output = fixture.f32("expected_output");
+    let expected_att_state = fixture.f32("expected_att_state");
+    let expected_att_token_shift_state = fixture.f32("expected_att_token_shift_state");
+    let expected_ffn_state = fixture.f32("expected_ffn_state");
+
+    // Load shapes
+    let input_shape = fixture.shape4("input");  // [C, T, B, 1]
+    let att_state_shape = fixture.shape4("att_state_in");  // [N, N, H, B]
+    let w1_shape = fixture.shape4("w1");  // [lora_dim, C, 1, 1]
+    let w2_shape = fixture.shape4("w2");  // [C, lora_dim, 1, 1]
+    let a1_shape = fixture.shape4("a1");
+    let a2_shape = fixture.shape4("a2");
+    let g1_shape = fixture.shape4("g1");
+    let g2_shape = fixture.shape4("g2");
+    let ffn_key_weight_shape = fixture.shape4("ffn_key_weight");  // [hidden, C, 1, 1]
+
+    // Extract dimensions
+    let c = input_shape[0];      // embedding dim (768)
+    let t = input_shape[1];      // sequence length (16)
+    let b = input_shape[2];      // batch size (2)
+    let n = att_state_shape[0];  // head size (64)
+    let h = att_state_shape[2];  // num heads (12)
+    let hidden = ffn_key_weight_shape[0];  // hidden size (3072)
+    let w_lora_dim = w1_shape[0];  // LoRA dim for w
+
+    println!("Testing full RWKV7 block:");
+    println!("  Input: [{}, {}, {}, 1] (C, T, B)", c, t, b);
+    println!("  Dimensions: C={}, T={}, B={}, N={}, H={}, hidden={}", c, t, b, n, h, hidden);
+
+    // ==== Step 1: Layer Norm (ln1) ====
+    let after_ln1 = web_rwkv::hip::hip_layer_norm(
+        input, ln1_weight, ln1_bias, c, t * b, 1e-5
+    ).expect("Layer norm 1 failed");
+
+    println!("  Step 1 (ln1): {} elements", after_ln1.len());
+    assert_tensors_close(&after_ln1, expected_after_ln1, 1e-3, 1e-3)
+        .expect("Layer norm 1 output doesn't match");
+
+    // ==== Step 2: Token Shift for Time-Mix ====
+    // Token shift: shifted = concat(state, input[:-1])
+    let (after_token_shift, new_att_token_shift_state) = web_rwkv::hip::hip_channel_mix_state(
+        &after_ln1, att_token_shift_state, x_r, c, t, b
+    ).expect("Time-mix token shift failed");
+
+    println!("  Step 2a (token shift xr): {} elements", after_token_shift.len());
+
+    // Multiple token shifts for time-mix (xr, xw, xk, xv, xa, xg)
+    let (xw_shifted, _) = web_rwkv::hip::hip_channel_mix_state(&after_ln1, att_token_shift_state, x_w, c, t, b).expect("xw shift failed");
+    let (xk_shifted, _) = web_rwkv::hip::hip_channel_mix_state(&after_ln1, att_token_shift_state, x_k_att, c, t, b).expect("xk shift failed");
+    let (xv_shifted, _) = web_rwkv::hip::hip_channel_mix_state(&after_ln1, att_token_shift_state, x_v, c, t, b).expect("xv shift failed");
+    let (xa_shifted, _) = web_rwkv::hip::hip_channel_mix_state(&after_ln1, att_token_shift_state, x_a, c, t, b).expect("xa shift failed");
+    let (xg_shifted, _) = web_rwkv::hip::hip_channel_mix_state(&after_ln1, att_token_shift_state, x_g, c, t, b).expect("xg shift failed");
+
+    println!("  Step 2 (all token shifts): done");
+
+    // ==== Step 3: Linear Projections (r, k, v) ====
+    // r = r_weight @ xr
+    let r_proj = web_rwkv::hip::hip_sgemm(r_weight, &after_token_shift, c, c, t * b)
+        .expect("R projection failed");
+    let k_proj = web_rwkv::hip::hip_sgemm(k_weight, &xk_shifted, c, c, t * b)
+        .expect("K projection failed");
+    let v_proj = web_rwkv::hip::hip_sgemm(v_weight, &xv_shifted, c, c, t * b)
+        .expect("V projection failed");
+
+    println!("  Step 3 (r, k, v projections): done");
+
+    // Validate r, k, v projections
+    assert_tensors_close(&r_proj, expected_r_proj, 1e-2, 0.05)
+        .expect("R projection doesn't match");
+    assert_tensors_close(&k_proj, expected_k_proj, 1e-2, 0.05)
+        .expect("K projection doesn't match");
+    assert_tensors_close(&v_proj, expected_v_proj, 1e-2, 0.05)
+        .expect("V projection doesn't match");
+    println!("  Validated r, k, v projections");
+
+    // ==== Step 4: Compute w (decay) ====
+    // w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
+    // First: xw @ w1 (w1 is [lora_dim, C])
+    let w_lora1 = web_rwkv::hip::hip_sgemm(w1, &xw_shifted, w_lora_dim, c, t * b)
+        .expect("W LoRA1 failed");
+    // tanh activation
+    let w_lora1_tanh = web_rwkv::hip::hip_tanh(&w_lora1).expect("W tanh failed");
+    // @ w2 (w2 is [C, lora_dim])
+    let w_lora2 = web_rwkv::hip::hip_sgemm(w2, &w_lora1_tanh, c, w_lora_dim, t * b)
+        .expect("W LoRA2 failed");
+    // w0 + w_lora2
+    let w_biased: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
+        .zip(w_lora2.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+    // -softplus(-x) - 0.5
+    let w_decay = web_rwkv::hip::hip_softplus_decay(&w_biased).expect("Softplus decay failed");
+
+    println!("  Step 4 (w decay): {} elements", w_decay.len());
+    assert_tensors_close(&w_decay, expected_w_proj, 1e-2, 0.05)
+        .expect("W projection doesn't match");
+    println!("  Validated w projection");
+
+    // ==== Step 5: Compute a (learning rate) ====
+    // a = sigmoid(a0 + (xa @ a1) @ a2)
+    let a_lora_dim = a1_shape[0];
+    let a_lora1 = web_rwkv::hip::hip_sgemm(a1, &xa_shifted, a_lora_dim, c, t * b)
+        .expect("A LoRA1 failed");
+    let a_lora2 = web_rwkv::hip::hip_sgemm(a2, &a_lora1, c, a_lora_dim, t * b)
+        .expect("A LoRA2 failed");
+    let a_biased: Vec<f32> = a0.iter().cycle().take(a_lora2.len())
+        .zip(a_lora2.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+    let a_proj = web_rwkv::hip::hip_sigmoid(&a_biased).expect("A sigmoid failed");
+
+    println!("  Step 5 (a learning rate): {} elements", a_proj.len());
+    assert_tensors_close(&a_proj, expected_a_proj, 1e-2, 0.05)
+        .expect("A projection doesn't match");
+    println!("  Validated a projection");
+
+    // ==== Step 6: Compute g (gate) ====
+    // g = sigmoid(xg @ g1) @ g2
+    let g_lora_dim = g1_shape[0];
+    let g_lora1 = web_rwkv::hip::hip_sgemm(g1, &xg_shifted, g_lora_dim, c, t * b)
+        .expect("G LoRA1 failed");
+    let g_lora1_sigmoid = web_rwkv::hip::hip_sigmoid(&g_lora1).expect("G sigmoid failed");
+    let g_proj = web_rwkv::hip::hip_sgemm(g2, &g_lora1_sigmoid, c, g_lora_dim, t * b)
+        .expect("G LoRA2 failed");
+
+    println!("  Step 6 (g gate): {} elements", g_proj.len());
+    assert_tensors_close(&g_proj, expected_g_proj, 1e-2, 0.05)
+        .expect("G projection doesn't match");
+    println!("  Validated g projection");
+
+    // ==== Step 7: L2 Normalize k ====
+    // kk = L2_norm(k * k_k, per_head)
+    let k_scaled: Vec<f32> = k_proj.iter()
+        .zip(k_k.iter().cycle())
+        .map(|(k, kk)| k * kk)
+        .collect();
+    let kk = web_rwkv::hip::hip_l2_norm(&k_scaled, c, t * b, n, 1e-12).expect("L2 norm failed");
+
+    println!("  Step 7 (kk L2 norm): {} elements", kk.len());
+    assert_tensors_close(&kk, expected_kk, 1e-2, 0.05)
+        .expect("kk (L2 norm) doesn't match");
+    println!("  Validated kk");
+
+    // ==== Step 8: Control K ====
+    // k_ctrl = k * (1 + (a - 1) * k_a)
+    let k_ctrl: Vec<f32> = k_proj.iter()
+        .zip(a_proj.iter())
+        .zip(k_a.iter().cycle())
+        .map(|((k, a), ka)| k * (1.0 + (a - 1.0) * ka))
+        .collect();
+
+    println!("  Step 8 (k_ctrl): {} elements", k_ctrl.len());
+    assert_tensors_close(&k_ctrl, expected_k_ctrl, 1e-2, 0.1)
+        .expect("k_ctrl doesn't match");
+    println!("  Validated k_ctrl");
+
+    // ==== Step 9: WKV7 ====
+    // Prepare WKV inputs: wkv_a = -kk, wkv_b = kk * a
+    let wkv_a: Vec<f32> = kk.iter().map(|x| -x).collect();
+    let wkv_b: Vec<f32> = kk.iter().zip(a_proj.iter()).map(|(kk, a)| kk * a).collect();
+
+    // w_decay needs to be exp(w) for WKV7 kernel
+    let w_exp: Vec<f32> = w_decay.iter().map(|w| w.exp()).collect();
+
+    // Reshape for WKV7: [C, T, B, 1] -> [N, H, T, B]
+    // Note: hip_wkv7 and hip_wkv_bonus expect [N, H, T, B] ordering
+    fn reshape_c_to_nhtb(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+        let mut result = vec![0.0f32; n * h * t * b];
+        for batch in 0..b {
+            for time in 0..t {
+                for head in 0..h {
+                    for ni in 0..n {
+                        let c_idx = head * n + ni;
+                        let src_idx = c_idx + time * c + batch * c * t;
+                        // [N, H, T, B] ordering: n + h*N + t*N*H + b*N*H*T
+                        let dst_idx = ni + head * n + time * n * h + batch * n * h * t;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    let r_wkv = reshape_c_to_nhtb(&r_proj, c, t, b, n, h);
+    let k_wkv = reshape_c_to_nhtb(&k_ctrl, c, t, b, n, h);
+    let v_wkv = reshape_c_to_nhtb(&v_proj, c, t, b, n, h);
+    let w_wkv = reshape_c_to_nhtb(&w_exp, c, t, b, n, h);
+    let a_wkv = reshape_c_to_nhtb(&wkv_a, c, t, b, n, h);
+    let b_wkv = reshape_c_to_nhtb(&wkv_b, c, t, b, n, h);
+
+    let (wkv_output, wkv_state_out) = web_rwkv::hip::hip_wkv7(
+        &w_wkv, &r_wkv, &k_wkv, &v_wkv, &a_wkv, &b_wkv, att_state_in, n, h, t, b
+    ).expect("WKV7 failed");
+
+    // Reshape WKV output back to [C, T, B, 1] from [N, H, T, B]
+    fn reshape_nhtb_to_c(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+        let mut result = vec![0.0f32; c * t * b];
+        for batch in 0..b {
+            for time in 0..t {
+                for head in 0..h {
+                    for ni in 0..n {
+                        let c_idx = head * n + ni;
+                        // [N, H, T, B] ordering: n + h*N + t*N*H + b*N*H*T
+                        let src_idx = ni + head * n + time * n * h + batch * n * h * t;
+                        let dst_idx = c_idx + time * c + batch * c * t;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    let wkv_out_flat = reshape_nhtb_to_c(&wkv_output, c, t, b, n, h);
+
+    println!("  Step 9 (WKV7): {} elements", wkv_out_flat.len());
+    assert_tensors_close(&wkv_out_flat, expected_wkv_out, 0.05, 0.5)
+        .expect("WKV output doesn't match");
+    println!("  Validated WKV output");
+
+    // ==== Step 10: WKV Bonus ====
+    // u = (r * k * r_k).sum(dim=-1, keepdim=True) * v
+    let wkv_bonus = web_rwkv::hip::hip_wkv_bonus(
+        &r_wkv, &k_wkv, &v_wkv, r_k_weight, n, h, t, b
+    ).expect("WKV bonus failed");
+    let wkv_bonus_flat = reshape_nhtb_to_c(&wkv_bonus, c, t, b, n, h);
+
+    println!("  Step 10 (WKV bonus): {} elements", wkv_bonus_flat.len());
+    assert_tensors_close(&wkv_bonus_flat, expected_wkv_bonus_out, 0.05, 0.2)
+        .expect("WKV bonus doesn't match");
+    println!("  Validated WKV bonus");
+
+    // Combine WKV output and bonus
+    let x_att_out: Vec<f32> = wkv_out_flat.iter()
+        .zip(wkv_bonus_flat.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    // ==== Step 11: Group Norm ====
+    let x_att_gn = web_rwkv::hip::hip_group_norm(
+        &x_att_out, ln_x_weight, ln_x_bias, c, t * b, h, 64e-5
+    ).expect("Group norm failed");
+
+    println!("  Step 11 (group norm): {} elements", x_att_gn.len());
+
+    // ==== Step 12: Gate and Output Projection ====
+    // x_gated = x_att_gn * g
+    let x_gated: Vec<f32> = x_att_gn.iter()
+        .zip(g_proj.iter())
+        .map(|(x, g)| x * g)
+        .collect();
+    // output = o_weight @ x_gated
+    let x_att_proj = web_rwkv::hip::hip_sgemm(o_weight, &x_gated, c, c, t * b)
+        .expect("Output projection failed");
+
+    println!("  Step 12 (gate + output): {} elements", x_att_proj.len());
+
+    // ==== Step 13: Residual Connection ====
+    let x_after_att: Vec<f32> = input.iter()
+        .zip(x_att_proj.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    println!("  Step 13 (residual): {} elements", x_after_att.len());
+
+    // Validate after time-mix
+    assert_tensors_close(&x_after_att, expected_after_time_mix, 0.05, 0.2)
+        .expect("After time-mix output doesn't match");
+    println!("  Time-mix validated!");
+
+    // ==== Step 14: Layer Norm (ln2) ====
+    let after_ln2 = web_rwkv::hip::hip_layer_norm(
+        &x_after_att, ln2_weight, ln2_bias, c, t * b, 1e-5
+    ).expect("Layer norm 2 failed");
+
+    println!("  Step 14 (ln2): {} elements", after_ln2.len());
+
+    // ==== Step 15: Channel-Mix (FFN) ====
+    // Token shift + Lerp
+    let (k_ffn, new_ffn_state) = web_rwkv::hip::hip_channel_mix_state(
+        &after_ln2, ffn_state_in, x_k_ffn, c, t, b
+    ).expect("FFN token shift failed");
+
+    // Key projection
+    let k_proj_ffn = web_rwkv::hip::hip_sgemm(ffn_key_weight, &k_ffn, hidden, c, t * b)
+        .expect("FFN key projection failed");
+
+    // Squared ReLU
+    let k_sq_ffn = web_rwkv::hip::hip_squared_relu(&k_proj_ffn)
+        .expect("Squared ReLU failed");
+
+    // Value projection
+    let x_ffn_out = web_rwkv::hip::hip_sgemm(ffn_value_weight, &k_sq_ffn, c, hidden, t * b)
+        .expect("FFN value projection failed");
+
+    println!("  Step 15 (channel-mix): {} elements", x_ffn_out.len());
+
+    // ==== Step 16: Final Residual ====
+    let x_final: Vec<f32> = x_after_att.iter()
+        .zip(x_ffn_out.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    println!("  Step 16 (final residual): {} elements", x_final.len());
+
+    // ==== Validate Final Output ====
+    // Full block has accumulated errors, so allow higher tolerance
+    assert_tensors_close(&x_final, expected_output, 0.1, 0.5)
+        .expect("Full block output doesn't match fixture");
+
+    println!("  Final output validated!");
+
+    // ==== Validate State Updates ====
+    assert_tensors_close(&wkv_state_out, expected_att_state, 0.1, 0.5)
+        .expect("Attention state doesn't match fixture");
+
+    assert_tensors_close(&new_att_token_shift_state, expected_att_token_shift_state, 1e-3, 1e-3)
+        .expect("Attention token shift state doesn't match fixture");
+
+    assert_tensors_close(&new_ffn_state, expected_ffn_state, 1e-2, 0.1)
+        .expect("FFN state doesn't match fixture");
+
+    println!("  All states validated!");
+    println!("Full block fixture test passed!");
 }
 
 #[test]

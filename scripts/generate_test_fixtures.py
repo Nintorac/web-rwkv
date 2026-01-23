@@ -906,7 +906,279 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
                  expected_output=(out_cm, (C, T, B, 1)),
                  expected_state=(x_cm[:, -1, :], (C, B, 1, 1)))
 
-    print("  Layer fixtures generated")
+    # ========== Full Block (Time-Mix + Channel-Mix) ==========
+    # This fixture tests a complete RWKV7 block:
+    # 1. Layer norm (ln1) -> Time-mix -> Residual
+    # 2. Layer norm (ln2) -> Channel-mix -> Residual
+    full_dir = layer_dir / "full_block"
+
+    set_seed(102)
+    B_full, T_full = 2, 16
+
+    # Generate input embedding (after embedding layer)
+    x_block = torch.randn(B_full, T_full, C, dtype=torch.float16)
+
+    # Initial states
+    att_state_in = torch.zeros(B_full, H, N, N, dtype=torch.float32)
+    att_token_shift_state = torch.zeros(B_full, C, dtype=torch.float16)
+    ffn_state_in = torch.zeros(B_full, C, dtype=torch.float16)
+
+    # Get layer 0 weights (same as above)
+    prefix = "blocks.0.att."
+    ln1_w = tensors["blocks.0.ln1.weight"]
+    ln1_b = tensors["blocks.0.ln1.bias"]
+    ln2_w = tensors["blocks.0.ln2.weight"]
+    ln2_b = tensors["blocks.0.ln2.bias"]
+
+    x_r = tensors[prefix + "x_r"].squeeze()
+    x_w = tensors[prefix + "x_w"].squeeze()
+    x_k = tensors[prefix + "x_k"].squeeze()
+    x_v = tensors[prefix + "x_v"].squeeze()
+    x_a = tensors[prefix + "x_a"].squeeze()
+    x_g = tensors[prefix + "x_g"].squeeze()
+
+    w0 = tensors[prefix + "w0"].squeeze()
+    w1 = tensors[prefix + "w1"]
+    w2 = tensors[prefix + "w2"]
+
+    a0 = tensors[prefix + "a0"].squeeze()
+    a1 = tensors[prefix + "a1"]
+    a2 = tensors[prefix + "a2"]
+
+    g1 = tensors[prefix + "g1"]
+    g2 = tensors[prefix + "g2"]
+
+    k_k = tensors[prefix + "k_k"].squeeze()
+    k_a = tensors[prefix + "k_a"].squeeze()
+    r_k = tensors[prefix + "r_k"]
+
+    r_weight = tensors[prefix + "receptance.weight"]
+    k_weight = tensors[prefix + "key.weight"]
+    v_weight = tensors[prefix + "value.weight"]
+    o_weight = tensors[prefix + "output.weight"]
+
+    ln_x_w = tensors[prefix + "ln_x.weight"]
+    ln_x_b = tensors[prefix + "ln_x.bias"]
+
+    # FFN weights
+    prefix_ffn = "blocks.0.ffn."
+    ffn_x_k = tensors[prefix_ffn + "x_k"].squeeze()
+    ffn_key_w = tensors[prefix_ffn + "key.weight"]
+    ffn_val_w = tensors[prefix_ffn + "value.weight"]
+
+    # ==== Time-Mix (Attention) ====
+    # Layer norm before attention
+    x_ln1 = F.layer_norm(x_block.float(), (C,), ln1_w.float(), ln1_b.float(), eps=1e-5).to(torch.float16)
+
+    # Token shift
+    xx_att = torch.cat([att_token_shift_state.unsqueeze(1), x_ln1[:, :-1, :]], dim=1)
+
+    # Time-shifted inputs
+    xr = torch.lerp(x_ln1.float(), xx_att.float(), x_r.float()).to(torch.float16)
+    xw = torch.lerp(x_ln1.float(), xx_att.float(), x_w.float()).to(torch.float16)
+    xk = torch.lerp(x_ln1.float(), xx_att.float(), x_k.float()).to(torch.float16)
+    xv = torch.lerp(x_ln1.float(), xx_att.float(), x_v.float()).to(torch.float16)
+    xa = torch.lerp(x_ln1.float(), xx_att.float(), x_a.float()).to(torch.float16)
+    xg = torch.lerp(x_ln1.float(), xx_att.float(), x_g.float()).to(torch.float16)
+
+    # Linear projections
+    r_proj = F.linear(xr.float(), r_weight.float()).to(torch.float16)
+    k_proj_att = F.linear(xk.float(), k_weight.float()).to(torch.float16)
+    v_proj = F.linear(xv.float(), v_weight.float()).to(torch.float16)
+
+    # w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
+    w_lora = torch.tanh(xw.float() @ w1.float().t()) @ w2.float().t()
+    w_proj = (-F.softplus(-(w0.float() + w_lora)) - 0.5).to(torch.float16)
+
+    # a = sigmoid(a0 + (xa @ a1) @ a2)
+    a_lora = (xa.float() @ a1.float().t()) @ a2.float().t()
+    a_proj = torch.sigmoid(a0.float() + a_lora).to(torch.float16)
+
+    # g = sigmoid(xg @ g1) @ g2
+    g_proj = (torch.sigmoid(xg.float() @ g1.float().t()) @ g2.float().t()).to(torch.float16)
+
+    # For layer 0, v_first = v
+    v_first_block = v_proj.clone()
+
+    # L2 normalize k
+    kk_block = F.normalize((k_proj_att.float() * k_k.float()).view(B_full, T_full, H, -1), dim=-1, p=2.0)
+    kk_block = kk_block.view(B_full, T_full, C).to(torch.float16)
+
+    # Control K
+    k_ctrl_block = (k_proj_att.float() * (1.0 + (a_proj.float() - 1.0) * k_a.float())).to(torch.float16)
+
+    # WKV inputs
+    wkv_a_block = -kk_block
+    wkv_b_block = kk_block * a_proj
+
+    # Decay
+    w_decay_block = torch.exp(w_proj.float())
+
+    # Reshape for WKV7
+    r_wkv_block = r_proj.float().view(B_full, T_full, H, N)
+    k_wkv_block = k_ctrl_block.float().view(B_full, T_full, H, N)
+    v_wkv_block = v_proj.float().view(B_full, T_full, H, N)
+    w_wkv_block = w_decay_block.view(B_full, T_full, H, N)
+    a_wkv_block = wkv_a_block.float().view(B_full, T_full, H, N)
+    b_wkv_block = wkv_b_block.float().view(B_full, T_full, H, N)
+
+    # Run WKV7
+    wkv_output_block = torch.empty(B_full, T_full, H, N, dtype=torch.float32)
+    wkv_state_out_block = att_state_in.clone()
+
+    for t in range(T_full):
+        for batch in range(B_full):
+            for head in range(H):
+                s = wkv_state_out_block[batch, head]
+
+                q_t = r_wkv_block[batch, t, head]
+                w_t = w_wkv_block[batch, t, head]
+                k_t = k_wkv_block[batch, t, head]
+                v_t = v_wkv_block[batch, t, head]
+                a_t = a_wkv_block[batch, t, head]
+                b_t = b_wkv_block[batch, t, head]
+
+                sa = (s * a_t.unsqueeze(0)).sum(dim=1)
+                s = s * w_t.unsqueeze(0) + \
+                    sa.unsqueeze(1) * b_t.unsqueeze(0) + \
+                    v_t.unsqueeze(1) * k_t.unsqueeze(0)
+                y = (s * q_t.unsqueeze(0)).sum(dim=1)
+                wkv_output_block[batch, t, head] = y
+                wkv_state_out_block[batch, head] = s
+
+    wkv_out_flat_block = wkv_output_block.view(B_full, T_full, C)
+
+    # WKV Bonus: u = (r * k * r_k).sum(dim=-1, keepdim=True) * v
+    r_bonus = r_proj.float().view(B_full, T_full, H, N)
+    k_bonus = k_ctrl_block.float().view(B_full, T_full, H, N)
+    v_bonus = v_proj.float().view(B_full, T_full, H, N)
+    wkv_bonus = ((r_bonus * k_bonus * r_k.float()).sum(dim=-1, keepdim=True) * v_bonus)
+    wkv_bonus = wkv_bonus.view(B_full, T_full, C)
+
+    # Combine WKV output and bonus
+    x_att_out = wkv_out_flat_block + wkv_bonus
+
+    # Group norm
+    x_att_gn = F.group_norm(x_att_out.view(B_full * T_full, C), H, ln_x_w.float(), ln_x_b.float(), eps=64e-5)
+    x_att_gn = x_att_gn.view(B_full, T_full, C)
+
+    # Gate and output projection
+    x_att_gated = (x_att_gn * g_proj.float())
+    x_att_proj = F.linear(x_att_gated, o_weight.float()).to(torch.float16)
+
+    # Residual connection
+    x_after_att = x_block.float() + x_att_proj.float()
+    x_after_att = x_after_att.to(torch.float16)
+
+    # ==== Channel-Mix (FFN) ====
+    # Layer norm before FFN
+    x_ln2 = F.layer_norm(x_after_att.float(), (C,), ln2_w.float(), ln2_b.float(), eps=1e-5).to(torch.float16)
+
+    # Token shift
+    xx_ffn = torch.cat([ffn_state_in.unsqueeze(1), x_ln2[:, :-1, :]], dim=1)
+
+    # Lerp
+    k_ffn = torch.lerp(x_ln2.float(), xx_ffn.float(), ffn_x_k.float()).to(torch.float16)
+
+    # Key projection
+    k_proj_ffn = F.linear(k_ffn.float(), ffn_key_w.float())
+
+    # Squared ReLU
+    k_sq_ffn = (F.relu(k_proj_ffn) ** 2).to(torch.float16)
+
+    # Value projection
+    x_ffn_out = F.linear(k_sq_ffn.float(), ffn_val_w.float()).to(torch.float16)
+
+    # Residual connection
+    x_final = x_after_att.float() + x_ffn_out.float()
+    x_final = x_final.to(torch.float16)
+
+    # New states
+    new_att_token_shift_state = x_ln1[:, -1, :].clone()
+    new_ffn_state = x_ln2[:, -1, :].clone()
+
+    # Transpose weights for rocBLAS column-major GEMM
+    key_w_for_gemm_block = ffn_key_w.T.contiguous()
+    val_w_for_gemm_block = ffn_val_w.T.contiguous()
+    r_weight_for_gemm = r_weight.T.contiguous()
+    k_weight_for_gemm = k_weight.T.contiguous()
+    v_weight_for_gemm = v_weight.T.contiguous()
+    o_weight_for_gemm = o_weight.T.contiguous()
+
+    hidden_size = ffn_key_w.shape[0]
+
+    save_fixture(full_dir / "layer_0.npz",
+                 # Block input
+                 input=(x_block, (C, T_full, B_full, 1)),
+
+                 # Initial states
+                 att_state_in=(att_state_in, (N, N, H, B_full)),
+                 att_token_shift_state=(att_token_shift_state, (C, B_full, 1, 1)),
+                 ffn_state_in=(ffn_state_in, (C, B_full, 1, 1)),
+
+                 # Layer norms
+                 ln1_weight=(ln1_w, (C, 1, 1, 1)),
+                 ln1_bias=(ln1_b, (C, 1, 1, 1)),
+                 ln2_weight=(ln2_w, (C, 1, 1, 1)),
+                 ln2_bias=(ln2_b, (C, 1, 1, 1)),
+
+                 # Time-mix weights (key ones for testing)
+                 x_r=(x_r, (C, 1, 1, 1)),
+                 x_w=(x_w, (C, 1, 1, 1)),
+                 x_k_att=(x_k, (C, 1, 1, 1)),
+                 x_v=(x_v, (C, 1, 1, 1)),
+                 x_a=(x_a, (C, 1, 1, 1)),
+                 x_g=(x_g, (C, 1, 1, 1)),
+                 w0=(w0, (C, 1, 1, 1)),
+                 # LoRA weights: store transposed data, keep original shape
+                 # This matches how channel_mix stores ffn_key_w.T with shape (hidden, C)
+                 # rocBLAS column-major interprets the transposed row-major data correctly
+                 w1=(w1.T.contiguous(), (w1.shape[0], w1.shape[1], 1, 1)),
+                 w2=(w2.T.contiguous(), (w2.shape[0], w2.shape[1], 1, 1)),
+                 a0=(a0, (C, 1, 1, 1)),
+                 a1=(a1.T.contiguous(), (a1.shape[0], a1.shape[1], 1, 1)),
+                 a2=(a2.T.contiguous(), (a2.shape[0], a2.shape[1], 1, 1)),
+                 g1=(g1.T.contiguous(), (g1.shape[0], g1.shape[1], 1, 1)),
+                 g2=(g2.T.contiguous(), (g2.shape[0], g2.shape[1], 1, 1)),
+                 k_k=(k_k, (C, 1, 1, 1)),
+                 k_a=(k_a, (C, 1, 1, 1)),
+                 # r_k is [H, N] in PyTorch, saved with shape (N, H, 1, 1) matching wkv_bonus fixture
+                 # NO transpose needed - row-major [H, N] data with column-major (N, H) shape works
+                 r_k_weight=(r_k, (N, H, 1, 1)),
+                 r_weight=(r_weight_for_gemm, (C, C, 1, 1)),
+                 k_weight=(k_weight_for_gemm, (C, C, 1, 1)),
+                 v_weight=(v_weight_for_gemm, (C, C, 1, 1)),
+                 o_weight=(o_weight_for_gemm, (C, C, 1, 1)),
+                 ln_x_weight=(ln_x_w, (C, 1, 1, 1)),
+                 ln_x_bias=(ln_x_b, (C, 1, 1, 1)),
+
+                 # FFN weights
+                 x_k_ffn=(ffn_x_k, (C, 1, 1, 1)),
+                 ffn_key_weight=(key_w_for_gemm_block, (hidden_size, C, 1, 1)),
+                 ffn_value_weight=(val_w_for_gemm_block, (C, hidden_size, 1, 1)),
+
+                 # Intermediates
+                 after_ln1=(x_ln1, (C, T_full, B_full, 1)),
+                 w_proj=(w_proj, (C, T_full, B_full, 1)),
+                 a_proj=(a_proj, (C, T_full, B_full, 1)),
+                 g_proj=(g_proj, (C, T_full, B_full, 1)),
+                 r_proj=(r_proj, (C, T_full, B_full, 1)),
+                 k_proj=(k_proj_att, (C, T_full, B_full, 1)),
+                 v_proj=(v_proj, (C, T_full, B_full, 1)),
+                 kk=(kk_block, (C, T_full, B_full, 1)),
+                 k_ctrl=(k_ctrl_block, (C, T_full, B_full, 1)),
+                 wkv_out=(wkv_out_flat_block, (C, T_full, B_full, 1)),
+                 wkv_bonus_out=(wkv_bonus.view(B_full, T_full, C), (C, T_full, B_full, 1)),
+                 after_time_mix=(x_after_att, (C, T_full, B_full, 1)),
+                 after_ln2=(x_ln2, (C, T_full, B_full, 1)),
+
+                 # Expected outputs
+                 expected_output=(x_final, (C, T_full, B_full, 1)),
+                 expected_att_state=(wkv_state_out_block, (N, N, H, B_full)),
+                 expected_att_token_shift_state=(new_att_token_shift_state, (C, B_full, 1, 1)),
+                 expected_ffn_state=(new_ffn_state, (C, B_full, 1, 1)))
+
+    print("  Layer fixtures generated (including full_block)")
 
 
 def generate_model_fixtures(output_dir: Path, config: dict, model_path: Optional[Path] = None):
