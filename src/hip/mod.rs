@@ -150,6 +150,17 @@ extern "C" {
         t: c_int,
         stream: HipStream
     ) -> HipError;
+    fn launch_channel_mix_state_f32(
+        x: *const f32,
+        state_in: *const f32,
+        x_k: *const f32,
+        output: *mut f32,
+        state_out: *mut f32,
+        c: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1787,6 +1798,121 @@ pub fn hip_token_shift(
     let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
 
     token_shift_f32(&d_x, &d_state_in, &d_mix, &mut d_output, &mut d_state_out, &stream)?;
+
+    let output = d_output.to_vec(&stream)?;
+    let state_out = d_state_out.to_vec(&stream)?;
+
+    Ok((output, state_out))
+}
+
+/// Launch the channel-mix state kernel.
+///
+/// Same as token shift but with batch dimension.
+/// Input: [C, T, B, 1], state: [C, B, 1, 1], x_k: [C, 1, 1, 1]
+///
+/// # Arguments
+/// * `x` - Input tensor of shape [C, T, B, 1]
+/// * `state_in` - Previous state per batch of shape [C, B, 1, 1]
+/// * `x_k` - Per-channel mixing factor of shape [C, 1, 1, 1]
+/// * `output` - Output tensor of shape [C, T, B, 1]
+/// * `state_out` - New state per batch of shape [C, B, 1, 1]
+/// * `stream` - HIP stream
+pub fn channel_mix_state_f32(
+    x: &TensorHip<f32>,
+    state_in: &TensorHip<f32>,
+    x_k: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    state_out: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    let c = x.shape()[0];
+    let t = x.shape()[1];
+    let b = x.shape()[2];
+
+    if output.shape() != x.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                x.shape(), output.shape()
+            ),
+        });
+    }
+    if state_in.shape()[0] != c || state_in.shape()[1] != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected [{}, {}, 1, 1], got {}",
+                c, b, state_in.shape()
+            ),
+        });
+    }
+    if x_k.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
+                c, x_k.shape()
+            ),
+        });
+    }
+
+    unsafe {
+        check(launch_channel_mix_state_f32(
+            x.as_ptr(),
+            state_in.as_ptr(),
+            x_k.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            c as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute channel-mix state on host data, returning (output, state_out).
+pub fn hip_channel_mix_state(
+    x: &[f32],
+    state_in: &[f32],
+    x_k: &[f32],
+    c: usize,
+    t: usize,
+    b: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    if x.len() != c * t * b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("x size mismatch: expected {}, got {}", c * t * b, x.len()),
+        });
+    }
+    if state_in.len() != c * b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("state_in size mismatch: expected {}, got {}", c * b, state_in.len()),
+        });
+    }
+    if x_k.len() != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("x_k size mismatch: expected {}, got {}", c, x_k.len()),
+        });
+    }
+
+    let stream = Stream::null();
+
+    let x_shape = TensorShape::new(c, t, b, 1);
+    let state_shape = TensorShape::new(c, b, 1, 1);
+    let xk_shape = TensorShape::new(c, 1, 1, 1);
+
+    let d_x = TensorHip::from_slice(x, x_shape, &stream)?;
+    let d_state_in = TensorHip::from_slice(state_in, state_shape, &stream)?;
+    let d_x_k = TensorHip::from_slice(x_k, xk_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(x_shape)?;
+    let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
+
+    channel_mix_state_f32(&d_x, &d_state_in, &d_x_k, &mut d_output, &mut d_state_out, &stream)?;
 
     let output = d_output.to_vec(&stream)?;
     let state_out = d_state_out.to_vec(&stream)?;

@@ -624,6 +624,78 @@ hipError_t launch_token_shift_f32(
     return hipGetLastError();
 }
 
+// ============================================================================
+// Channel-Mix State Kernel
+// Same as token shift but with batch dimension
+// Input: [C, T, B, 1], state: [C, B, 1, 1], x_k: [C, 1, 1, 1]
+// Formula: output[t] = x[t] + x_k * (prev[t] - x[t])
+// Where prev[0] = state_in, prev[t>0] = x[t-1]
+// State is updated to x[T-1] for each batch
+// ============================================================================
+
+__global__ void kernel_channel_mix_state_f32(
+    const float* __restrict__ x,          // [C, T, B, 1] - input tensor
+    const float* __restrict__ state_in,   // [C, B, 1, 1] - previous state per batch
+    const float* __restrict__ x_k,        // [C, 1, 1, 1] - mixing factor
+    float* __restrict__ output,           // [C, T, B, 1] - output
+    float* __restrict__ state_out,        // [C, B, 1, 1] - new state per batch
+    int C,                                 // Channel dimension
+    int T,                                 // Number of tokens
+    int B                                  // Batch size
+) {
+    // Each thread handles one (channel, batch) pair
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * B;
+    if (idx >= total) return;
+
+    int c = idx % C;        // Channel index
+    int b = idx / C;        // Batch index
+
+    float mix_val = x_k[c];
+    // state_in is [C, B, 1, 1] so element (c, b) is at b*C + c
+    float prev = state_in[b * C + c];
+
+    // Process each token in sequence for this (channel, batch)
+    for (int t = 0; t < T; t++) {
+        // x is [C, T, B, 1] so element (c, t, b) is at b*T*C + t*C + c
+        int offset = b * T * C + t * C + c;
+        float curr = x[offset];
+
+        // Token shift: blend current with previous
+        output[offset] = curr + mix_val * (prev - curr);
+
+        prev = curr;
+    }
+
+    // State out is the last token for this batch
+    state_out[b * C + c] = prev;
+}
+
+hipError_t launch_channel_mix_state_f32(
+    const float* x,
+    const float* state_in,
+    const float* x_k,
+    float* output,
+    float* state_out,
+    int C,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (C <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+
+    int total = C * B;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_channel_mix_state_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       x, state_in, x_k, output, state_out, C, T, B);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

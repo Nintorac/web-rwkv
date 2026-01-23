@@ -649,6 +649,52 @@ fn test_token_shift_single_fixture() {
     println!("token_shift single fixture test passed: {} elements match", output.len());
 }
 
+/// Test channel-mix state kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.15.
+#[test]
+#[cfg(feature = "hip")]
+fn test_channel_mix_state_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/channel_mix_state/basic.npz")
+        .expect("Failed to load channel_mix_state fixture");
+
+    let x = fixture.f32("x");
+    let state_in = fixture.f32("state_in");
+    let x_k = fixture.f32("x_k");
+    let expected_output = fixture.f32("expected_output");
+    let expected_state = fixture.f32("expected_state");
+    let shape = fixture.shape4("x");
+
+    let c = shape[0];
+    let t = shape[1];
+    let b = shape[2];
+
+    println!(
+        "Testing channel_mix_state: {} elements, shape {:?} (C={}, T={}, B={})",
+        x.len(),
+        shape,
+        c,
+        t,
+        b
+    );
+
+    let (output, state_out) = web_rwkv::hip::hip_channel_mix_state(x, state_in, x_k, c, t, b)
+        .expect("channel_mix_state kernel failed");
+
+    // Slightly higher tolerance due to FP32 precision differences
+    assert_tensors_close(&output, expected_output, 2e-3, 5e-4)
+        .expect("channel_mix_state output doesn't match fixture");
+
+    assert_tensors_close(&state_out, expected_state, 2e-3, 5e-4)
+        .expect("channel_mix_state state doesn't match fixture");
+
+    println!("channel_mix_state fixture test passed: {} elements match", output.len());
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {
