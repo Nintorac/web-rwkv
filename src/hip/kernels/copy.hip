@@ -1,4 +1,4 @@
-// Trivial copy kernel for testing HIP build system and FFI
+// HIP kernels for RWKV inference backend
 #include <hip/hip_runtime.h>
 
 extern "C" {
@@ -32,9 +32,93 @@ hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);
 }
 
-// Get device properties
+// Get device properties (legacy - struct layout may not match Rust)
 hipError_t hip_get_device_properties(hipDeviceProp_t* props, int device_id) {
     return hipGetDeviceProperties(props, device_id);
+}
+
+// Safe property accessors that extract individual fields to avoid ABI issues
+hipError_t hip_get_device_name(int device_id, char* name, int max_len) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    int i;
+    for (i = 0; i < max_len - 1 && props.name[i] != '\0'; i++) {
+        name[i] = props.name[i];
+    }
+    name[i] = '\0';
+    return hipSuccess;
+}
+
+hipError_t hip_get_device_gcn_arch_name(int device_id, char* name, int max_len) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    int i;
+    for (i = 0; i < max_len - 1 && props.gcnArchName[i] != '\0'; i++) {
+        name[i] = props.gcnArchName[i];
+    }
+    name[i] = '\0';
+    return hipSuccess;
+}
+
+hipError_t hip_get_device_total_memory(int device_id, size_t* total_mem) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    *total_mem = props.totalGlobalMem;
+    return hipSuccess;
+}
+
+hipError_t hip_get_device_mp_count(int device_id, int* count) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    *count = props.multiProcessorCount;
+    return hipSuccess;
+}
+
+hipError_t hip_get_device_warp_size(int device_id, int* warp_size) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    *warp_size = props.warpSize;
+    return hipSuccess;
+}
+
+hipError_t hip_get_device_compute_capability(int device_id, int* major, int* minor) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    *major = props.major;
+    *minor = props.minor;
+    return hipSuccess;
+}
+
+hipError_t hip_is_device_integrated(int device_id, int* integrated) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    *integrated = props.integrated;
+    return hipSuccess;
+}
+
+hipError_t hip_supports_cooperative_launch(int device_id, int* supported) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_id);
+    if (err != hipSuccess) return err;
+    *supported = props.cooperativeLaunch;
+    return hipSuccess;
+}
+
+// Set active device
+hipError_t hip_set_device(int device_id) {
+    return hipSetDevice(device_id);
+}
+
+// Get current device
+hipError_t hip_get_device(int* device_id) {
+    return hipGetDevice(device_id);
 }
 
 // Memory allocation

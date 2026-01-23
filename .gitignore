@@ -2,7 +2,7 @@
 /trace
 /.vscode
 .DS_Store
-
+!.beads/
 Cargo.lock
 *.st
 *.safetensors
