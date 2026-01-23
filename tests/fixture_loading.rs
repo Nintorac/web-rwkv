@@ -325,6 +325,40 @@ fn test_sigmoid_edge_cases_fixture() {
     println!("sigmoid edge cases fixture test passed");
 }
 
+/// Test squared ReLU kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.2.
+#[test]
+#[cfg(feature = "hip")]
+fn test_squared_relu_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/squared_relu/basic.npz")
+        .expect("Failed to load squared_relu fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+
+    println!(
+        "Testing squared_relu: {} elements, shape {:?}",
+        input.len(),
+        shape
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_squared_relu(input)
+        .expect("squared_relu kernel failed");
+
+    // Compare with fixture (< 1e-3 relative error per acceptance criteria)
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("squared_relu output doesn't match fixture");
+
+    println!("squared_relu fixture test passed: {} elements match", output.len());
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {

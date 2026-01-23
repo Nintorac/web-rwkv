@@ -107,6 +107,7 @@ extern "C" {
     fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_lerp_f32(a: *const f32, b: *const f32, t: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_sigmoid_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    fn launch_squared_relu_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1195,6 +1196,54 @@ pub fn hip_sigmoid(input: &[f32]) -> Result<Vec<f32>> {
     d_output.to_vec(&stream)
 }
 
+/// Launch the squared ReLU kernel: out = max(0, x)^2
+///
+/// Used in RWKV7 channel mixing.
+pub fn squared_relu_f32(
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "squared_relu_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_squared_relu_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute squared ReLU on host data, returning results.
+/// This is a convenience function for testing.
+pub fn hip_squared_relu(input: &[f32]) -> Result<Vec<f32>> {
+    let stream = Stream::null();
+    let shape = TensorShape::new(input.len(), 1, 1, 1);
+
+    let d_input = TensorHip::from_slice(input, shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(shape)?;
+
+    squared_relu_f32(&d_input, &mut d_output, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1657,5 +1706,35 @@ mod tests {
         assert!(output[6] >= 1.0 - 1e-10, "sigmoid(100) should be ≈1, got {}", output[6]);
 
         println!("Sigmoid edge case test passed: all {} values are finite and in [0,1]", output.len());
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.2 (Squared ReLU Kernel) ===
+
+    #[test]
+    fn test_squared_relu() {
+        // Test basic squared ReLU: out = max(0, x)^2
+        let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+
+        let output = hip_squared_relu(&input).expect("squared_relu kernel failed");
+
+        // Expected: max(0, x)^2
+        // [-2] -> 0^2 = 0
+        // [-1] -> 0^2 = 0
+        // [0]  -> 0^2 = 0
+        // [1]  -> 1^2 = 1
+        // [2]  -> 2^2 = 4
+        // [3]  -> 3^2 = 9
+        let expected = vec![0.0, 0.0, 0.0, 1.0, 4.0, 9.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Squared ReLU test passed: {} values verified", output.len());
     }
 }

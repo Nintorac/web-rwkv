@@ -134,6 +134,36 @@ hipError_t launch_sigmoid_f32(const float* input, float* output, int n, hipStrea
     return hipGetLastError();
 }
 
+// ============================================================================
+// Squared ReLU Kernel: out = max(0, x)^2
+// Used in RWKV7 channel mixing
+// ============================================================================
+
+__global__ void kernel_squared_relu_f32(const float* __restrict__ input,
+                                         float* __restrict__ output,
+                                         int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = input[idx];
+        float relu = fmaxf(0.0f, x);
+        output[idx] = relu * relu;
+    }
+}
+
+hipError_t launch_squared_relu_f32(const float* input, float* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_squared_relu_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);
