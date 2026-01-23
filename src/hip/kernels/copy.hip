@@ -164,6 +164,48 @@ hipError_t launch_squared_relu_f32(const float* input, float* output, int n, hip
     return hipGetLastError();
 }
 
+// ============================================================================
+// Softplus Decay Kernel: out = log(sigmoid(x)) - 0.5 = -softplus(-x) - 0.5
+// Used for RWKV7 time decay computation
+// ============================================================================
+
+__global__ void kernel_softplus_decay_f32(const float* __restrict__ input,
+                                           float* __restrict__ output,
+                                           int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = input[idx];
+        // log(sigmoid(x)) - 0.5 = -log(1 + exp(-x)) - 0.5
+        // Numerically stable: for large positive x, exp(-x) -> 0, so result -> -0.5
+        //                     for large negative x, result -> x - 0.5
+        float log_sigmoid;
+        if (x > 20.0f) {
+            // For large positive x, log(sigmoid(x)) ≈ 0
+            log_sigmoid = 0.0f;
+        } else if (x < -20.0f) {
+            // For large negative x, log(sigmoid(x)) ≈ x
+            log_sigmoid = x;
+        } else {
+            log_sigmoid = -__logf(1.0f + __expf(-x));
+        }
+        output[idx] = log_sigmoid - 0.5f;
+    }
+}
+
+hipError_t launch_softplus_decay_f32(const float* input, float* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_softplus_decay_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

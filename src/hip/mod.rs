@@ -108,6 +108,7 @@ extern "C" {
     fn launch_lerp_f32(a: *const f32, b: *const f32, t: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_sigmoid_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_squared_relu_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    fn launch_softplus_decay_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1244,6 +1245,55 @@ pub fn hip_squared_relu(input: &[f32]) -> Result<Vec<f32>> {
     d_output.to_vec(&stream)
 }
 
+/// Launch the softplus decay kernel: out = log(sigmoid(x)) - 0.5
+///
+/// Used for RWKV7 time decay computation.
+/// Numerically stable for all finite inputs.
+pub fn softplus_decay_f32(
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "softplus_decay_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_softplus_decay_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute softplus decay on host data, returning results.
+/// This is a convenience function for testing.
+pub fn hip_softplus_decay(input: &[f32]) -> Result<Vec<f32>> {
+    let stream = Stream::null();
+    let shape = TensorShape::new(input.len(), 1, 1, 1);
+
+    let d_input = TensorHip::from_slice(input, shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(shape)?;
+
+    softplus_decay_f32(&d_input, &mut d_output, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1736,5 +1786,73 @@ mod tests {
             );
         }
         println!("Squared ReLU test passed: {} values verified", output.len());
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.14 (Softplus Decay Kernel) ===
+
+    #[test]
+    fn test_softplus_decay() {
+        // Test softplus decay: out = log(sigmoid(x)) - 0.5
+        let input = vec![0.0, 1.0, -1.0, 5.0, -5.0];
+
+        let output = hip_softplus_decay(&input).expect("softplus_decay kernel failed");
+
+        // Expected: log(sigmoid(x)) - 0.5
+        // log(sigmoid(0)) - 0.5 = log(0.5) - 0.5 ≈ -0.693 - 0.5 = -1.193
+        // log(sigmoid(1)) - 0.5 ≈ -0.313 - 0.5 = -0.813
+        // log(sigmoid(-1)) - 0.5 ≈ -1.313 - 0.5 = -1.813
+        // log(sigmoid(5)) - 0.5 ≈ -0.0067 - 0.5 ≈ -0.507
+        // log(sigmoid(-5)) - 0.5 ≈ -5.0067 - 0.5 ≈ -5.507
+        let expected: Vec<f32> = input.iter().map(|&x| {
+            let log_sigmoid = -(1.0f32 + (-x).exp()).ln();
+            log_sigmoid - 0.5
+        }).collect();
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-4;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Softplus decay test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_softplus_decay_numerical_stability() {
+        // Test edge cases that could cause numerical issues
+        let input = vec![
+            -100.0,  // Very negative: result ≈ x - 0.5 = -100.5
+            -50.0,   // Large negative
+            -20.0,   // At clamping boundary
+            0.0,     // Zero
+            20.0,    // At clamping boundary
+            50.0,    // Large positive
+            100.0,   // Very positive: result ≈ -0.5
+        ];
+
+        let output = hip_softplus_decay(&input).expect("softplus_decay stability test failed");
+
+        // Verify no NaN or Inf values
+        for (i, &val) in output.iter().enumerate() {
+            assert!(
+                !val.is_nan(),
+                "NaN at index {} (input={})", i, input[i]
+            );
+            assert!(
+                !val.is_infinite(),
+                "Inf at index {} (input={})", i, input[i]
+            );
+        }
+
+        // Verify expected behavior at extremes
+        // For large negative x: result ≈ x - 0.5
+        assert!((output[0] - (-100.5)).abs() < 0.1, "softplus_decay(-100) should be ≈-100.5, got {}", output[0]);
+        // For large positive x: result ≈ -0.5
+        assert!((output[6] - (-0.5)).abs() < 0.01, "softplus_decay(100) should be ≈-0.5, got {}", output[6]);
+
+        println!("Softplus decay stability test passed: all {} values are finite", output.len());
     }
 }

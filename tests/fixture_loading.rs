@@ -359,6 +359,40 @@ fn test_squared_relu_fixture() {
     println!("squared_relu fixture test passed: {} elements match", output.len());
 }
 
+/// Test softplus decay kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.14.
+#[test]
+#[cfg(feature = "hip")]
+fn test_softplus_decay_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/softplus_decay/basic.npz")
+        .expect("Failed to load softplus_decay fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+
+    println!(
+        "Testing softplus_decay: {} elements, shape {:?}",
+        input.len(),
+        shape
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_softplus_decay(input)
+        .expect("softplus_decay kernel failed");
+
+    // Compare with fixture - use slightly higher tolerance due to f16 fixture precision
+    assert_tensors_close(&output, expected, 5e-3, 1e-3)
+        .expect("softplus_decay output doesn't match fixture");
+
+    println!("softplus_decay fixture test passed: {} elements match", output.len());
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {
