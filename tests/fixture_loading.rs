@@ -1382,3 +1382,150 @@ fn test_all_kernel_fixtures_loadable() {
     println!("\nLoaded {} kernel fixtures successfully", loaded);
     assert!(loaded > 0, "No fixtures were loaded");
 }
+
+// ============================================================================
+// Model Loading Tests (bd-2sh.5.4)
+// ============================================================================
+
+/// Check if the model file exists.
+fn model_exists() -> bool {
+    Path::new("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st").exists()
+}
+
+/// Check if model weight spot check fixture exists.
+fn model_fixture_exists() -> bool {
+    Path::new("tests/fixtures/model/weights_spot_check.npz").exists()
+}
+
+/// Test that the RWKV7 HIP model loads without error.
+/// Acceptance criteria 1: Model loads without error.
+#[test]
+#[cfg(feature = "hip")]
+fn test_rwkv7_hip_model_loads() {
+    if !model_exists() {
+        eprintln!("Skipping test: model file not found. Expected: /workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st");
+        return;
+    }
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load RWKV7 HIP model");
+
+    // Verify basic model info for 0.1B model
+    assert_eq!(model.info.n_layer, 12, "Expected 12 layers");
+    assert_eq!(model.info.n_embd, 768, "Expected embedding dim 768");
+    assert_eq!(model.info.n_head, 12, "Expected 12 attention heads");
+    assert_eq!(model.info.head_size, 64, "Expected head size 64");
+    assert_eq!(model.info.n_hidden, 3072, "Expected hidden dim 3072 (4x embd)");
+
+    println!("RWKV7 HIP model loaded successfully:");
+    println!("  Layers: {}", model.info.n_layer);
+    println!("  Embedding dim: {}", model.info.n_embd);
+    println!("  Attention heads: {}", model.info.n_head);
+    println!("  Head size: {}", model.info.head_size);
+    println!("  Vocabulary size: {}", model.info.n_vocab);
+    println!("  Hidden dim: {}", model.info.n_hidden);
+}
+
+/// Test that model dimensions match expected values.
+/// Acceptance criteria 2: All dimensions match expected values.
+#[test]
+#[cfg(feature = "hip")]
+fn test_rwkv7_hip_model_dimensions() {
+    if !model_exists() {
+        eprintln!("Skipping test: model file not found");
+        return;
+    }
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load model");
+
+    // Check embedding weight shape: [n_embd, n_vocab, 1, 1] in web-rwkv convention
+    let emb_shape = model.embed.w.shape();
+    assert_eq!(emb_shape.dim(0), 768, "Embedding fast axis should be n_embd=768");
+
+    // Check head weight shape: [n_embd, n_vocab, 1, 1]
+    let head_shape = model.head.w.shape();
+    assert_eq!(head_shape.dim(0), 768, "Head fast axis should be n_embd=768");
+
+    // Check layer 0 attention receptance weight: [n_embd, n_embd, 1, 1]
+    let w_r_shape = model.layers[0].att.w_r.shape();
+    assert_eq!(w_r_shape.dim(0), 768, "w_r dim 0 should be n_embd=768");
+    assert_eq!(w_r_shape.dim(1), 768, "w_r dim 1 should be n_embd=768");
+
+    // Check layer 0 FFN key weight: [n_embd, n_hidden, 1, 1]
+    let ffn_k_shape = model.layers[0].ffn.w_k.shape();
+    assert_eq!(ffn_k_shape.dim(0), 768, "FFN key dim 0 should be n_embd=768");
+    assert_eq!(ffn_k_shape.dim(1), 3072, "FFN key dim 1 should be n_hidden=3072");
+
+    // Check r_k shape: [head_size, n_head, 1, 1]
+    let r_k_shape = model.layers[0].att.r_k.shape();
+    assert_eq!(r_k_shape.dim(0), 64, "r_k dim 0 should be head_size=64");
+    assert_eq!(r_k_shape.dim(1), 12, "r_k dim 1 should be n_head=12");
+
+    println!("All tensor dimensions validated:");
+    println!("  emb.w: {:?}", emb_shape);
+    println!("  head.w: {:?}", head_shape);
+    println!("  layers[0].att.w_r: {:?}", w_r_shape);
+    println!("  layers[0].ffn.w_k: {:?}", ffn_k_shape);
+    println!("  layers[0].att.r_k: {:?}", r_k_shape);
+}
+
+/// Test that model weights match Python-loaded values (spot check).
+/// Acceptance criteria 3: Spot-check weights match Python-loaded values.
+#[test]
+#[cfg(feature = "hip")]
+fn test_rwkv7_hip_model_weights_spot_check() {
+    if !model_exists() {
+        eprintln!("Skipping test: model file not found");
+        return;
+    }
+    if !model_fixture_exists() {
+        eprintln!("Skipping test: weight spot check fixture not found");
+        return;
+    }
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load model");
+
+    let fixture = TestFixture::load("tests/fixtures/model/weights_spot_check.npz")
+        .expect("Failed to load spot check fixture");
+
+    // Map fixture names to model weight names
+    let checks = [
+        ("emb_weight", "emb.weight"),
+        ("blocks_0_att_receptance_weight", "blocks.0.att.receptance.weight"),
+        ("blocks_0_att_r_k", "blocks.0.att.r_k"),
+        ("blocks_5_ffn_key_weight", "blocks.5.ffn.key.weight"),
+        ("blocks_11_ln2_weight", "blocks.11.ln2.weight"),
+        ("head_weight", "head.weight"),
+    ];
+
+    let mut passed = 0;
+    for (fixture_name, model_name) in &checks {
+        // Get expected values from fixture (first 64 elements)
+        let expected = fixture.f32(fixture_name);
+
+        // Get actual values from model
+        let actual = model.read_weight_head(model_name, 64)
+            .expect(&format!("Failed to read {}", model_name));
+
+        // Verify lengths match
+        let n = expected.len().min(actual.len());
+
+        // Compare with tolerance
+        let result = assert_tensors_close(&actual[..n], &expected[..n], 1e-3, 1e-4);
+
+        match result {
+            Ok(()) => {
+                println!("  {} matches ({} elements)", model_name, n);
+                passed += 1;
+            }
+            Err(e) => {
+                eprintln!("  {} MISMATCH: {}", model_name, e);
+            }
+        }
+    }
+
+    println!("\nWeight spot check: {}/{} passed", passed, checks.len());
+    assert_eq!(passed, checks.len(), "Some weight spot checks failed");
+}

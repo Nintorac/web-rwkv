@@ -874,6 +874,17 @@ pub struct TensorHip<T> {
     owned: bool,
 }
 
+impl<T> std::fmt::Debug for TensorHip<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorHip")
+            .field("shape", &self.view.shape)
+            .field("memory_type", &self.memory_type)
+            .field("len", &self.allocated_len)
+            .field("owned", &self.owned)
+            .finish()
+    }
+}
+
 impl<T: Copy> TensorHip<T> {
     /// Allocate a new tensor with the given shape using device memory.
     pub fn new(shape: TensorShape) -> Result<Self> {
@@ -956,6 +967,38 @@ impl<T: Copy> TensorHip<T> {
         }
 
         let tensor = Self::new(shape)?;
+        if tensor.allocated_len > 0 {
+            let size = tensor.allocated_len * std::mem::size_of::<T>();
+            unsafe {
+                check(hip_memcpy_h2d(
+                    tensor.ptr as *mut c_void,
+                    data.as_ptr() as *const c_void,
+                    size,
+                    stream.handle(),
+                ))?;
+            }
+        }
+        Ok(tensor)
+    }
+
+    /// Create a tensor from host data using managed (unified) memory.
+    ///
+    /// Managed memory can be accessed by both CPU and GPU, which is useful for
+    /// model weights on APUs where zero-copy access avoids transfer overhead.
+    pub fn from_slice_managed(data: &[T], shape: TensorShape, stream: &Stream) -> Result<Self> {
+        if data.len() != shape.len() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Data length {} doesn't match shape {} (len={})",
+                    data.len(),
+                    shape,
+                    shape.len()
+                ),
+            });
+        }
+
+        let tensor = Self::managed(shape)?;
         if tensor.allocated_len > 0 {
             let size = tensor.allocated_len * std::mem::size_of::<T>();
             unsafe {
@@ -2738,6 +2781,451 @@ pub fn hip_hgemm(
 
     // Copy back result
     d_output.to_vec(&stream)
+}
+
+// ============================================================================
+// Model Loading for RWKV7 HIP Backend
+// ============================================================================
+
+use half::f16;
+use std::path::Path;
+
+/// Information about a loaded RWKV7 model.
+#[derive(Debug, Clone)]
+pub struct Rwkv7ModelInfo {
+    /// Number of transformer layers
+    pub n_layer: usize,
+    /// Embedding dimension
+    pub n_embd: usize,
+    /// Number of attention heads
+    pub n_head: usize,
+    /// Head size (n_embd / n_head)
+    pub head_size: usize,
+    /// Vocabulary size
+    pub n_vocab: usize,
+    /// Hidden dimension for FFN
+    pub n_hidden: usize,
+}
+
+/// A single layer's layer normalization weights.
+#[derive(Debug)]
+pub struct LayerNormHip {
+    pub weight: TensorHip<f32>,
+    pub bias: TensorHip<f32>,
+}
+
+/// Attention weights for a single layer.
+#[derive(Debug)]
+pub struct AttentionHip {
+    // Token shift mix weights
+    pub x_r: TensorHip<f32>,
+    pub x_w: TensorHip<f32>,
+    pub x_k: TensorHip<f32>,
+    pub x_v: TensorHip<f32>,
+    pub x_a: TensorHip<f32>,
+    pub x_g: TensorHip<f32>,
+
+    // Decay LoRA
+    pub w0: TensorHip<f32>,
+    pub w1: TensorHip<f32>,
+    pub w2: TensorHip<f32>,
+
+    // Learning rate LoRA
+    pub a0: TensorHip<f32>,
+    pub a1: TensorHip<f32>,
+    pub a2: TensorHip<f32>,
+
+    // Gate LoRA
+    pub g1: TensorHip<f32>,
+    pub g2: TensorHip<f32>,
+
+    // Value residual LoRA (layers > 0)
+    pub v0: Option<TensorHip<f32>>,
+    pub v1: Option<TensorHip<f32>>,
+    pub v2: Option<TensorHip<f32>>,
+
+    // Key normalization weights
+    pub r_k: TensorHip<f32>,
+    pub k_k: TensorHip<f32>,
+    pub k_a: TensorHip<f32>,
+
+    // Projection matrices (column-major for rocBLAS)
+    pub w_r: TensorHip<f32>,  // Receptance: [n_embd, n_embd]
+    pub w_k: TensorHip<f32>,  // Key: [n_embd, n_embd]
+    pub w_v: TensorHip<f32>,  // Value: [n_embd, n_embd]
+    pub w_o: TensorHip<f32>,  // Output: [n_embd, n_embd]
+
+    // Group normalization
+    pub gn: LayerNormHip,
+}
+
+/// Feed-forward network weights for a single layer.
+#[derive(Debug)]
+pub struct FfnHip {
+    // Token shift mix weight
+    pub x_k: TensorHip<f32>,
+
+    // Projection matrices
+    pub w_k: TensorHip<f32>,  // Key (expand): [n_hidden, n_embd]
+    pub w_v: TensorHip<f32>,  // Value (contract): [n_embd, n_hidden]
+}
+
+/// A single transformer layer's weights.
+#[derive(Debug)]
+pub struct LayerHip {
+    pub att_ln: LayerNormHip,
+    pub ffn_ln: LayerNormHip,
+    pub att: AttentionHip,
+    pub ffn: FfnHip,
+}
+
+/// Embedding weights.
+#[derive(Debug)]
+pub struct EmbedHip {
+    pub ln: LayerNormHip,
+    pub w: TensorHip<f32>,  // [n_vocab, n_embd]
+}
+
+/// Output head weights.
+#[derive(Debug)]
+pub struct HeadHip {
+    pub ln: LayerNormHip,
+    pub w: TensorHip<f32>,  // [n_vocab, n_embd]
+}
+
+/// RWKV7 model loaded into HIP memory.
+///
+/// Weights are stored in managed memory for zero-copy APU access.
+/// All tensors use FP32 internally (converted from FP16 at load time).
+#[derive(Debug)]
+pub struct Rwkv7Hip {
+    pub info: Rwkv7ModelInfo,
+    pub embed: EmbedHip,
+    pub head: HeadHip,
+    pub layers: Vec<LayerHip>,
+}
+
+/// Error type for model loading.
+#[derive(Debug)]
+pub enum ModelLoadError {
+    Hip(HipErrorKind),
+    Io(std::io::Error),
+    SafeTensor(String),
+    InvalidModel(String),
+}
+
+impl std::fmt::Display for ModelLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelLoadError::Hip(e) => write!(f, "HIP error: {}", e),
+            ModelLoadError::Io(e) => write!(f, "IO error: {}", e),
+            ModelLoadError::SafeTensor(e) => write!(f, "SafeTensor error: {}", e),
+            ModelLoadError::InvalidModel(e) => write!(f, "Invalid model: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ModelLoadError {}
+
+impl From<HipErrorKind> for ModelLoadError {
+    fn from(e: HipErrorKind) -> Self {
+        ModelLoadError::Hip(e)
+    }
+}
+
+impl From<std::io::Error> for ModelLoadError {
+    fn from(e: std::io::Error) -> Self {
+        ModelLoadError::Io(e)
+    }
+}
+
+/// Load a tensor from SafeTensors, converting f16 to f32 and loading into managed HIP memory.
+fn load_tensor_f32(
+    st: &safetensors::SafeTensors,
+    name: &str,
+    stream: &Stream,
+) -> std::result::Result<TensorHip<f32>, ModelLoadError> {
+    let tensor = st.tensor(name).map_err(|e| ModelLoadError::SafeTensor(format!("{}: {}", name, e)))?;
+
+    let shape_st = tensor.shape();
+    let dtype = tensor.dtype();
+    let data = tensor.data();
+
+    // Convert f16 bytes to f32 vec
+    let f32_data: Vec<f32> = match dtype {
+        safetensors::Dtype::F16 => {
+            let f16_slice: &[f16] = bytemuck::cast_slice(data);
+            f16_slice.iter().map(|x| x.to_f32()).collect()
+        }
+        safetensors::Dtype::F32 => {
+            bytemuck::cast_slice(data).to_vec()
+        }
+        safetensors::Dtype::BF16 => {
+            let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
+            bf16_slice.iter().map(|x| x.to_f32()).collect()
+        }
+        _ => return Err(ModelLoadError::InvalidModel(format!(
+            "Unsupported dtype {:?} for tensor {}", dtype, name
+        ))),
+    };
+
+    // Convert shape to TensorShape (web-rwkv convention: shape[0] is fastest axis)
+    // SafeTensors stores shape as [slow, ..., fast], so we need to reverse
+    let hip_shape = match shape_st.len() {
+        1 => TensorShape::new(shape_st[0], 1, 1, 1),
+        2 => TensorShape::new(shape_st[1], shape_st[0], 1, 1),
+        3 => TensorShape::new(shape_st[2], shape_st[1], shape_st[0], 1),
+        4 => TensorShape::new(shape_st[3], shape_st[2], shape_st[1], shape_st[0]),
+        _ => return Err(ModelLoadError::InvalidModel(format!(
+            "Unsupported shape {:?} for tensor {}", shape_st, name
+        ))),
+    };
+
+    TensorHip::from_slice_managed(&f32_data, hip_shape, stream).map_err(ModelLoadError::from)
+}
+
+/// Load layer normalization weights.
+fn load_layer_norm(
+    st: &safetensors::SafeTensors,
+    prefix: &str,
+    stream: &Stream,
+) -> std::result::Result<LayerNormHip, ModelLoadError> {
+    let weight = load_tensor_f32(st, &format!("{}.weight", prefix), stream)?;
+    let bias = load_tensor_f32(st, &format!("{}.bias", prefix), stream)?;
+    Ok(LayerNormHip { weight, bias })
+}
+
+impl Rwkv7Hip {
+    /// Load an RWKV7 model from a SafeTensors file.
+    ///
+    /// Weights are loaded into managed (unified) memory for efficient APU access.
+    /// All weights are converted to FP32 for computation.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the .st (SafeTensors) file
+    ///
+    /// # Returns
+    /// The loaded model with all weights in HIP memory, or an error.
+    pub fn load<P: AsRef<Path>>(path: P) -> std::result::Result<Self, ModelLoadError> {
+        let data = std::fs::read(path.as_ref())?;
+        let st = safetensors::SafeTensors::deserialize(&data)
+            .map_err(|e| ModelLoadError::SafeTensor(format!("Failed to parse SafeTensors: {}", e)))?;
+
+        let stream = Stream::null();
+
+        // Detect model dimensions from tensor shapes
+        let embed_tensor = st.tensor("emb.weight")
+            .map_err(|e| ModelLoadError::SafeTensor(format!("emb.weight: {}", e)))?;
+        let embed_shape = embed_tensor.shape();  // [n_vocab, n_embd]
+        let n_vocab = embed_shape[0];
+        let n_embd = embed_shape[1];
+
+        // Get n_head from r_k tensor (RWKV7-specific)
+        let r_k_tensor = st.tensor("blocks.0.att.r_k")
+            .map_err(|e| ModelLoadError::SafeTensor(format!("blocks.0.att.r_k: {}", e)))?;
+        let n_head = r_k_tensor.shape()[0];
+        let head_size = n_embd / n_head;
+
+        // Get n_hidden from FFN key weight
+        let ffn_k_tensor = st.tensor("blocks.0.ffn.key.weight")
+            .map_err(|e| ModelLoadError::SafeTensor(format!("blocks.0.ffn.key.weight: {}", e)))?;
+        let n_hidden = ffn_k_tensor.shape()[0];
+
+        // Count layers
+        let n_layer = st.names().iter()
+            .filter_map(|name| {
+                if name.starts_with("blocks.") {
+                    let rest = name.strip_prefix("blocks.")?;
+                    let layer_num: usize = rest.split('.').next()?.parse().ok()?;
+                    Some(layer_num + 1)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(0);
+
+        if n_layer == 0 {
+            return Err(ModelLoadError::InvalidModel("No layers found".to_string()));
+        }
+
+        let info = Rwkv7ModelInfo {
+            n_layer,
+            n_embd,
+            n_head,
+            head_size,
+            n_vocab,
+            n_hidden,
+        };
+
+        log::info!("Loading RWKV7 model: {} layers, {} embd, {} heads, {} vocab",
+            n_layer, n_embd, n_head, n_vocab);
+
+        // Load embedding
+        let embed = EmbedHip {
+            ln: load_layer_norm(&st, "blocks.0.ln0", &stream)?,
+            w: load_tensor_f32(&st, "emb.weight", &stream)?,
+        };
+
+        // Load output head
+        let head = HeadHip {
+            ln: load_layer_norm(&st, "ln_out", &stream)?,
+            w: load_tensor_f32(&st, "head.weight", &stream)?,
+        };
+
+        // Load layers
+        let mut layers = Vec::with_capacity(n_layer);
+        for layer_idx in 0..n_layer {
+            let prefix = format!("blocks.{}", layer_idx);
+
+            // Attention layer norm
+            let att_ln = load_layer_norm(&st, &format!("{}.ln1", prefix), &stream)?;
+
+            // FFN layer norm
+            let ffn_ln = load_layer_norm(&st, &format!("{}.ln2", prefix), &stream)?;
+
+            // Attention weights
+            let att = AttentionHip {
+                x_r: load_tensor_f32(&st, &format!("{}.att.x_r", prefix), &stream)?,
+                x_w: load_tensor_f32(&st, &format!("{}.att.x_w", prefix), &stream)?,
+                x_k: load_tensor_f32(&st, &format!("{}.att.x_k", prefix), &stream)?,
+                x_v: load_tensor_f32(&st, &format!("{}.att.x_v", prefix), &stream)?,
+                x_a: load_tensor_f32(&st, &format!("{}.att.x_a", prefix), &stream)?,
+                x_g: load_tensor_f32(&st, &format!("{}.att.x_g", prefix), &stream)?,
+
+                w0: load_tensor_f32(&st, &format!("{}.att.w0", prefix), &stream)?,
+                w1: load_tensor_f32(&st, &format!("{}.att.w1", prefix), &stream)?,
+                w2: load_tensor_f32(&st, &format!("{}.att.w2", prefix), &stream)?,
+
+                a0: load_tensor_f32(&st, &format!("{}.att.a0", prefix), &stream)?,
+                a1: load_tensor_f32(&st, &format!("{}.att.a1", prefix), &stream)?,
+                a2: load_tensor_f32(&st, &format!("{}.att.a2", prefix), &stream)?,
+
+                g1: load_tensor_f32(&st, &format!("{}.att.g1", prefix), &stream)?,
+                g2: load_tensor_f32(&st, &format!("{}.att.g2", prefix), &stream)?,
+
+                // Value residual LoRA (only for layers > 0)
+                v0: if layer_idx > 0 {
+                    Some(load_tensor_f32(&st, &format!("{}.att.v0", prefix), &stream)?)
+                } else {
+                    None
+                },
+                v1: if layer_idx > 0 {
+                    Some(load_tensor_f32(&st, &format!("{}.att.v1", prefix), &stream)?)
+                } else {
+                    None
+                },
+                v2: if layer_idx > 0 {
+                    Some(load_tensor_f32(&st, &format!("{}.att.v2", prefix), &stream)?)
+                } else {
+                    None
+                },
+
+                r_k: load_tensor_f32(&st, &format!("{}.att.r_k", prefix), &stream)?,
+                k_k: load_tensor_f32(&st, &format!("{}.att.k_k", prefix), &stream)?,
+                k_a: load_tensor_f32(&st, &format!("{}.att.k_a", prefix), &stream)?,
+
+                w_r: load_tensor_f32(&st, &format!("{}.att.receptance.weight", prefix), &stream)?,
+                w_k: load_tensor_f32(&st, &format!("{}.att.key.weight", prefix), &stream)?,
+                w_v: load_tensor_f32(&st, &format!("{}.att.value.weight", prefix), &stream)?,
+                w_o: load_tensor_f32(&st, &format!("{}.att.output.weight", prefix), &stream)?,
+
+                gn: load_layer_norm(&st, &format!("{}.att.ln_x", prefix), &stream)?,
+            };
+
+            // FFN weights
+            let ffn = FfnHip {
+                x_k: load_tensor_f32(&st, &format!("{}.ffn.x_k", prefix), &stream)?,
+                w_k: load_tensor_f32(&st, &format!("{}.ffn.key.weight", prefix), &stream)?,
+                w_v: load_tensor_f32(&st, &format!("{}.ffn.value.weight", prefix), &stream)?,
+            };
+
+            layers.push(LayerHip { att_ln, ffn_ln, att, ffn });
+        }
+
+        // Synchronize to ensure all transfers are complete
+        stream.synchronize()?;
+
+        log::info!("RWKV7 model loaded successfully");
+
+        Ok(Self { info, embed, head, layers })
+    }
+
+    /// Get a reference to a specific weight tensor by name (for spot-checking).
+    ///
+    /// Name format examples:
+    /// - "emb.weight" - embedding weights
+    /// - "blocks.0.att.receptance.weight" - layer 0 attention receptance
+    /// - "blocks.5.ffn.key.weight" - layer 5 FFN key weights
+    /// - "head.weight" - output head weights
+    pub fn get_weight(&self, name: &str) -> Option<&TensorHip<f32>> {
+        if name == "emb.weight" {
+            return Some(&self.embed.w);
+        }
+        if name == "head.weight" {
+            return Some(&self.head.w);
+        }
+        if name.starts_with("blocks.") {
+            let parts: Vec<&str> = name.strip_prefix("blocks.")?.split('.').collect();
+            if parts.is_empty() {
+                return None;
+            }
+            let layer_idx: usize = parts[0].parse().ok()?;
+            if layer_idx >= self.layers.len() {
+                return None;
+            }
+            let layer = &self.layers[layer_idx];
+            let rest = parts[1..].join(".");
+
+            return match rest.as_str() {
+                "ln1.weight" => Some(&layer.att_ln.weight),
+                "ln1.bias" => Some(&layer.att_ln.bias),
+                "ln2.weight" => Some(&layer.ffn_ln.weight),
+                "ln2.bias" => Some(&layer.ffn_ln.bias),
+                "att.x_r" => Some(&layer.att.x_r),
+                "att.x_w" => Some(&layer.att.x_w),
+                "att.x_k" => Some(&layer.att.x_k),
+                "att.x_v" => Some(&layer.att.x_v),
+                "att.x_a" => Some(&layer.att.x_a),
+                "att.x_g" => Some(&layer.att.x_g),
+                "att.w0" => Some(&layer.att.w0),
+                "att.w1" => Some(&layer.att.w1),
+                "att.w2" => Some(&layer.att.w2),
+                "att.a0" => Some(&layer.att.a0),
+                "att.a1" => Some(&layer.att.a1),
+                "att.a2" => Some(&layer.att.a2),
+                "att.g1" => Some(&layer.att.g1),
+                "att.g2" => Some(&layer.att.g2),
+                "att.r_k" => Some(&layer.att.r_k),
+                "att.k_k" => Some(&layer.att.k_k),
+                "att.k_a" => Some(&layer.att.k_a),
+                "att.receptance.weight" => Some(&layer.att.w_r),
+                "att.key.weight" => Some(&layer.att.w_k),
+                "att.value.weight" => Some(&layer.att.w_v),
+                "att.output.weight" => Some(&layer.att.w_o),
+                "att.ln_x.weight" => Some(&layer.att.gn.weight),
+                "att.ln_x.bias" => Some(&layer.att.gn.bias),
+                "ffn.x_k" => Some(&layer.ffn.x_k),
+                "ffn.key.weight" => Some(&layer.ffn.w_k),
+                "ffn.value.weight" => Some(&layer.ffn.w_v),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Read the first N elements of a weight tensor back to the host.
+    ///
+    /// Useful for spot-checking loaded weights against reference values.
+    pub fn read_weight_head(&self, name: &str, n: usize) -> std::result::Result<Vec<f32>, ModelLoadError> {
+        let tensor = self.get_weight(name)
+            .ok_or_else(|| ModelLoadError::InvalidModel(format!("Weight not found: {}", name)))?;
+
+        let stream = Stream::null();
+        let all_data = tensor.to_vec(&stream)?;
+        let n = n.min(all_data.len());
+        Ok(all_data[..n].to_vec())
+    }
 }
 
 #[cfg(test)]
