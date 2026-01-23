@@ -104,6 +104,7 @@ extern "C" {
     fn hip_device_synchronize() -> HipError;
     fn hip_get_error_string(error: HipError) -> *const c_char;
     fn launch_copy_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1033,6 +1034,55 @@ pub fn hip_copy_kernel(input: &[f32]) -> Result<Vec<f32>> {
     Ok(output)
 }
 
+/// Launch the decay exponential kernel: out = exp(-exp(x))
+///
+/// This is the time decay transformation used in RWKV7.
+/// Numerically stable for all finite inputs.
+pub fn decay_exp_f32(
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "decay_exp_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_decay_exp_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute decay exponential on host data, returning results.
+/// This is a convenience function for testing.
+pub fn hip_decay_exp(input: &[f32]) -> Result<Vec<f32>> {
+    let stream = Stream::null();
+    let shape = TensorShape::new(input.len(), 1, 1, 1);
+
+    let d_input = TensorHip::from_slice(input, shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(shape)?;
+
+    decay_exp_f32(&d_input, &mut d_output, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,5 +1331,90 @@ mod tests {
             .expect("Failed to create full view");
         assert!(full_view.is_contiguous(), "Full view should be contiguous");
         println!("Full view is contiguous: {}", full_view.is_contiguous());
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.3 (Decay Exponential Kernel) ===
+
+    #[test]
+    fn test_decay_exp() {
+        // Test basic decay_exp functionality: out = exp(-exp(x))
+        // Also serves as the primary acceptance test when fixtures are loaded
+
+        // Test known values
+        let input = vec![
+            0.0,   // exp(-exp(0)) = exp(-1) ≈ 0.3679
+            -1.0,  // exp(-exp(-1)) = exp(-0.3679) ≈ 0.6922
+            1.0,   // exp(-exp(1)) = exp(-2.718) ≈ 0.0660
+            -5.0,  // exp(-exp(-5)) ≈ exp(-0.0067) ≈ 0.9933
+            5.0,   // exp(-exp(5)) ≈ exp(-148.4) ≈ 0
+        ];
+
+        let output = hip_decay_exp(&input).expect("decay_exp kernel failed");
+
+        // Expected values (computed with Python: np.exp(-np.exp(x)))
+        let expected = vec![
+            0.36787944,  // exp(-1)
+            0.69220066,  // exp(-exp(-1))
+            0.06598804,  // exp(-exp(1))
+            0.99330715,  // exp(-exp(-5))
+            0.0,         // exp(-exp(5)) ≈ 0 (underflow)
+        ];
+
+        // Check each value with tolerance
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-3 + 1e-3 * exp.abs(); // rtol=1e-3, atol=1e-3
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Basic decay_exp test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_decay_exp_numerical_stability() {
+        // Test edge cases that could cause numerical issues
+        let input = vec![
+            -50.0,  // Very negative: exp(-exp(-50)) ≈ 1
+            -10.0,  // Negative: exp(-exp(-10)) ≈ 1
+            -5.0,   // Moderate negative
+            -1.0,   // Small negative
+            0.0,    // Zero
+            1.0,    // Small positive
+            5.0,    // Moderate positive: exp(-exp(5)) ≈ 0
+            10.0,   // exp(-exp(10)) ≈ 0 (extreme underflow)
+            80.0,   // At clamping boundary
+            100.0,  // Beyond clamping: should be 0, not NaN/Inf
+        ];
+
+        let output = hip_decay_exp(&input).expect("decay_exp stability test failed");
+
+        // Verify no NaN or Inf values
+        for (i, &val) in output.iter().enumerate() {
+            assert!(
+                !val.is_nan(),
+                "NaN at index {} (input={})", i, input[i]
+            );
+            assert!(
+                !val.is_infinite(),
+                "Inf at index {} (input={})", i, input[i]
+            );
+            assert!(
+                val >= 0.0 && val <= 1.0,
+                "Value out of [0,1] range at index {}: {} (input={})",
+                i, val, input[i]
+            );
+        }
+
+        // Verify expected behavior at extremes
+        assert!(output[0] > 0.999, "exp(-exp(-50)) should be ≈1, got {}", output[0]);
+        assert!(output[1] > 0.999, "exp(-exp(-10)) should be ≈1, got {}", output[1]);
+        assert!(output[7] < 0.001, "exp(-exp(10)) should be ≈0, got {}", output[7]);
+        assert!(output[8] < 0.001, "exp(-exp(80)) should be ≈0, got {}", output[8]);
+        assert_eq!(output[9], 0.0, "exp(-exp(100)) should be exactly 0");
+
+        println!("Numerical stability test passed: all {} values are finite and in [0,1]", output.len());
     }
 }

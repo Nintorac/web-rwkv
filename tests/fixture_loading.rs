@@ -144,6 +144,78 @@ fn test_tensor_comparison() {
     );
 }
 
+/// Test decay_exp kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.3.
+#[test]
+#[cfg(feature = "hip")]
+fn test_decay_exp_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/decay_exp/basic.npz")
+        .expect("Failed to load decay_exp fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+
+    println!(
+        "Testing decay_exp: {} elements, shape {:?}",
+        input.len(),
+        shape
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_decay_exp(input)
+        .expect("decay_exp kernel failed");
+
+    // Compare with fixture
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("decay_exp output doesn't match fixture");
+
+    println!("decay_exp fixture test passed: {} elements match", output.len());
+}
+
+/// Test decay_exp numerical stability against edge case fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.3.
+#[test]
+#[cfg(feature = "hip")]
+fn test_decay_exp_stability_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/decay_exp/stability.npz")
+        .expect("Failed to load decay_exp stability fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+
+    println!(
+        "Testing decay_exp stability: {} edge case values",
+        input.len()
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_decay_exp(input)
+        .expect("decay_exp stability kernel failed");
+
+    // Verify no NaN/Inf
+    for (i, &val) in output.iter().enumerate() {
+        assert!(!val.is_nan(), "NaN at index {} (input={})", i, input[i]);
+        assert!(!val.is_infinite(), "Inf at index {} (input={})", i, input[i]);
+    }
+
+    // Compare with fixture
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("decay_exp stability output doesn't match fixture");
+
+    println!("decay_exp stability fixture test passed");
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {
