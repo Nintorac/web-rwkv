@@ -349,6 +349,217 @@ hipError_t launch_layer_norm_f32(
     return hipGetLastError();
 }
 
+// ============================================================================
+// Group Normalization Kernel
+// Normalizes input tensor per group of channels
+// Input shape: [C, N, 1, 1] - C is channel dimension (fastest axis)
+// With G groups, each group has C/G channels
+// For each of the N vectors, normalize each group independently
+// ============================================================================
+
+// Group normalization kernel
+// Each block handles one (vector, group) pair
+// Grid: (num_groups, N)
+__global__ void kernel_group_norm_f32(
+    const float* __restrict__ input,      // [C, N, 1, 1]
+    const float* __restrict__ weight,     // [C, 1, 1, 1]
+    const float* __restrict__ bias,       // [C, 1, 1, 1]
+    float* __restrict__ output,           // [C, N, 1, 1]
+    int C,                                 // Total channels
+    int N,                                 // Number of vectors
+    int G,                                 // Number of groups
+    float eps                              // Epsilon for numerical stability
+) {
+    int group_idx = blockIdx.x;
+    int vec_idx = blockIdx.y;
+
+    if (group_idx >= G || vec_idx >= N) return;
+
+    int channels_per_group = C / G;
+
+    // Shared memory for block reduction
+    __shared__ float shared_mem[LAYERNORM_BLOCK_SIZE / 32];
+    __shared__ float mean_shared;
+    __shared__ float rstd_shared;
+
+    // Base offset for this vector in memory
+    int vec_offset = vec_idx * C;
+    // Start channel for this group
+    int group_start = group_idx * channels_per_group;
+
+    // Step 1: Compute mean for this group
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
+        int c = group_start + i;
+        local_sum += input[vec_offset + c];
+    }
+
+    float total_sum = block_reduce_sum(local_sum, shared_mem);
+
+    if (threadIdx.x == 0) {
+        mean_shared = total_sum / (float)channels_per_group;
+    }
+    __syncthreads();
+
+    float mean = mean_shared;
+
+    // Step 2: Compute variance for this group
+    float local_var_sum = 0.0f;
+    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
+        int c = group_start + i;
+        float x = input[vec_offset + c];
+        float diff = x - mean;
+        local_var_sum += diff * diff;
+    }
+
+    float total_var_sum = block_reduce_sum(local_var_sum, shared_mem);
+
+    if (threadIdx.x == 0) {
+        float variance = total_var_sum / (float)channels_per_group;
+        rstd_shared = rsqrtf(variance + eps);
+    }
+    __syncthreads();
+
+    float rstd = rstd_shared;
+
+    // Step 3: Normalize and apply per-channel weight/bias
+    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
+        int c = group_start + i;
+        float x = input[vec_offset + c];
+        float normalized = (x - mean) * rstd;
+        output[vec_offset + c] = normalized * weight[c] + bias[c];
+    }
+}
+
+hipError_t launch_group_norm_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int C,          // Total channels
+    int N,          // Number of vectors
+    int G,          // Number of groups
+    float eps,
+    hipStream_t stream
+) {
+    if (C <= 0 || N <= 0 || G <= 0) {
+        return hipSuccess;
+    }
+
+    // Each block handles one (group, vector) pair
+    int block_size = LAYERNORM_BLOCK_SIZE;
+    dim3 grid_size(G, N);
+
+    hipLaunchKernelGGL(kernel_group_norm_f32, grid_size, dim3(block_size), 0, stream,
+                       input, weight, bias, output, C, N, G, eps);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// L2 Normalization Kernel (Key Normalization)
+// Normalizes vectors to unit L2 norm, per head
+// Used for key normalization in RWKV7
+// ============================================================================
+
+__global__ void kernel_l2_norm_f32(
+    const float* __restrict__ input,      // [C, N, 1, 1] where C = H * head_size
+    float* __restrict__ output,           // [C, N, 1, 1]
+    int C,                                 // Total channels
+    int N,                                 // Number of vectors
+    int head_size,                         // Size of each head (normalize over this)
+    float eps                              // Epsilon for numerical stability
+) {
+    int H = C / head_size;  // Number of heads
+    int head_idx = blockIdx.x;
+    int vec_idx = blockIdx.y;
+
+    if (head_idx >= H || vec_idx >= N) return;
+
+    // Shared memory for block reduction
+    __shared__ float shared_mem[LAYERNORM_BLOCK_SIZE / 32];
+    __shared__ float rnorm_shared;  // 1 / sqrt(sum_sq + eps)
+
+    // Base offset for this vector in memory
+    int vec_offset = vec_idx * C;
+    // Start channel for this head
+    int head_start = head_idx * head_size;
+
+    // Step 1: Compute sum of squares
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+        int c = head_start + i;
+        float x = input[vec_offset + c];
+        local_sum_sq += x * x;
+    }
+
+    float total_sum_sq = block_reduce_sum(local_sum_sq, shared_mem);
+
+    if (threadIdx.x == 0) {
+        rnorm_shared = rsqrtf(total_sum_sq + eps);
+    }
+    __syncthreads();
+
+    float rnorm = rnorm_shared;
+
+    // Step 2: Normalize
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+        int c = head_start + i;
+        output[vec_offset + c] = input[vec_offset + c] * rnorm;
+    }
+}
+
+hipError_t launch_l2_norm_f32(
+    const float* input,
+    float* output,
+    int C,          // Total channels (H * head_size)
+    int N,          // Number of vectors
+    int head_size,  // Size per head
+    float eps,
+    hipStream_t stream
+) {
+    if (C <= 0 || N <= 0 || head_size <= 0) {
+        return hipSuccess;
+    }
+
+    int H = C / head_size;
+    int block_size = LAYERNORM_BLOCK_SIZE;
+    dim3 grid_size(H, N);
+
+    hipLaunchKernelGGL(kernel_l2_norm_f32, grid_size, dim3(block_size), 0, stream,
+                       input, output, C, N, head_size, eps);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// Tanh Activation Kernel
+// Standard tanh activation: out = tanh(x)
+// ============================================================================
+
+__global__ void kernel_tanh_f32(const float* __restrict__ input,
+                                 float* __restrict__ output,
+                                 int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = tanhf(input[idx]);
+    }
+}
+
+hipError_t launch_tanh_f32(const float* input, float* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_tanh_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

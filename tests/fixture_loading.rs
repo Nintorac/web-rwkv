@@ -485,6 +485,127 @@ fn test_layer_norm_rwkv7_eps_fixture() {
     println!("layer_norm rwkv7_eps fixture test passed: {} elements match", output.len());
 }
 
+/// Test group normalization kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.6.
+#[test]
+#[cfg(feature = "hip")]
+fn test_group_norm_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/group_norm/basic.npz")
+        .expect("Failed to load group_norm fixture");
+
+    let input = fixture.f32("input");
+    let weight = fixture.f32("weight");
+    let bias = fixture.f32("bias");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+    let num_groups = fixture.i64("num_groups")[0] as usize;
+    let eps = fixture.f32("eps")[0];
+
+    let c = shape[0];
+    let n = shape[1];
+
+    println!(
+        "Testing group_norm: {} elements, shape {:?} (C={}, N={}, G={}, eps={})",
+        input.len(),
+        shape,
+        c,
+        n,
+        num_groups,
+        eps
+    );
+
+    let output = web_rwkv::hip::hip_group_norm(input, weight, bias, c, n, num_groups, eps)
+        .expect("group_norm kernel failed");
+
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("group_norm output doesn't match fixture");
+
+    println!("group_norm fixture test passed: {} elements match", output.len());
+}
+
+/// Test L2 normalization kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.7.
+#[test]
+#[cfg(feature = "hip")]
+fn test_l2_norm_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/l2_norm/basic.npz")
+        .expect("Failed to load l2_norm fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+    let head_size = fixture.i64("head_size")[0] as usize;
+
+    // Shape is [head_size, H, T, B] in fixture
+    // Total elements = head_size * H * T * B
+    // For L2 norm, we normalize each head independently
+    // C = head_size * H (total channels per token)
+    // N = T * B (number of tokens)
+    let c = shape[0] * shape[1];  // head_size * H
+    let n = shape[2] * shape[3];  // T * B
+
+    println!(
+        "Testing l2_norm: {} elements, shape {:?} (C={}, N={}, head_size={})",
+        input.len(),
+        shape,
+        c,
+        n,
+        head_size
+    );
+
+    let eps = 1e-12;  // L2 norm uses very small epsilon
+
+    let output = web_rwkv::hip::hip_l2_norm(input, c, n, head_size, eps)
+        .expect("l2_norm kernel failed");
+
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("l2_norm output doesn't match fixture");
+
+    println!("l2_norm fixture test passed: {} elements match", output.len());
+}
+
+/// Test tanh kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.13.
+#[test]
+#[cfg(feature = "hip")]
+fn test_tanh_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/tanh/basic.npz")
+        .expect("Failed to load tanh fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+
+    println!(
+        "Testing tanh: {} elements, shape {:?}",
+        input.len(),
+        shape
+    );
+
+    let output = web_rwkv::hip::hip_tanh(input)
+        .expect("tanh kernel failed");
+
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("tanh output doesn't match fixture");
+
+    println!("tanh fixture test passed: {} elements match", output.len());
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {
