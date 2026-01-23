@@ -216,6 +216,42 @@ fn test_decay_exp_stability_fixture() {
     println!("decay_exp stability fixture test passed");
 }
 
+/// Test lerp kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.4.
+#[test]
+#[cfg(feature = "hip")]
+fn test_lerp_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/lerp/basic.npz")
+        .expect("Failed to load lerp fixture");
+
+    let a = fixture.f32("a");
+    let b = fixture.f32("b");
+    let t = fixture.f32("t");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("a");
+
+    println!(
+        "Testing lerp: {} elements, shape {:?}",
+        a.len(),
+        shape
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_lerp(a, b, t)
+        .expect("lerp kernel failed");
+
+    // Compare with fixture (< 1e-3 relative error per acceptance criteria)
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("lerp output doesn't match fixture");
+
+    println!("lerp fixture test passed: {} elements match", output.len());
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {

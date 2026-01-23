@@ -66,6 +66,41 @@ hipError_t launch_decay_exp_f32(const float* input, float* output, int n, hipStr
     return hipGetLastError();
 }
 
+// ============================================================================
+// Lerp Kernel: out = a + t * (b - a) (linear interpolation)
+// Used for RWKV7 mixing operations
+// ============================================================================
+
+__global__ void kernel_lerp_f32(const float* __restrict__ a,
+                                 const float* __restrict__ b,
+                                 const float* __restrict__ t,
+                                 float* __restrict__ output,
+                                 int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float a_val = a[idx];
+        float b_val = b[idx];
+        float t_val = t[idx];
+        // lerp: a + t * (b - a) = a * (1 - t) + b * t
+        output[idx] = a_val + t_val * (b_val - a_val);
+    }
+}
+
+hipError_t launch_lerp_f32(const float* a, const float* b, const float* t,
+                           float* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_lerp_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       a, b, t, output, n);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

@@ -105,6 +105,7 @@ extern "C" {
     fn hip_get_error_string(error: HipError) -> *const c_char;
     fn launch_copy_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    fn launch_lerp_f32(a: *const f32, b: *const f32, t: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1083,6 +1084,68 @@ pub fn hip_decay_exp(input: &[f32]) -> Result<Vec<f32>> {
     d_output.to_vec(&stream)
 }
 
+/// Launch the lerp kernel: out = a + t * (b - a) (linear interpolation)
+///
+/// This is used for mixing operations in RWKV7.
+/// All tensors must have the same length and be contiguous.
+pub fn lerp_f32(
+    a: &TensorHip<f32>,
+    b: &TensorHip<f32>,
+    t: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    let n = a.len();
+    if b.len() != n || t.len() != n || output.len() != n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: a={}, b={}, t={}, output={}",
+                n, b.len(), t.len(), output.len()
+            ),
+        });
+    }
+    if !a.is_contiguous() || !b.is_contiguous() || !t.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "lerp_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_lerp_f32(
+            a.as_ptr(),
+            b.as_ptr(),
+            t.as_ptr(),
+            output.as_mut_ptr(),
+            n as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute linear interpolation on host data, returning results.
+/// This is a convenience function for testing.
+pub fn hip_lerp(a: &[f32], b: &[f32], t: &[f32]) -> Result<Vec<f32>> {
+    if a.len() != b.len() || a.len() != t.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("Size mismatch: a={}, b={}, t={}", a.len(), b.len(), t.len()),
+        });
+    }
+
+    let stream = Stream::null();
+    let shape = TensorShape::new(a.len(), 1, 1, 1);
+
+    let d_a = TensorHip::from_slice(a, shape, &stream)?;
+    let d_b = TensorHip::from_slice(b, shape, &stream)?;
+    let d_t = TensorHip::from_slice(t, shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(shape)?;
+
+    lerp_f32(&d_a, &d_b, &d_t, &mut d_output, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1416,5 +1479,63 @@ mod tests {
         assert_eq!(output[9], 0.0, "exp(-exp(100)) should be exactly 0");
 
         println!("Numerical stability test passed: all {} values are finite and in [0,1]", output.len());
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.4 (Lerp Kernel) ===
+
+    #[test]
+    fn test_lerp() {
+        // Test basic lerp functionality: out = a + t * (b - a)
+        let a = vec![0.0, 1.0, 2.0, 10.0, -5.0];
+        let b = vec![10.0, 5.0, 2.0, 0.0, 5.0];
+        let t = vec![0.0, 0.5, 1.0, 0.25, 0.5];
+
+        let output = hip_lerp(&a, &b, &t).expect("lerp kernel failed");
+
+        // Expected: lerp(a, b, t) = a + t * (b - a)
+        // [0] lerp(0, 10, 0) = 0
+        // [1] lerp(1, 5, 0.5) = 1 + 0.5 * 4 = 3
+        // [2] lerp(2, 2, 1) = 2
+        // [3] lerp(10, 0, 0.25) = 10 + 0.25 * (-10) = 7.5
+        // [4] lerp(-5, 5, 0.5) = -5 + 0.5 * 10 = 0
+        let expected = vec![0.0, 3.0, 2.0, 7.5, 0.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Basic lerp test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_lerp_edge_cases() {
+        // Test edge cases: t outside [0, 1] (extrapolation)
+        let a = vec![0.0, 0.0, 100.0];
+        let b = vec![10.0, 10.0, 0.0];
+        let t = vec![-0.5, 1.5, 2.0];
+
+        let output = hip_lerp(&a, &b, &t).expect("lerp edge case test failed");
+
+        // Expected with extrapolation:
+        // [0] lerp(0, 10, -0.5) = 0 + (-0.5) * 10 = -5
+        // [1] lerp(0, 10, 1.5) = 0 + 1.5 * 10 = 15
+        // [2] lerp(100, 0, 2.0) = 100 + 2.0 * (-100) = -100
+        let expected = vec![-5.0, 15.0, -100.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-4;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Lerp edge case test passed: extrapolation works correctly");
     }
 }
