@@ -427,7 +427,7 @@ def generate_wkv7_fixtures(output_dir: Path, config: dict):
         else:
             state = state_in.clone()
 
-        output = torch.empty(B, T, H, N, dtype=torch.float16)
+        output = torch.empty(B, T, H, N, dtype=torch.float32)
 
         # Sequential processing (reference implementation)
         for t in range(T):
@@ -452,13 +452,13 @@ def generate_wkv7_fixtures(output_dir: Path, config: dict):
 
                     # Output: y = state @ q
                     y = (s * q_t.unsqueeze(0)).sum(dim=1)  # [N]
-                    output[batch, t, head] = y.to(torch.float16)
+                    output[batch, t, head] = y
 
                     state[batch, head] = s
 
         return {
             'w_raw': w_raw.to(torch.float16),
-            'w_decay': w_decay.to(torch.float16),
+            'w_decay': w_decay,  # Keep float32 - this was used in computation
             'q': q,
             'k': k,
             'v': v,
@@ -743,7 +743,51 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
     wkv_a = -kk
     wkv_b = kk * a
 
-    # For now, save the intermediates - full WKV would require the kernel
+    # Run WKV7 reference to compute output
+    # Convert w to decay form: w_decay = exp(w) since w is already in log decay form
+    # Note: In RWKV7, w = -softplus(-(...)) - 0.5 gives the log decay directly
+    # w_decay = exp(w) where w is negative, so decay is in (0, 1)
+    w_decay = torch.exp(w.float())
+
+    # Reshape for WKV7: [B, T, C] -> [B, T, H, N]
+    r_wkv = r.float().view(B, T, H, N)
+    k_wkv = k_ctrl.float().view(B, T, H, N)
+    v_wkv = v.float().view(B, T, H, N)
+    w_wkv = w_decay.view(B, T, H, N)
+    a_wkv = wkv_a.float().view(B, T, H, N)
+    b_wkv = wkv_b.float().view(B, T, H, N)
+
+    wkv_output = torch.empty(B, T, H, N, dtype=torch.float32)
+    wkv_state_out = state_in.clone()
+
+    for t in range(T):
+        for batch in range(B):
+            for head in range(H):
+                s = wkv_state_out[batch, head]  # [N, N]
+
+                q_t = r_wkv[batch, t, head]
+                w_t = w_wkv[batch, t, head]
+                k_t = k_wkv[batch, t, head]
+                v_t = v_wkv[batch, t, head]
+                a_t = a_wkv[batch, t, head]
+                b_t = b_wkv[batch, t, head]
+
+                # sa = state @ a
+                sa = (s * a_t.unsqueeze(0)).sum(dim=1)
+
+                # state = state * w + outer(sa, b) + outer(v, k)
+                s = s * w_t.unsqueeze(0) + \
+                    sa.unsqueeze(1) * b_t.unsqueeze(0) + \
+                    v_t.unsqueeze(1) * k_t.unsqueeze(0)
+
+                # output = state @ q (using r as q)
+                y = (s * q_t.unsqueeze(0)).sum(dim=1)
+                wkv_output[batch, t, head] = y
+
+                wkv_state_out[batch, head] = s
+
+    wkv_out_flat = wkv_output.view(B, T, C)
+
     # Save fixtures for layer 0
     tm_dir = layer_dir / "time_mix"
 
@@ -766,6 +810,7 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
                  k=(k, (C, T, B, 1)),
                  v=(v, (C, T, B, 1)),
                  w=(w, (C, T, B, 1)),
+                 w_decay=(w_decay, (N, T, H, B)),  # Decay form for WKV kernel
                  a=(a, (C, T, B, 1)),
                  g=(g, (C, T, B, 1)),
                  v_first=(v_first, (C, T, B, 1)),
@@ -773,6 +818,10 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
                  k_ctrl=(k_ctrl, (C, T, B, 1)),
                  wkv_a=(wkv_a, (C, T, B, 1)),
                  wkv_b=(wkv_b, (C, T, B, 1)),
+
+                 # WKV outputs
+                 expected_wkv_output=(wkv_out_flat, (C, T, B, 1)),
+                 expected_wkv_state=(wkv_state_out, (N, N, H, B)),
 
                  # New token shift state
                  expected_token_shift_state=(x_normed[:, -1, :], (C, B, 1, 1)))
@@ -789,21 +838,71 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
     ffn_key_w = tensors[prefix_ffn + "key.weight"]
     ffn_val_w = tensors[prefix_ffn + "value.weight"]
 
-    # Token shift
+    # Token shift: shift x along time, prepending state
     xx_cm = torch.cat([cm_state.unsqueeze(1), x_cm[:, :-1, :]], dim=1)
+
+    # Lerp: k = lerp(x, xx, x_k)
     k_cm = torch.lerp(x_cm.float(), xx_cm.float(), ffn_x_k.float()).to(torch.float16)
 
-    # relu(key(k))^2
+    # Key projection: k_proj = k @ key_weight.T
     k_proj = F.linear(k_cm.float(), ffn_key_w.float())
+
+    # Squared ReLU: k_sq = relu(k_proj)^2
     k_sq = (F.relu(k_proj) ** 2).to(torch.float16)
 
-    # value(k_sq)
+    # Value projection: out = k_sq @ value_weight.T
     out_cm = F.linear(k_sq.float(), ffn_val_w.float()).to(torch.float16)
+
+    # Transpose weights for rocBLAS column-major GEMM
+    # PyTorch F.linear does: output = input @ weight.T
+    # rocBLAS GEMM does: C = A @ B (column-major)
+    #
+    # The trick: when we store a PyTorch row-major matrix and interpret it as
+    # column-major, rocBLAS sees its transpose. So if we want rocBLAS to see W,
+    # we need to store W.T in row-major (PyTorch) format.
+    #
+    # For F.linear(input, W) where input=[B,T,K], W=[N,K]:
+    #   PyTorch: output = input @ W.T
+    # For rocBLAS with our stored W.T:
+    #   rocBLAS sees: A=W.T interpreted as column-major = W (what we want)
+    #   output = W @ input (when input is also in column-major form)
+    #
+    # But wait - we need output = input @ W.T, not W @ input.
+    # These are different: [B*T, K] @ [K, N] vs [N, K] @ [K, B*T]
+    # Actually they give the same result but with different output layouts!
+    #
+    # Let's use rocBLAS transpose: C = alpha * op(A) * op(B)
+    # Actually our current implementation uses NoTrans for both.
+    #
+    # Simpler approach: store weight as-is, but use it differently in GEMM.
+    # For F.linear: output[N, T*B] = weight[N, K] @ input[K, T*B]
+    # This works if weight is stored in the right format for column-major.
+    #
+    # PyTorch weight [N, K] stored row-major = [N, K] column-major.T = [K, N] column-major
+    # So rocBLAS sees [K, N], not [N, K].
+    #
+    # To get rocBLAS to see [N, K], store weight.T.contiguous() which is [K, N] row-major.
+    # When rocBLAS interprets [K, N] row-major as column-major, it sees [N, K]. Perfect!
+    key_w_for_gemm = ffn_key_w.T.contiguous()  # [K=768, N=3072] row-major -> [N, K] col-major
+    val_w_for_gemm = ffn_val_w.T.contiguous()  # [K=3072, N=768] row-major -> [N, K] col-major
+
+    # hidden_size is the intermediate dimension (3072 for RWKV 0.1B)
+    hidden_size = ffn_key_w.shape[0]
 
     save_fixture(cm_dir / "basic.npz",
                  input=(x_cm, (C, T, B, 1)),
                  state_in=(cm_state, (C, B, 1, 1)),
                  x_k=(ffn_x_k, (C, 1, 1, 1)),
+                 # Weights transposed for rocBLAS column-major GEMM
+                 # key_weight: [N=hidden, K=C] in rocBLAS col-major
+                 key_weight=(key_w_for_gemm, (hidden_size, C, 1, 1)),
+                 # value_weight: [N=C, K=hidden] in rocBLAS col-major
+                 value_weight=(val_w_for_gemm, (C, hidden_size, 1, 1)),
+                 # Intermediates for step-by-step validation
+                 shifted=(xx_cm, (C, T, B, 1)),
+                 after_lerp=(k_cm, (C, T, B, 1)),
+                 after_key_proj=(k_proj, (hidden_size, T, B, 1)),
+                 after_squared_relu=(k_sq, (hidden_size, T, B, 1)),
                  expected_output=(out_cm, (C, T, B, 1)),
                  expected_state=(x_cm[:, -1, :], (C, B, 1, 1)))
 

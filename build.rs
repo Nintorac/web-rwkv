@@ -29,6 +29,7 @@ mod hip {
             rocm_path.join("lib").display()
         );
         println!("cargo:rustc-link-lib=dylib=amdhip64");
+        println!("cargo:rustc-link-lib=dylib=rocblas");
     }
 
     fn compile_hip_kernels(rocm_path: &PathBuf, out_dir: &PathBuf) {

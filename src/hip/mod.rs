@@ -161,6 +161,44 @@ extern "C" {
         b: c_int,
         stream: HipStream
     ) -> HipError;
+    fn launch_wkv_bonus_f32(
+        r: *const f32,
+        k: *const f32,
+        v: *const f32,
+        r_k: *const f32,
+        output: *mut f32,
+        n: c_int,    // head_size
+        h: c_int,    // n_heads
+        t: c_int,    // tokens
+        b: c_int,    // batch
+        stream: HipStream
+    ) -> HipError;
+    fn launch_control_k_f32(
+        k_a: *const f32,   // per-channel weight [C, 1, 1, 1]
+        a: *const f32,     // attention [C, T, B, 1]
+        k: *const f32,     // key [C, T, B, 1]
+        output: *mut f32,  // output [C, T, B, 1]
+        c: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
+    fn launch_wkv7_f32(
+        w_decay: *const f32,   // [N, H, T, B] - pre-computed decay
+        q: *const f32,         // [N, H, T, B]
+        k: *const f32,         // [N, H, T, B]
+        v: *const f32,         // [N, H, T, B]
+        a: *const f32,         // [N, H, T, B]
+        b: *const f32,         // [N, H, T, B]
+        state_in: *const f32,  // [N, N, H, B]
+        output: *mut f32,      // [N, H, T, B]
+        state_out: *mut f32,   // [N, N, H, B]
+        n: c_int,    // head_size
+        h: c_int,    // n_heads
+        t: c_int,    // tokens
+        b: c_int,    // batch
+        stream: HipStream
+    ) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -171,7 +209,42 @@ extern "C" {
     fn hip_get_device_compute_capability(device_id: c_int, major: *mut c_int, minor: *mut c_int) -> HipError;
     fn hip_is_device_integrated(device_id: c_int, integrated: *mut c_int) -> HipError;
     fn hip_supports_cooperative_launch(device_id: c_int, supported: *mut c_int) -> HipError;
+
+    // rocBLAS functions
+    fn rocblas_handle_create(handle: *mut RocblasHandle) -> RocblasStatus;
+    fn rocblas_handle_destroy(handle: RocblasHandle) -> RocblasStatus;
+    fn rocblas_set_stream_wrapper(handle: RocblasHandle, stream: HipStream) -> RocblasStatus;
+    fn launch_hgemm(
+        handle: RocblasHandle,
+        m: c_int,       // rows of A and C
+        n: c_int,       // cols of B and C
+        k: c_int,       // cols of A, rows of B
+        a: *const u16,  // M×K matrix (FP16 as u16)
+        b: *const u16,  // K×N matrix (FP16 as u16)
+        c: *mut u16     // M×N matrix (FP16 as u16)
+    ) -> RocblasStatus;
+    fn launch_sgemm(
+        handle: RocblasHandle,
+        m: c_int,       // rows of A and C
+        n: c_int,       // cols of B and C
+        k: c_int,       // cols of A, rows of B
+        alpha: f32,
+        a: *const f32,  // M×K matrix
+        b: *const f32,  // K×N matrix
+        beta: f32,
+        c: *mut f32     // M×N matrix
+    ) -> RocblasStatus;
+    fn rocblas_to_hip_error(status: RocblasStatus) -> HipError;
 }
+
+/// rocBLAS handle type (opaque pointer)
+pub type RocblasHandle = *mut c_void;
+
+/// rocBLAS status code
+pub type RocblasStatus = c_int;
+
+/// rocBLAS success status
+pub const ROCBLAS_STATUS_SUCCESS: RocblasStatus = 0;
 
 /// HIP success error code
 pub const HIP_SUCCESS: HipError = 0;
@@ -1918,6 +1991,753 @@ pub fn hip_channel_mix_state(
     let state_out = d_state_out.to_vec(&stream)?;
 
     Ok((output, state_out))
+}
+
+/// Launch the WKV bonus kernel (time_first).
+///
+/// Computes: output = (r * k * r_k).sum(dim=head_size) * v
+/// This is the "time_first" bonus attention on the current token.
+///
+/// # Arguments
+/// * `r` - Receptance tensor of shape [N, H, T, B] where N=head_size, H=n_heads
+/// * `k` - Key tensor of shape [N, H, T, B]
+/// * `v` - Value tensor of shape [N, H, T, B]
+/// * `r_k` - Per-head bonus weight of shape [N, H, 1, 1]
+/// * `output` - Output tensor of shape [N, H, T, B]
+/// * `stream` - HIP stream
+pub fn wkv_bonus_f32(
+    r: &TensorHip<f32>,
+    k: &TensorHip<f32>,
+    v: &TensorHip<f32>,
+    r_k: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    // Shape: [N, H, T, B] where N=head_size
+    let n = r.shape()[0];  // head_size
+    let h = r.shape()[1];  // n_heads
+    let t = r.shape()[2];  // tokens
+    let b = r.shape()[3];  // batch
+
+    // Validate shapes
+    if k.shape() != r.shape() || v.shape() != r.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Shape mismatch: r={}, k={}, v={}",
+                r.shape(), k.shape(), v.shape()
+            ),
+        });
+    }
+    if output.shape() != r.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                r.shape(), output.shape()
+            ),
+        });
+    }
+    if r_k.shape()[0] != n || r_k.shape()[1] != h {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "r_k shape mismatch: expected [{}, {}, 1, 1], got {}",
+                n, h, r_k.shape()
+            ),
+        });
+    }
+    if !r.is_contiguous() || !k.is_contiguous() || !v.is_contiguous()
+        || !r_k.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv_bonus_f32 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv_bonus_f32(
+            r.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            r_k.as_ptr(),
+            output.as_mut_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute WKV bonus on host data, returning results.
+/// This is a convenience function for testing.
+///
+/// # Arguments
+/// * `r` - Receptance data of shape [N, H, T, B] flattened
+/// * `k` - Key data of shape [N, H, T, B] flattened
+/// * `v` - Value data of shape [N, H, T, B] flattened
+/// * `r_k` - Per-head bonus weight of shape [N, H, 1, 1] flattened
+/// * `n` - head_size
+/// * `h` - n_heads
+/// * `t` - tokens
+/// * `b` - batch
+pub fn hip_wkv_bonus(
+    r: &[f32],
+    k: &[f32],
+    v: &[f32],
+    r_k: &[f32],
+    n: usize,  // head_size
+    h: usize,  // n_heads
+    t: usize,  // tokens
+    b: usize,  // batch
+) -> Result<Vec<f32>> {
+    let expected_len = n * h * t * b;
+    let rk_len = n * h;
+
+    if r.len() != expected_len || k.len() != expected_len || v.len() != expected_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}, got r={}, k={}, v={}",
+                expected_len, r.len(), k.len(), v.len()
+            ),
+        });
+    }
+    if r_k.len() != rk_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("r_k size mismatch: expected {}, got {}", rk_len, r_k.len()),
+        });
+    }
+
+    let stream = Stream::null();
+
+    let data_shape = TensorShape::new(n, h, t, b);
+    let rk_shape = TensorShape::new(n, h, 1, 1);
+
+    let d_r = TensorHip::from_slice(r, data_shape, &stream)?;
+    let d_k = TensorHip::from_slice(k, data_shape, &stream)?;
+    let d_v = TensorHip::from_slice(v, data_shape, &stream)?;
+    let d_r_k = TensorHip::from_slice(r_k, rk_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(data_shape)?;
+
+    wkv_bonus_f32(&d_r, &d_k, &d_v, &d_r_k, &mut d_output, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
+/// Launch the control-K kernel (replacement key).
+///
+/// Computes: output = k * (1 + (a - 1) * k_a)
+/// This creates the replacement key for RWKV7 time mixing.
+///
+/// # Arguments
+/// * `k_a` - Per-channel control weight of shape [C, 1, 1, 1]
+/// * `a` - Attention tensor of shape [C, T, B, 1]
+/// * `k` - Key tensor of shape [C, T, B, 1]
+/// * `output` - Output tensor of shape [C, T, B, 1]
+/// * `stream` - HIP stream
+pub fn control_k_f32(
+    k_a: &TensorHip<f32>,
+    a: &TensorHip<f32>,
+    k: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    let c = k.shape()[0];
+    let t = k.shape()[1];
+    let b = k.shape()[2];
+
+    if output.shape() != k.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                k.shape(), output.shape()
+            ),
+        });
+    }
+    if a.shape() != k.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "a shape mismatch: expected {}, got {}",
+                k.shape(), a.shape()
+            ),
+        });
+    }
+    if k_a.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "k_a shape mismatch: expected [{}, 1, 1, 1], got {}",
+                c, k_a.shape()
+            ),
+        });
+    }
+    if !k_a.is_contiguous() || !a.is_contiguous() || !k.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "control_k_f32 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_control_k_f32(
+            k_a.as_ptr(),
+            a.as_ptr(),
+            k.as_ptr(),
+            output.as_mut_ptr(),
+            c as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute control-K on host data, returning results.
+/// This is a convenience function for testing.
+///
+/// # Arguments
+/// * `k_a` - Per-channel control weight of size C
+/// * `a` - Attention data of shape [C, T, B, 1] flattened
+/// * `k` - Key data of shape [C, T, B, 1] flattened
+/// * `c` - Channel dimension
+/// * `t` - Token dimension
+/// * `b` - Batch dimension
+pub fn hip_control_k(
+    k_a: &[f32],
+    a: &[f32],
+    k: &[f32],
+    c: usize,
+    t: usize,
+    b: usize,
+) -> Result<Vec<f32>> {
+    let expected_len = c * t * b;
+
+    if k.len() != expected_len || a.len() != expected_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}, got k={}, a={}",
+                expected_len, k.len(), a.len()
+            ),
+        });
+    }
+    if k_a.len() != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("k_a size mismatch: expected {}, got {}", c, k_a.len()),
+        });
+    }
+
+    let stream = Stream::null();
+
+    let data_shape = TensorShape::new(c, t, b, 1);
+    let ka_shape = TensorShape::new(c, 1, 1, 1);
+
+    let d_k_a = TensorHip::from_slice(k_a, ka_shape, &stream)?;
+    let d_a = TensorHip::from_slice(a, data_shape, &stream)?;
+    let d_k = TensorHip::from_slice(k, data_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(data_shape)?;
+
+    control_k_f32(&d_k_a, &d_a, &d_k, &mut d_output, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
+/// Launch the WKV7 core kernel.
+///
+/// Implements RWKV7's time mixing attention mechanism:
+///   1. sa = sum(a[j] * state[i,j])  - attention over state
+///   2. state[i,j] = state[i,j] * w[j] + sa * b[j] + k[j] * v[i]  - update
+///   3. y[i] = sum(state[i,j] * q[j])  - output
+///
+/// # Arguments
+/// * `w_decay` - Pre-computed decay tensor [N, H, T, B] where decay = exp(-exp(w_raw))
+/// * `q` - Query tensor [N, H, T, B]
+/// * `k` - Key tensor [N, H, T, B]
+/// * `v` - Value tensor [N, H, T, B]
+/// * `a` - Attention component tensor [N, H, T, B]
+/// * `b` - Attention component tensor [N, H, T, B]
+/// * `state_in` - Input state tensor [N, N, H, B]
+/// * `output` - Output tensor [N, H, T, B]
+/// * `state_out` - Output state tensor [N, N, H, B]
+/// * `stream` - HIP stream
+pub fn wkv7_f32(
+    w_decay: &TensorHip<f32>,
+    q: &TensorHip<f32>,
+    k: &TensorHip<f32>,
+    v: &TensorHip<f32>,
+    a: &TensorHip<f32>,
+    b: &TensorHip<f32>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    state_out: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    // Input shape: [N, H, T, B]
+    let n = w_decay.shape()[0];  // head_size
+    let h = w_decay.shape()[1];  // n_heads
+    let t = w_decay.shape()[2];  // tokens
+    let b_size = w_decay.shape()[3];  // batch
+
+    // Validate input shapes
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape || k.shape() != input_shape || v.shape() != input_shape
+        || a.shape() != input_shape || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
+                w_decay.shape(), q.shape(), k.shape(), v.shape(), a.shape(), b.shape()
+            ),
+        });
+    }
+
+    // Validate output shape
+    if output.shape() != input_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                input_shape, output.shape()
+            ),
+        });
+    }
+
+    // Validate state shapes: [N, N, H, B]
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_in shape mismatch: expected {}, got {}",
+                state_shape, state_in.shape()
+            ),
+        });
+    }
+    if state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_out shape mismatch: expected {}, got {}",
+                state_shape, state_out.shape()
+            ),
+        });
+    }
+
+    // Check contiguity
+    if !w_decay.is_contiguous() || !q.is_contiguous() || !k.is_contiguous()
+        || !v.is_contiguous() || !a.is_contiguous() || !b.is_contiguous()
+        || !state_in.is_contiguous() || !output.is_contiguous() || !state_out.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_f32 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_f32(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute WKV7 on host data, returning (output, state_out).
+/// This is a convenience function for testing.
+///
+/// # Arguments
+/// * `w_decay` - Pre-computed decay data [N, H, T, B] flattened
+/// * `q`, `k`, `v`, `a`, `b` - Input data [N, H, T, B] flattened
+/// * `state_in` - Input state [N, N, H, B] flattened
+/// * `n` - head_size
+/// * `h` - n_heads
+/// * `t` - tokens
+/// * `b` - batch
+pub fn hip_wkv7(
+    w_decay: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    a: &[f32],
+    b: &[f32],
+    state_in: &[f32],
+    n: usize,
+    h: usize,
+    t: usize,
+    batch: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let input_len = n * h * t * batch;
+    let state_len = n * n * h * batch;
+
+    if w_decay.len() != input_len || q.len() != input_len || k.len() != input_len
+        || v.len() != input_len || a.len() != input_len || b.len() != input_len
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}, got w={}, q={}, k={}, v={}, a={}, b={}",
+                input_len, w_decay.len(), q.len(), k.len(), v.len(), a.len(), b.len()
+            ),
+        });
+    }
+    if state_in.len() != state_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("state_in size mismatch: expected {}, got {}", state_len, state_in.len()),
+        });
+    }
+
+    let stream = Stream::null();
+
+    let input_shape = TensorShape::new(n, h, t, batch);
+    let state_shape = TensorShape::new(n, n, h, batch);
+
+    let d_w_decay = TensorHip::from_slice(w_decay, input_shape, &stream)?;
+    let d_q = TensorHip::from_slice(q, input_shape, &stream)?;
+    let d_k = TensorHip::from_slice(k, input_shape, &stream)?;
+    let d_v = TensorHip::from_slice(v, input_shape, &stream)?;
+    let d_a = TensorHip::from_slice(a, input_shape, &stream)?;
+    let d_b = TensorHip::from_slice(b, input_shape, &stream)?;
+    let d_state_in = TensorHip::from_slice(state_in, state_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(input_shape)?;
+    let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
+
+    wkv7_f32(
+        &d_w_decay, &d_q, &d_k, &d_v, &d_a, &d_b,
+        &d_state_in, &mut d_output, &mut d_state_out, &stream
+    )?;
+
+    let output = d_output.to_vec(&stream)?;
+    let state_out = d_state_out.to_vec(&stream)?;
+
+    Ok((output, state_out))
+}
+
+// ============================================================================
+// rocBLAS GEMV/GEMM Functions
+// ============================================================================
+
+/// Create a rocBLAS handle.
+pub fn rocblas_create() -> Result<RocblasHandle> {
+    let mut handle: RocblasHandle = std::ptr::null_mut();
+    let status = unsafe { rocblas_handle_create(&mut handle) };
+    if status != ROCBLAS_STATUS_SUCCESS {
+        return Err(HipErrorKind {
+            code: unsafe { rocblas_to_hip_error(status) },
+            message: format!("Failed to create rocBLAS handle: status {}", status),
+        });
+    }
+    Ok(handle)
+}
+
+/// Destroy a rocBLAS handle.
+pub fn rocblas_destroy(handle: RocblasHandle) -> Result<()> {
+    let status = unsafe { rocblas_handle_destroy(handle) };
+    if status != ROCBLAS_STATUS_SUCCESS {
+        return Err(HipErrorKind {
+            code: unsafe { rocblas_to_hip_error(status) },
+            message: format!("Failed to destroy rocBLAS handle: status {}", status),
+        });
+    }
+    Ok(())
+}
+
+/// Set the stream for a rocBLAS handle.
+pub fn rocblas_set_stream(handle: RocblasHandle, stream: &Stream) -> Result<()> {
+    let status = unsafe { rocblas_set_stream_wrapper(handle, stream.handle()) };
+    if status != ROCBLAS_STATUS_SUCCESS {
+        return Err(HipErrorKind {
+            code: unsafe { rocblas_to_hip_error(status) },
+            message: format!("Failed to set rocBLAS stream: status {}", status),
+        });
+    }
+    Ok(())
+}
+
+/// HGEMM: C = A * B (FP16 matrix multiply)
+///
+/// Computes C = A * B where:
+/// - A is M×K matrix (stored column-major)
+/// - B is K×N matrix (stored column-major)
+/// - C is M×N matrix (stored column-major)
+///
+/// For the RWKV use case:
+/// - weight is (N, K) = (out_features, in_features) stored as K×N in column-major
+/// - input is K×A (in_features × tokens)
+/// - output is N×A (out_features × tokens)
+///
+/// The operation is: output = weight @ input
+pub fn hgemm_f16(
+    handle: RocblasHandle,
+    weight: &TensorHip<f32>,  // Actually f16 stored as f32 for API simplicity
+    input: &TensorHip<f32>,   // Actually f16
+    output: &mut TensorHip<f32>, // Actually f16
+) -> Result<()> {
+    // For web-rwkv tensor convention:
+    // weight: Shape(N, K) where N is fastest = column-major K×N = N cols, K rows
+    //   Actually stored as transpose, so it's M×K where M=N, K=K
+    // input: Shape(K, A) = column-major A×K = K rows, A cols -> actually K×A where K rows, A cols
+    // output: Shape(N, A) = column-major A×N = N rows, A cols -> N×A
+    //
+    // We want: output[N,A] = weight[N,K] @ input[K,A]
+    // In rocBLAS column-major terms:
+    //   C[M,N] = A[M,K] * B[K,N] where M=N_out, N=A_tokens, K=K_in
+
+    let weight_shape = weight.shape();
+    let input_shape = input.shape();
+
+    // weight: [N, K, 1, 1] where N is out_features, K is in_features
+    // input: [K, A, 1, 1] where K is in_features, A is tokens
+    let m = weight_shape[0] as c_int;  // N (output features) - rows of weight
+    let k = weight_shape[1] as c_int;  // K (input features) - cols of weight, rows of input
+    let n = input_shape[1] as c_int;   // A (tokens) - cols of input
+
+    // Verify dimensions
+    if input_shape[0] as c_int != k {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "HGEMM dimension mismatch: weight has K={}, input has K={}",
+                k, input_shape[0]
+            ),
+        });
+    }
+
+    let status = unsafe {
+        launch_hgemm(
+            handle,
+            m, n, k,
+            weight.as_ptr() as *const u16,
+            input.as_ptr() as *const u16,
+            output.as_mut_ptr() as *mut u16,
+        )
+    };
+
+    if status != ROCBLAS_STATUS_SUCCESS {
+        return Err(HipErrorKind {
+            code: unsafe { rocblas_to_hip_error(status) },
+            message: format!("rocBLAS HGEMM failed: status {}", status),
+        });
+    }
+
+    Ok(())
+}
+
+/// Low-level SGEMM wrapper that calls rocBLAS with TensorHip buffers.
+///
+/// Performs: C = alpha * A * B + beta * C (FP32 matrix multiply)
+///
+/// # Arguments
+/// * `handle` - rocBLAS handle
+/// * `weight` - Weight matrix (A) on device
+/// * `input` - Input matrix (B) on device
+/// * `output` - Output matrix (C) on device
+pub fn sgemm_f32(
+    handle: RocblasHandle,
+    weight: &TensorHip<f32>,
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+) -> Result<()> {
+    // For web-rwkv tensor convention:
+    // weight: Shape(N, K) where N is fastest = column-major K×N = N cols, K rows
+    // input: Shape(K, A) = column-major A×K = K rows, A cols
+    // output: Shape(N, A) = column-major A×N = N rows, A cols
+    //
+    // We want: output[N,A] = weight[N,K] @ input[K,A]
+    // In rocBLAS column-major terms:
+    //   C[M,N] = A[M,K] * B[K,N] where M=N_out, N=A_tokens, K=K_in
+
+    let weight_shape = weight.shape();
+    let input_shape = input.shape();
+
+    // weight: [N, K, 1, 1] where N is out_features, K is in_features
+    // input: [K, A, 1, 1] where K is in_features, A is tokens
+    let m = weight_shape[0] as c_int;  // N (output features) - rows of weight
+    let k = weight_shape[1] as c_int;  // K (input features) - cols of weight, rows of input
+    let n = input_shape[1] as c_int;   // A (tokens) - cols of input
+
+    // Verify dimensions
+    if input_shape[0] as c_int != k {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "SGEMM dimension mismatch: weight has K={}, input has K={}",
+                k, input_shape[0]
+            ),
+        });
+    }
+
+    let status = unsafe {
+        launch_sgemm(
+            handle,
+            m, n, k,
+            1.0,  // alpha
+            weight.as_ptr(),
+            input.as_ptr(),
+            0.0,  // beta
+            output.as_mut_ptr(),
+        )
+    };
+
+    if status != ROCBLAS_STATUS_SUCCESS {
+        return Err(HipErrorKind {
+            code: unsafe { rocblas_to_hip_error(status) },
+            message: format!("rocBLAS SGEMM failed: status {}", status),
+        });
+    }
+
+    Ok(())
+}
+
+/// High-level SGEMM that manages device memory allocation.
+///
+/// Performs: output = weight @ input (FP32 matrix multiply)
+///
+/// # Arguments
+/// * `weight` - Weight matrix [N, K] where N is output features, K is input features (flattened)
+/// * `input` - Input matrix [K, A] where K is input features, A is tokens (flattened)
+/// * `m` - Number of output features (N)
+/// * `k` - Number of input features (K)
+/// * `n` - Number of tokens (A)
+///
+/// # Returns
+/// * Output vector [N, A] (flattened)
+pub fn hip_sgemm(
+    weight: &[f32],
+    input: &[f32],
+    m: usize,   // output features (N)
+    k: usize,   // input features (K)
+    n: usize,   // tokens (A)
+) -> Result<Vec<f32>> {
+    if weight.len() != m * k {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Weight size mismatch: expected {}×{}={}, got {}",
+                m, k, m * k, weight.len()
+            ),
+        });
+    }
+    if input.len() != k * n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}×{}={}, got {}",
+                k, n, k * n, input.len()
+            ),
+        });
+    }
+
+    let stream = Stream::new()?;
+
+    // Create tensors with appropriate shapes
+    // weight: [M, K, 1, 1] where M=output_features, K=input_features
+    let weight_shape = TensorShape::new(m, k, 1, 1);
+    // input: [K, N, 1, 1] where K=input_features, N=tokens
+    let input_shape = TensorShape::new(k, n, 1, 1);
+    // output: [M, N, 1, 1] where M=output_features, N=tokens
+    let output_shape = TensorShape::new(m, n, 1, 1);
+
+    let d_weight = TensorHip::from_slice(weight, weight_shape, &stream)?;
+    let d_input = TensorHip::from_slice(input, input_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(output_shape)?;
+
+    // Create rocBLAS handle
+    let handle = rocblas_create()?;
+    rocblas_set_stream(handle, &stream)?;
+
+    // Run GEMM
+    sgemm_f32(handle, &d_weight, &d_input, &mut d_output)?;
+
+    // Clean up handle
+    rocblas_destroy(handle)?;
+
+    // Copy back result
+    d_output.to_vec(&stream)
+}
+
+/// High-level HGEMM that manages device memory allocation.
+///
+/// Performs: output = weight @ input (FP16 matrix multiply)
+///
+/// # Arguments
+/// * `weight` - Weight matrix [N, K] where N is output features, K is input features
+/// * `input` - Input matrix [K, A] where K is input features, A is tokens
+///
+/// # Returns
+/// * Output vector [N, A] (flattened)
+pub fn hip_hgemm(
+    weight: &[f32],
+    input: &[f32],
+    m: usize,   // output features (N)
+    k: usize,   // input features (K)
+    n: usize,   // tokens (A)
+) -> Result<Vec<f32>> {
+    if weight.len() != m * k {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Weight size mismatch: expected {}×{}={}, got {}",
+                m, k, m * k, weight.len()
+            ),
+        });
+    }
+    if input.len() != k * n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}×{}={}, got {}",
+                k, n, k * n, input.len()
+            ),
+        });
+    }
+
+    let stream = Stream::new()?;
+
+    // Create tensors with appropriate shapes
+    // weight: [M, K, 1, 1] where M=output_features, K=input_features
+    let weight_shape = TensorShape::new(m, k, 1, 1);
+    // input: [K, N, 1, 1] where K=input_features, N=tokens
+    let input_shape = TensorShape::new(k, n, 1, 1);
+    // output: [M, N, 1, 1] where M=output_features, N=tokens
+    let output_shape = TensorShape::new(m, n, 1, 1);
+
+    let d_weight = TensorHip::from_slice(weight, weight_shape, &stream)?;
+    let d_input = TensorHip::from_slice(input, input_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(output_shape)?;
+
+    // Create rocBLAS handle
+    let handle = rocblas_create()?;
+    rocblas_set_stream(handle, &stream)?;
+
+    // Run GEMM
+    hgemm_f16(handle, &d_weight, &d_input, &mut d_output)?;
+
+    // Clean up handle
+    rocblas_destroy(handle)?;
+
+    // Copy back result
+    d_output.to_vec(&stream)
 }
 
 #[cfg(test)]

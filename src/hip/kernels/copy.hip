@@ -1,5 +1,7 @@
 // HIP kernels for RWKV inference backend
 #include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h>
+#include <hip/hip_fp16.h>
 
 extern "C" {
 
@@ -696,6 +698,311 @@ hipError_t launch_channel_mix_state_f32(
     return hipGetLastError();
 }
 
+// ============================================================================
+// WKV Bonus Kernel (time_first)
+// Computes: output = (r * k * r_k).sum(dim=head_size) * v
+// This is the "time_first" bonus attention on current token
+// Input shapes: r, k, v: [N, H, T, B], r_k: [N, H, 1, 1]
+// where N = head_size, H = n_heads
+// ============================================================================
+
+__global__ void kernel_wkv_bonus_f32(
+    const float* __restrict__ r,          // [N, H, T, B]
+    const float* __restrict__ k,          // [N, H, T, B]
+    const float* __restrict__ v,          // [N, H, T, B]
+    const float* __restrict__ r_k,        // [N, H, 1, 1] - per-head bonus weight
+    float* __restrict__ output,           // [N, H, T, B]
+    int N,                                 // head_size
+    int H,                                 // n_heads
+    int T,                                 // tokens
+    int B                                  // batch
+) {
+    // Each block handles one (h, t, b) position
+    // Block computes sum over N, then writes all N elements
+    int htb_idx = blockIdx.x;
+    int total_htb = H * T * B;
+    if (htb_idx >= total_htb) return;
+
+    // Decompose htb_idx: in [N, H, T, B] layout, N is fastest
+    // So for position (h, t, b), the stride is:
+    // flat_idx = n + N * (h + H * (t + T * b))
+    // htb_idx corresponds to h + H * (t + T * b)
+    int h = htb_idx % H;
+    int tb = htb_idx / H;
+    int t = tb % T;
+    int b = tb / T;
+
+    // Shared memory for reduction
+    __shared__ float shared_sum[LAYERNORM_BLOCK_SIZE];
+
+    // Base indices
+    int base_htb = h * N + t * H * N + b * T * H * N;  // Correct: h*N since we skip h N-element blocks
+    // Wait, let me recalculate: flat index for (n, h, t, b) = n + N*h + N*H*t + N*H*T*b
+    // So base for (h, t, b) is N*h + N*H*t + N*H*T*b = N*(h + H*t + H*T*b)
+    int base = N * (h + H * t + H * T * b);
+
+    // r_k has shape [N, H, 1, 1], so r_k[n, h] is at n + N*h
+    int r_k_base = N * h;
+
+    // Step 1: Compute partial sums for (r * k * r_k).sum() over N
+    float local_sum = 0.0f;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        int idx = base + n;
+        float r_val = r[idx];
+        float k_val = k[idx];
+        float rk_val = r_k[r_k_base + n];
+        local_sum += r_val * k_val * rk_val;
+    }
+
+    // Block reduction
+    shared_sum[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    // Reduce in shared memory
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    float total_sum = shared_sum[0];
+
+    // Step 2: Write output = sum * v
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        int idx = base + n;
+        output[idx] = total_sum * v[idx];
+    }
+}
+
+hipError_t launch_wkv_bonus_f32(
+    const float* r,
+    const float* k,
+    const float* v,
+    const float* r_k,
+    float* output,
+    int N,      // head_size
+    int H,      // n_heads
+    int T,      // tokens
+    int B,      // batch
+    hipStream_t stream
+) {
+    if (N <= 0 || H <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+
+    int total_htb = H * T * B;
+    int block_size = LAYERNORM_BLOCK_SIZE;
+
+    hipLaunchKernelGGL(kernel_wkv_bonus_f32, dim3(total_htb), dim3(block_size), 0, stream,
+                       r, k, v, r_k, output, N, H, T, B);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// Control-K Kernel (Replacement Key)
+// Computes: output = k * (1 + (a - 1) * k_a)
+// where k_a is a per-channel control weight, a is the attention,
+// and k is the key tensor.
+// This creates the replacement key for RWKV7 time mixing.
+// ============================================================================
+
+__global__ void kernel_control_k_f32(
+    const float* __restrict__ k_a,         // [C, 1, 1, 1] - per-channel weight
+    const float* __restrict__ a,           // [C, T, B, 1]
+    const float* __restrict__ k,           // [C, T, B, 1]
+    float* __restrict__ output,            // [C, T, B, 1]
+    int C,
+    int T,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * T * B;
+    if (idx >= total) return;
+
+    // Get channel index for k_a lookup
+    int c = idx % C;
+
+    float k_a_val = k_a[c];
+    float a_val = a[idx];
+    float k_val = k[idx];
+
+    // output = k * (1 + (a - 1) * k_a)
+    output[idx] = k_val * (1.0f + (a_val - 1.0f) * k_a_val);
+}
+
+hipError_t launch_control_k_f32(
+    const float* k_a,
+    const float* a,
+    const float* k,
+    float* output,
+    int C,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (C <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+
+    int total = C * T * B;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_control_k_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       k_a, a, k, output, C, T, B);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// WKV7 Core Kernel
+// Implements RWKV7's time mixing attention mechanism.
+//
+// The kernel processes T tokens sequentially, maintaining an NxN state matrix
+// per head per batch. Each thread handles one row of the state matrix.
+//
+// Input/Output shapes (web-rwkv convention with N as fastest axis):
+//   w_decay: [N, H, T, B] - pre-computed decay = exp(-exp(w_raw))
+//   q, k, v, a, b: [N, H, T, B] - query, key, value, attention components
+//   state_in/out: [N, N, H, B] - NxN state matrix per head per batch
+//   output: [N, H, T, B]
+//
+// Algorithm per timestep:
+//   1. sa = sum(a[j] * state[i,j]) for all j  // attention over state
+//   2. state[i,j] = state[i,j] * w[j] + sa * b[j] + k[j] * v[i]  // update
+//   3. y[i] = sum(state[i,j] * q[j]) for all j  // output
+// ============================================================================
+
+// Fixed head size for RWKV7 - matches the reference implementation
+#define WKV7_HEAD_SIZE 64
+
+__global__ void kernel_wkv7_f32(
+    const float* __restrict__ w_decay,    // [N, H, T, B] - decay values
+    const float* __restrict__ q,          // [N, H, T, B]
+    const float* __restrict__ k,          // [N, H, T, B]
+    const float* __restrict__ v,          // [N, H, T, B]
+    const float* __restrict__ a,          // [N, H, T, B]
+    const float* __restrict__ b,          // [N, H, T, B]
+    const float* __restrict__ state_in,   // [N, N, H, B]
+    float* __restrict__ output,           // [N, H, T, B]
+    float* __restrict__ state_out,        // [N, N, H, B]
+    int N,    // head_size (64)
+    int H,    // n_heads
+    int T,    // tokens
+    int B     // batch
+) {
+    // Thread i handles row i of the state matrix for a specific (head, batch)
+    int i = threadIdx.x;  // position within head (0..N-1)
+    int hh = blockIdx.x;  // head index
+    int bb = blockIdx.y;  // batch index
+
+    if (i >= N) return;
+
+    // Each thread maintains its own state row
+    float state[WKV7_HEAD_SIZE];
+
+    // Load initial state: state_in has shape [N, N, H, B]
+    // For row i of head hh, batch bb:
+    // state_in[j, i, hh, bb] is at: j + N*(i + N*(hh + H*bb))
+    int state_base = i*N + hh*N*N + bb*N*N*H;
+    #pragma unroll
+    for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+        state[j] = state_in[j + state_base];
+    }
+
+    // Shared memory for per-token vectors
+    __shared__ float sh_q[WKV7_HEAD_SIZE];
+    __shared__ float sh_k[WKV7_HEAD_SIZE];
+    __shared__ float sh_w[WKV7_HEAD_SIZE];
+    __shared__ float sh_a[WKV7_HEAD_SIZE];
+    __shared__ float sh_b[WKV7_HEAD_SIZE];
+
+    // Process each timestep
+    for (int t = 0; t < T; t++) {
+        // Input index for this (n, h, t, b) element
+        // Shape [N, H, T, B]: ind = n + N*(h + H*(t + T*b))
+        int ind = i + N*(hh + H*(t + T*bb));
+
+        // Load vectors into shared memory (all threads collaborate)
+        __syncthreads();
+        sh_q[i] = q[ind];
+        sh_w[i] = w_decay[ind];
+        sh_k[i] = k[ind];
+        sh_a[i] = a[ind];
+        sh_b[i] = b[ind];
+        __syncthreads();
+
+        // Load this thread's v value
+        float v_val = v[ind];
+
+        // Step 1: Compute sa = sum(a[j] * state[j])
+        float sa = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+            sa += sh_a[j] * state[j];
+        }
+
+        // Step 2: Update state and compute output
+        // state[j] = state[j] * w[j] + sa * b[j] + k[j] * v
+        // y = sum(state[j] * q[j])
+        float y = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+            float s = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
+            state[j] = s;
+            y += s * sh_q[j];
+        }
+
+        // Write output
+        output[ind] = y;
+    }
+
+    // Save final state
+    #pragma unroll
+    for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+        state_out[j + state_base] = state[j];
+    }
+}
+
+hipError_t launch_wkv7_f32(
+    const float* w_decay,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* a,
+    const float* b,
+    const float* state_in,
+    float* output,
+    float* state_out,
+    int N,    // head_size
+    int H,    // n_heads
+    int T,    // tokens
+    int B,    // batch
+    hipStream_t stream
+) {
+    if (N <= 0 || H <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+
+    // Only support N=64 for now (matches reference)
+    if (N != WKV7_HEAD_SIZE) {
+        return hipErrorInvalidValue;
+    }
+
+    // Launch grid: one block per (head, batch) pair
+    // Block: N threads (one per state row)
+    dim3 grid(H, B);
+    dim3 block(N);
+
+    hipLaunchKernelGGL(kernel_wkv7_f32, grid, block, 0, stream,
+                       w_decay, q, k, v, a, b, state_in, output, state_out,
+                       N, H, T, B);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);
@@ -836,6 +1143,143 @@ hipError_t hip_device_synchronize() {
 // Error string
 const char* hip_get_error_string(hipError_t error) {
     return hipGetErrorString(error);
+}
+
+// ============================================================================
+// rocBLAS GEMV/GEMM Functions
+// ============================================================================
+
+// Create rocBLAS handle
+rocblas_status rocblas_handle_create(rocblas_handle* handle) {
+    return rocblas_create_handle(handle);
+}
+
+// Destroy rocBLAS handle
+rocblas_status rocblas_handle_destroy(rocblas_handle handle) {
+    return rocblas_destroy_handle(handle);
+}
+
+// Set rocBLAS stream
+rocblas_status rocblas_set_stream_wrapper(rocblas_handle handle, hipStream_t stream) {
+    return rocblas_set_stream(handle, stream);
+}
+
+// SGEMV: y = alpha * A * x + beta * y
+// A is M×N, x is length N, y is length M
+// Column-major: A has stride M (lda = M)
+rocblas_status launch_sgemv(
+    rocblas_handle handle,
+    int M,              // rows of A, length of y
+    int N,              // cols of A, length of x
+    float alpha,
+    const float* A,     // M×N matrix (column-major)
+    const float* x,     // length N vector
+    float beta,
+    float* y            // length M vector
+) {
+    return rocblas_sgemv(
+        handle,
+        rocblas_operation_none,  // no transpose
+        M, N,
+        &alpha,
+        A, M,       // lda = M (column-major)
+        x, 1,       // incx = 1
+        &beta,
+        y, 1        // incy = 1
+    );
+}
+
+// HGEMV: same as SGEMV but with FP16
+// Note: rocBLAS doesn't have native hgemv, so we use hgemm with n=1
+rocblas_status launch_hgemv(
+    rocblas_handle handle,
+    int M,              // rows of A
+    int N,              // cols of A
+    const __half* A,    // M×N matrix
+    const __half* x,    // length N vector
+    __half* y           // length M vector
+) {
+    // Use hgemm with n=1: C = A * B where B is N×1 and C is M×1
+    const rocblas_half alpha = {0x3C00};  // 1.0 in FP16
+    const rocblas_half beta = {0x0000};   // 0.0 in FP16
+
+    return rocblas_hgemm(
+        handle,
+        rocblas_operation_none,  // opA
+        rocblas_operation_none,  // opB
+        M, 1, N,                 // M, N, K (result is M×1)
+        &alpha,
+        (const rocblas_half*)A, M,   // A is M×N (K=N)
+        (const rocblas_half*)x, N,   // B is K×N (N=1), ldb=K=N
+        &beta,
+        (rocblas_half*)y, M          // C is M×1, ldc=M
+    );
+}
+
+// SGEMM: C = alpha * A * B + beta * C
+// A is M×K, B is K×N, C is M×N
+rocblas_status launch_sgemm(
+    rocblas_handle handle,
+    int M,              // rows of A and C
+    int N,              // cols of B and C
+    int K,              // cols of A, rows of B
+    float alpha,
+    const float* A,     // M×K matrix
+    const float* B,     // K×N matrix
+    float beta,
+    float* C            // M×N matrix
+) {
+    return rocblas_sgemm(
+        handle,
+        rocblas_operation_none,  // opA
+        rocblas_operation_none,  // opB
+        M, N, K,
+        &alpha,
+        A, M,       // lda = M
+        B, K,       // ldb = K
+        &beta,
+        C, M        // ldc = M
+    );
+}
+
+// HGEMM: same as SGEMM but with FP16
+rocblas_status launch_hgemm(
+    rocblas_handle handle,
+    int M,              // rows of A and C
+    int N,              // cols of B and C
+    int K,              // cols of A, rows of B
+    const __half* A,    // M×K matrix
+    const __half* B,    // K×N matrix
+    __half* C           // M×N matrix
+) {
+    const rocblas_half alpha = {0x3C00};  // 1.0 in FP16
+    const rocblas_half beta = {0x0000};   // 0.0 in FP16
+
+    return rocblas_hgemm(
+        handle,
+        rocblas_operation_none,  // opA
+        rocblas_operation_none,  // opB
+        M, N, K,
+        &alpha,
+        (const rocblas_half*)A, M,
+        (const rocblas_half*)B, K,
+        &beta,
+        (rocblas_half*)C, M
+    );
+}
+
+// Convert rocblas_status to hipError_t for consistent error handling
+hipError_t rocblas_to_hip_error(rocblas_status status) {
+    switch (status) {
+        case rocblas_status_success:
+            return hipSuccess;
+        case rocblas_status_invalid_value:
+            return hipErrorInvalidValue;
+        case rocblas_status_memory_error:
+            return hipErrorMemoryAllocation;
+        default:
+            return hipErrorUnknown;
+    }
 }
 
 } // extern "C"
