@@ -75,6 +75,8 @@ crossterm = "0.29"
 dialoguer = "0.12.0"
 fastrand = "2.3"
 memmap2 = "0.9"
+ndarray = "0.16"
+ndarray-npy = "0.9"
 ratatui = { version = "0.30", features = ["all-widgets"] }
 simple_logger = { version = "5.1", features = ["stderr"] }
 tokio = { version = "1.41", features = ["full"] }
