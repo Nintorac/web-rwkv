@@ -101,6 +101,39 @@ hipError_t launch_lerp_f32(const float* a, const float* b, const float* t,
     return hipGetLastError();
 }
 
+// ============================================================================
+// Sigmoid Kernel: out = 1 / (1 + exp(-x))
+// Standard sigmoid activation function
+// ============================================================================
+
+__global__ void kernel_sigmoid_f32(const float* __restrict__ input,
+                                    float* __restrict__ output,
+                                    int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = input[idx];
+        // Numerically stable sigmoid:
+        // For large positive x: 1 / (1 + exp(-x)) ≈ 1
+        // For large negative x: 1 / (1 + exp(-x)) ≈ 0
+        // Using __expf for fast math on GPU
+        output[idx] = 1.0f / (1.0f + __expf(-x));
+    }
+}
+
+hipError_t launch_sigmoid_f32(const float* input, float* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_sigmoid_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

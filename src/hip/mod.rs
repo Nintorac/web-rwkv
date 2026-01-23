@@ -106,6 +106,7 @@ extern "C" {
     fn launch_copy_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     fn launch_lerp_f32(a: *const f32, b: *const f32, t: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    fn launch_sigmoid_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -1146,6 +1147,54 @@ pub fn hip_lerp(a: &[f32], b: &[f32], t: &[f32]) -> Result<Vec<f32>> {
     d_output.to_vec(&stream)
 }
 
+/// Launch the sigmoid kernel: out = 1 / (1 + exp(-x))
+///
+/// Standard sigmoid activation function.
+pub fn sigmoid_f32(
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "sigmoid_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_sigmoid_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute sigmoid on host data, returning results.
+/// This is a convenience function for testing.
+pub fn hip_sigmoid(input: &[f32]) -> Result<Vec<f32>> {
+    let stream = Stream::null();
+    let shape = TensorShape::new(input.len(), 1, 1, 1);
+
+    let d_input = TensorHip::from_slice(input, shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(shape)?;
+
+    sigmoid_f32(&d_input, &mut d_output, &stream)?;
+
+    d_output.to_vec(&stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1537,5 +1586,76 @@ mod tests {
             );
         }
         println!("Lerp edge case test passed: extrapolation works correctly");
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.1 (Sigmoid Kernel) ===
+
+    #[test]
+    fn test_sigmoid() {
+        // Test basic sigmoid functionality: out = 1 / (1 + exp(-x))
+        let input = vec![0.0, 1.0, -1.0, 2.0, -2.0];
+
+        let output = hip_sigmoid(&input).expect("sigmoid kernel failed");
+
+        // Expected: sigmoid(x) = 1 / (1 + exp(-x))
+        // sigmoid(0) = 0.5
+        // sigmoid(1) ≈ 0.7311
+        // sigmoid(-1) ≈ 0.2689
+        // sigmoid(2) ≈ 0.8808
+        // sigmoid(-2) ≈ 0.1192
+        let expected = vec![0.5, 0.7310586, 0.26894143, 0.880797, 0.11920292];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i, actual, exp, diff
+            );
+        }
+        println!("Basic sigmoid test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_sigmoid_edge_cases() {
+        // Test edge cases that could cause numerical issues
+        let input = vec![
+            -100.0,  // Very negative: sigmoid → 0
+            -50.0,   // Large negative
+            -10.0,   // Moderate negative
+            0.0,     // Zero: sigmoid = 0.5
+            10.0,    // Moderate positive
+            50.0,    // Large positive
+            100.0,   // Very positive: sigmoid → 1
+        ];
+
+        let output = hip_sigmoid(&input).expect("sigmoid edge case test failed");
+
+        // Verify no NaN or Inf values
+        for (i, &val) in output.iter().enumerate() {
+            assert!(
+                !val.is_nan(),
+                "NaN at index {} (input={})", i, input[i]
+            );
+            assert!(
+                !val.is_infinite(),
+                "Inf at index {} (input={})", i, input[i]
+            );
+            assert!(
+                val >= 0.0 && val <= 1.0,
+                "Value out of [0,1] range at index {}: {} (input={})",
+                i, val, input[i]
+            );
+        }
+
+        // Verify expected behavior at extremes
+        assert!(output[0] < 1e-10, "sigmoid(-100) should be ≈0, got {}", output[0]);
+        assert!(output[1] < 1e-10, "sigmoid(-50) should be ≈0, got {}", output[1]);
+        assert!((output[3] - 0.5).abs() < 1e-6, "sigmoid(0) should be 0.5, got {}", output[3]);
+        assert!(output[5] >= 1.0 - 1e-10, "sigmoid(50) should be ≈1, got {}", output[5]);
+        assert!(output[6] >= 1.0 - 1e-10, "sigmoid(100) should be ≈1, got {}", output[6]);
+
+        println!("Sigmoid edge case test passed: all {} values are finite and in [0,1]", output.len());
     }
 }

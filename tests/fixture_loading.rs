@@ -252,6 +252,79 @@ fn test_lerp_fixture() {
     println!("lerp fixture test passed: {} elements match", output.len());
 }
 
+/// Test sigmoid kernel against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.1.
+#[test]
+#[cfg(feature = "hip")]
+fn test_sigmoid_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/sigmoid/basic.npz")
+        .expect("Failed to load sigmoid fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+    let shape = fixture.shape4("input");
+
+    println!(
+        "Testing sigmoid: {} elements, shape {:?}",
+        input.len(),
+        shape
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_sigmoid(input)
+        .expect("sigmoid kernel failed");
+
+    // Compare with fixture (< 1e-3 relative error per acceptance criteria)
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("sigmoid output doesn't match fixture");
+
+    println!("sigmoid fixture test passed: {} elements match", output.len());
+}
+
+/// Test sigmoid edge cases against Python fixtures.
+/// This is an acceptance criteria test for bd-2sh.4.1.
+#[test]
+#[cfg(feature = "hip")]
+fn test_sigmoid_edge_cases_fixture() {
+    if !fixtures_exist() {
+        eprintln!("Skipping test: fixtures not generated");
+        return;
+    }
+
+    let fixture = TestFixture::load("tests/fixtures/kernels/sigmoid/edge_cases.npz")
+        .expect("Failed to load sigmoid edge_cases fixture");
+
+    let input = fixture.f32("input");
+    let expected = fixture.f32("expected");
+
+    println!(
+        "Testing sigmoid edge cases: {} elements",
+        input.len()
+    );
+
+    // Run kernel
+    let output = web_rwkv::hip::hip_sigmoid(input)
+        .expect("sigmoid edge cases kernel failed");
+
+    // Verify no NaN/Inf
+    for (i, &val) in output.iter().enumerate() {
+        assert!(!val.is_nan(), "NaN at index {} (input={})", i, input[i]);
+        assert!(!val.is_infinite(), "Inf at index {} (input={})", i, input[i]);
+        assert!(val >= 0.0 && val <= 1.0, "Value out of [0,1] at index {}: {}", i, val);
+    }
+
+    // Compare with fixture
+    assert_tensors_close(&output, expected, 1e-3, 1e-4)
+        .expect("sigmoid edge cases output doesn't match fixture");
+
+    println!("sigmoid edge cases fixture test passed");
+}
+
 #[test]
 fn test_all_kernel_fixtures_loadable() {
     if !fixtures_exist() {
