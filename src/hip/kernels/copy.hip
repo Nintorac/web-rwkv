@@ -878,6 +878,22 @@ hipError_t launch_control_k_f32(
 // Fixed head size for RWKV7 - matches the reference implementation
 #define WKV7_HEAD_SIZE 64
 
+// Pairwise summation helper: reduces a 64-element array to a single sum.
+// Uses tree-based reduction: error is O(epsilon * log(N)) vs O(epsilon * N).
+// This improves numerical precision for FP32 accumulation.
+__device__ __forceinline__ float pairwise_sum_64(float* __restrict__ tmp) {
+    // Tree reduction: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+    // This matches the Python pairwise_sum: x = x[..., :half] + x[..., half:]
+    #pragma unroll
+    for (int stride = 32; stride > 0; stride >>= 1) {
+        #pragma unroll
+        for (int j = 0; j < stride; j++) {
+            tmp[j] = tmp[j] + tmp[j + stride];
+        }
+    }
+    return tmp[0];
+}
+
 __global__ void kernel_wkv7_f32(
     const float* __restrict__ w_decay,    // [N, H, T, B] - decay values
     const float* __restrict__ q,          // [N, H, T, B]
@@ -919,6 +935,9 @@ __global__ void kernel_wkv7_f32(
     __shared__ float sh_a[WKV7_HEAD_SIZE];
     __shared__ float sh_b[WKV7_HEAD_SIZE];
 
+    // Temporary array for pairwise summation (per-thread)
+    float tmp[WKV7_HEAD_SIZE];
+
     // Process each timestep
     for (int t = 0; t < T; t++) {
         // Input index for this (n, h, t, b) element
@@ -937,23 +956,27 @@ __global__ void kernel_wkv7_f32(
         // Load this thread's v value
         float v_val = v[ind];
 
-        // Step 1: Compute sa = sum(a[j] * state[j])
-        float sa = 0.0f;
+        // Step 1: Compute sa = sum(a[j] * state[j]) using pairwise summation
+        // Pairwise sum reduces error from O(N*epsilon) to O(log(N)*epsilon)
         #pragma unroll
         for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-            sa += sh_a[j] * state[j];
+            tmp[j] = sh_a[j] * state[j];
+        }
+        float sa = pairwise_sum_64(tmp);
+
+        // Step 2: Update state (element-wise, no summation error)
+        // state[j] = state[j] * w[j] + sa * b[j] + k[j] * v
+        #pragma unroll
+        for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+            state[j] = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
         }
 
-        // Step 2: Update state and compute output
-        // state[j] = state[j] * w[j] + sa * b[j] + k[j] * v
-        // y = sum(state[j] * q[j])
-        float y = 0.0f;
+        // Step 3: Compute output y = sum(state[j] * q[j]) using pairwise summation
         #pragma unroll
         for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-            float s = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
-            state[j] = s;
-            y += s * sh_q[j];
+            tmp[j] = state[j] * sh_q[j];
         }
+        float y = pairwise_sum_64(tmp);
 
         // Write output
         output[ind] = y;

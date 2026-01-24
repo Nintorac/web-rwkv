@@ -46,6 +46,42 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
 
 
+def pairwise_sum(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Pairwise summation along a dimension for improved numerical precision.
+
+    Uses tree-based reduction: error is O(epsilon * log(N)) vs O(epsilon * N) for naive sum.
+    This matches the pairwise summation used in the HIP WKV7 kernel for consistency.
+
+    Args:
+        x: Input tensor
+        dim: Dimension to reduce
+
+    Returns:
+        Tensor with the specified dimension reduced
+    """
+    # Move the reduction dimension to the last position
+    x = x.movedim(dim, -1)
+    original_shape = x.shape[:-1]
+    n = x.shape[-1]
+
+    # Flatten all other dimensions
+    x = x.reshape(-1, n)
+
+    # Ensure n is a power of 2 for clean reduction, pad if necessary
+    if n & (n - 1) != 0:
+        # Not a power of 2, use standard sum as fallback
+        result = x.sum(dim=-1)
+    else:
+        # Pairwise tree reduction
+        while x.shape[-1] > 1:
+            half = x.shape[-1] // 2
+            x = x[..., :half] + x[..., half:]
+        result = x.squeeze(-1)
+
+    return result.reshape(original_shape)
+
+
 def save_fixture(path: Path, **tensors: Dict[str, Tuple[np.ndarray, Tuple[int, ...]]]):
     """
     Save tensors to NPZ with flattened data and explicit 4D shapes.
@@ -425,8 +461,15 @@ def generate_wkv7_fixtures(output_dir: Path, config: dict):
         q = torch.randn(B, T, H, N, dtype=torch.float16)
         k = torch.randn(B, T, H, N, dtype=torch.float16)
         v = torch.randn(B, T, H, N, dtype=torch.float16)
-        a = torch.randn(B, T, H, N, dtype=torch.float16)  # -kk (normalized removal key)
-        b = torch.randn(B, T, H, N, dtype=torch.float16)  # kk * a_t (replacement)
+
+        # In real RWKV7, a=-kk and b=kk*a_proj where:
+        # - kk is L2-normalized (|kk|_2 = 1), so elements are bounded to [-1, 1]
+        # - a_proj = sigmoid(...), so a_proj is bounded to (0, 1)
+        # Using bounded values prevents numerical explosion in state accumulation.
+        kk = F.normalize(torch.randn(B, T, H, N), dim=-1, p=2.0)  # L2-normalized
+        a_proj = torch.sigmoid(torch.randn(B, T, H, N))  # bounded to (0, 1)
+        a = (-kk).to(torch.float16)  # -kk, elements roughly in [-1, 1]
+        b = (kk * a_proj).to(torch.float16)  # kk * a_proj, bounded
 
         if state_in is None:
             state = torch.zeros(B, H, N, N, dtype=torch.float32)
@@ -449,7 +492,8 @@ def generate_wkv7_fixtures(output_dir: Path, config: dict):
                     b_t = b[batch, t, head].float()  # [N]
 
                     # sa = state @ a (contract last dim of state with a)
-                    sa = (s * a_t.unsqueeze(0)).sum(dim=1)  # [N]
+                    # Use pairwise_sum for numerical consistency with HIP kernel
+                    sa = pairwise_sum(s * a_t.unsqueeze(0), dim=1)  # [N]
 
                     # State update: s = s * w + outer(sa, b) + outer(v, k)
                     s = s * w_t.unsqueeze(0) + \
@@ -457,7 +501,8 @@ def generate_wkv7_fixtures(output_dir: Path, config: dict):
                         v_t.unsqueeze(1) * k_t.unsqueeze(0)
 
                     # Output: y = state @ q
-                    y = (s * q_t.unsqueeze(0)).sum(dim=1)  # [N]
+                    # Use pairwise_sum for numerical consistency with HIP kernel
+                    y = pairwise_sum(s * q_t.unsqueeze(0), dim=1)  # [N]
                     output[batch, t, head] = y
 
                     state[batch, head] = s
@@ -778,16 +823,16 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
                 a_t = a_wkv[batch, t, head]
                 b_t = b_wkv[batch, t, head]
 
-                # sa = state @ a
-                sa = (s * a_t.unsqueeze(0)).sum(dim=1)
+                # sa = state @ a (pairwise_sum for HIP kernel consistency)
+                sa = pairwise_sum(s * a_t.unsqueeze(0), dim=1)
 
                 # state = state * w + outer(sa, b) + outer(v, k)
                 s = s * w_t.unsqueeze(0) + \
                     sa.unsqueeze(1) * b_t.unsqueeze(0) + \
                     v_t.unsqueeze(1) * k_t.unsqueeze(0)
 
-                # output = state @ q (using r as q)
-                y = (s * q_t.unsqueeze(0)).sum(dim=1)
+                # output = state @ q (using r as q, pairwise_sum for HIP consistency)
+                y = pairwise_sum(s * q_t.unsqueeze(0), dim=1)
                 wkv_output[batch, t, head] = y
 
                 wkv_state_out[batch, head] = s
@@ -1044,17 +1089,18 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
                 a_t = a_wkv_block[batch, t, head]
                 b_t = b_wkv_block[batch, t, head]
 
-                sa = (s * a_t.unsqueeze(0)).sum(dim=1)
+                sa = pairwise_sum(s * a_t.unsqueeze(0), dim=1)
                 s = s * w_t.unsqueeze(0) + \
                     sa.unsqueeze(1) * b_t.unsqueeze(0) + \
                     v_t.unsqueeze(1) * k_t.unsqueeze(0)
-                y = (s * q_t.unsqueeze(0)).sum(dim=1)
+                y = pairwise_sum(s * q_t.unsqueeze(0), dim=1)
                 wkv_output_block[batch, t, head] = y
                 wkv_state_out_block[batch, head] = s
 
     wkv_out_flat_block = wkv_output_block.view(B_full, T_full, C)
 
     # WKV Bonus: u = (r * k * r_k).sum(dim=-1, keepdim=True) * v
+    # Note: wkv_bonus uses block reduction in HIP kernel which is similar to pairwise
     r_bonus = r_proj.float().view(B_full, T_full, H, N)
     k_bonus = k_ctrl_block.float().view(B_full, T_full, H, N)
     v_bonus = v_proj.float().view(B_full, T_full, H, N)
