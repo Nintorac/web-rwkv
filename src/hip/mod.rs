@@ -3039,6 +3039,91 @@ impl From<std::io::Error> for ModelLoadError {
     }
 }
 
+/// State for HIP RWKV7 inference.
+///
+/// Holds the recurrent state needed to continue inference from a previous position.
+/// Create with `HipState::new()` for fresh inference, or clone for branching.
+///
+/// # State Components
+/// - `att_states`: WKV recurrent state per layer `[head_size * head_size * n_head]`
+/// - `att_shift_states`: Attention token shift state per layer `[n_embd]`
+/// - `ffn_states`: FFN token shift state per layer `[n_embd]`
+///
+/// # Usage
+/// ```ignore
+/// let mut state = HipState::new(&model.info);
+///
+/// // Streaming: process tokens one at a time
+/// let logits1 = model.forward_with_state(&[token1], &mut state)?;
+/// let logits2 = model.forward_with_state(&[token2], &mut state)?;
+///
+/// // Chunked: process long sequences in pieces
+/// for chunk in long_sequence.chunks(4096) {
+///     let logits = model.forward_with_state(chunk, &mut state)?;
+/// }
+///
+/// // Branching: clone state for speculative decoding
+/// let branch_state = state.clone();
+///
+/// // Multi-sequence: use separate states for each sequence
+/// let mut state_a = HipState::new(&model.info);
+/// let mut state_b = HipState::new(&model.info);
+/// let logits_a = model.forward_with_state(&tokens_a, &mut state_a)?;
+/// let logits_b = model.forward_with_state(&tokens_b, &mut state_b)?;
+/// ```
+///
+/// # Note on Batching
+/// This state is designed for single-sequence inference. For multi-sequence
+/// workloads, use separate `HipState` instances per sequence. Parallel batched
+/// inference (processing multiple sequences in a single kernel launch) would
+/// require extending the state to include a batch dimension.
+#[derive(Debug, Clone)]
+pub struct HipState {
+    /// WKV state per layer: [head_size * head_size * n_head] per layer
+    pub att_states: Vec<Vec<f32>>,
+    /// Attention token shift state per layer: [n_embd] per layer
+    pub att_shift_states: Vec<Vec<f32>>,
+    /// FFN token shift state per layer: [n_embd] per layer
+    pub ffn_states: Vec<Vec<f32>>,
+}
+
+impl HipState {
+    /// Create a fresh state initialized to zeros.
+    ///
+    /// Use this to start inference from the beginning of a sequence.
+    pub fn new(info: &Rwkv7ModelInfo) -> Self {
+        let n_layer = info.n_layer;
+        let n_embd = info.n_embd;
+        let head_size = info.head_size;
+        let n_head = info.n_head;
+
+        HipState {
+            att_states: (0..n_layer)
+                .map(|_| vec![0.0f32; head_size * head_size * n_head])
+                .collect(),
+            att_shift_states: (0..n_layer)
+                .map(|_| vec![0.0f32; n_embd])
+                .collect(),
+            ffn_states: (0..n_layer)
+                .map(|_| vec![0.0f32; n_embd])
+                .collect(),
+        }
+    }
+
+    /// Reset state to zeros (equivalent to creating a new state).
+    pub fn reset(&mut self) {
+        for state in &mut self.att_states {
+            state.fill(0.0);
+        }
+        for state in &mut self.att_shift_states {
+            state.fill(0.0);
+        }
+        for state in &mut self.ffn_states {
+            state.fill(0.0);
+        }
+    }
+}
+
 /// Transpose a 2D matrix from row-major to column-major layout.
 ///
 /// Row-major [M, K]: element (i, j) at index i * K + j
@@ -3409,17 +3494,47 @@ impl Rwkv7Hip {
         Ok(all_data[..n].to_vec())
     }
 
-    /// Run a full forward pass on input tokens.
+    /// Run a full forward pass on input tokens with fresh state.
     ///
-    /// This processes tokens through all layers (embedding, attention, FFN, head)
-    /// and returns logits for the next token prediction.
+    /// This is a convenience wrapper that creates a fresh state and calls
+    /// `forward_with_state()`. Use this when you don't need to continue
+    /// inference from a previous position.
     ///
     /// # Arguments
     /// * `tokens` - Input token IDs
     ///
     /// # Returns
-    /// Logits tensor of shape [vocab_size, T] for each input token.
+    /// Logits tensor of shape [vocab_size * T] for each input token.
     pub fn forward(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut state = HipState::new(&self.info);
+        self.forward_with_state(tokens, &mut state)
+    }
+
+    /// Run a full forward pass on input tokens with explicit state management.
+    ///
+    /// This is the core forward pass that enables:
+    /// - Streaming inference (token-by-token with state carryover)
+    /// - Chunked processing (long context in pieces)
+    /// - Multi-turn conversations (continue from saved state)
+    ///
+    /// # Arguments
+    /// * `tokens` - Input token IDs
+    /// * `state` - Mutable reference to inference state (updated in-place)
+    ///
+    /// # Returns
+    /// Logits tensor of shape [vocab_size * T] for each input token.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut state = HipState::new(&model.info);
+    ///
+    /// // Streaming: process tokens one at a time
+    /// let logits1 = model.forward_with_state(&[token1], &mut state)?;
+    /// let logits2 = model.forward_with_state(&[token2], &mut state)?;
+    ///
+    /// // The state carries over, so logits2 is conditioned on both tokens
+    /// ```
+    pub fn forward_with_state(&self, tokens: &[u32], state: &mut HipState) -> Result<Vec<f32>> {
         let stream = Stream::null();
         let n_embd = self.info.n_embd;
         let n_head = self.info.n_head;
@@ -3441,16 +3556,7 @@ impl Rwkv7Hip {
             }
         }
 
-        // Initialize states (zeros for fresh inference)
-        let mut att_states: Vec<Vec<f32>> = (0..n_layer)
-            .map(|_| vec![0.0f32; head_size * head_size * n_head])
-            .collect();
-        let mut att_shift_states: Vec<Vec<f32>> = (0..n_layer)
-            .map(|_| vec![0.0f32; n_embd])
-            .collect();
-        let mut ffn_states: Vec<Vec<f32>> = (0..n_layer)
-            .map(|_| vec![0.0f32; n_embd])
-            .collect();
+        // v_first is computed fresh each forward call (not part of persistent state)
         let mut v_first: Option<Vec<f32>> = None;
 
         // Process each layer
@@ -3470,7 +3576,7 @@ impl Rwkv7Hip {
             let x_ln1 = hip_layer_norm(&x, &ln1_w, &ln1_b, n_embd, t * b, 1e-5)?;
 
             // Token shift for attention - all shifts use the same old state
-            let att_shift_state = &att_shift_states[layer_idx];
+            let att_shift_state = &state.att_shift_states[layer_idx];
             let x_r = layer.att.x_r.to_vec(&stream)?;
             let x_w = layer.att.x_w.to_vec(&stream)?;
             let x_k = layer.att.x_k.to_vec(&stream)?;
@@ -3486,7 +3592,7 @@ impl Rwkv7Hip {
             let (xg, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_g, n_embd, t, b)?;
 
             // Update shift state after all shifts are computed
-            att_shift_states[layer_idx] = new_att_shift;
+            state.att_shift_states[layer_idx] = new_att_shift;
 
             // Linear projections: r, k, v
             let w_r = layer.att.w_r.to_vec(&stream)?;
@@ -3575,9 +3681,9 @@ impl Rwkv7Hip {
             // Run WKV7
             let (wkv_output, new_att_state) = hip_wkv7(
                 &w_decay, &r, &k_ctrl, &v, &wkv_a, &wkv_b,
-                &att_states[layer_idx], head_size, n_head, t, b
+                &state.att_states[layer_idx], head_size, n_head, t, b
             )?;
-            att_states[layer_idx] = new_att_state;
+            state.att_states[layer_idx] = new_att_state;
 
             // WKV bonus
             let r_k = layer.att.r_k.to_vec(&stream)?;
@@ -3610,8 +3716,8 @@ impl Rwkv7Hip {
 
             // Token shift for FFN
             let ffn_x_k = layer.ffn.x_k.to_vec(&stream)?;
-            let (xk_ffn, new_ffn_state) = hip_channel_mix_state(&x_ln2, &ffn_states[layer_idx], &ffn_x_k, n_embd, t, b)?;
-            ffn_states[layer_idx] = new_ffn_state;
+            let (xk_ffn, new_ffn_state) = hip_channel_mix_state(&x_ln2, &state.ffn_states[layer_idx], &ffn_x_k, n_embd, t, b)?;
+            state.ffn_states[layer_idx] = new_ffn_state;
 
             // Key projection + squared ReLU
             let ffn_w_k = layer.ffn.w_k.to_vec(&stream)?;
@@ -4646,5 +4752,320 @@ mod tests {
             );
         }
         println!("Token shift full mix test passed");
+    }
+
+    // === State I/O Tests (bd-2sh.5.6) ===
+
+    /// Test that HipState is correctly sized for model dimensions.
+    #[test]
+    fn test_hip_state_sizing() {
+        let info = Rwkv7ModelInfo {
+            n_layer: 12,
+            n_embd: 768,
+            n_head: 12,
+            head_size: 64,
+            n_vocab: 65536,
+            n_hidden: 2048,
+        };
+
+        let state = HipState::new(&info);
+
+        // Check dimensions
+        assert_eq!(state.att_states.len(), 12, "Should have 12 layers of att states");
+        assert_eq!(state.att_shift_states.len(), 12, "Should have 12 layers of att shift states");
+        assert_eq!(state.ffn_states.len(), 12, "Should have 12 layers of ffn states");
+
+        // Check per-layer sizes
+        let expected_att_state_size = 64 * 64 * 12; // head_size * head_size * n_head
+        let expected_shift_state_size = 768; // n_embd
+
+        for (i, att_state) in state.att_states.iter().enumerate() {
+            assert_eq!(att_state.len(), expected_att_state_size,
+                "Layer {} att state should have {} elements", i, expected_att_state_size);
+        }
+
+        for (i, shift_state) in state.att_shift_states.iter().enumerate() {
+            assert_eq!(shift_state.len(), expected_shift_state_size,
+                "Layer {} att shift state should have {} elements", i, expected_shift_state_size);
+        }
+
+        for (i, ffn_state) in state.ffn_states.iter().enumerate() {
+            assert_eq!(ffn_state.len(), expected_shift_state_size,
+                "Layer {} ffn state should have {} elements", i, expected_shift_state_size);
+        }
+
+        // Check all values are zero-initialized
+        for att_state in &state.att_states {
+            assert!(att_state.iter().all(|&x| x == 0.0), "att_states should be zero-initialized");
+        }
+        for shift_state in &state.att_shift_states {
+            assert!(shift_state.iter().all(|&x| x == 0.0), "att_shift_states should be zero-initialized");
+        }
+        for ffn_state in &state.ffn_states {
+            assert!(ffn_state.iter().all(|&x| x == 0.0), "ffn_states should be zero-initialized");
+        }
+
+        println!("HipState sizing test passed");
+    }
+
+    /// Test that HipState::reset() zeros all state.
+    #[test]
+    fn test_hip_state_reset() {
+        let info = Rwkv7ModelInfo {
+            n_layer: 2,
+            n_embd: 64,
+            n_head: 2,
+            head_size: 32,
+            n_vocab: 100,
+            n_hidden: 128,
+        };
+
+        let mut state = HipState::new(&info);
+
+        // Fill with non-zero values
+        for att_state in &mut state.att_states {
+            att_state.fill(1.5);
+        }
+        for shift_state in &mut state.att_shift_states {
+            shift_state.fill(2.5);
+        }
+        for ffn_state in &mut state.ffn_states {
+            ffn_state.fill(3.5);
+        }
+
+        // Reset
+        state.reset();
+
+        // Verify all zeros
+        for att_state in &state.att_states {
+            assert!(att_state.iter().all(|&x| x == 0.0), "att_states should be zero after reset");
+        }
+        for shift_state in &state.att_shift_states {
+            assert!(shift_state.iter().all(|&x| x == 0.0), "att_shift_states should be zero after reset");
+        }
+        for ffn_state in &state.ffn_states {
+            assert!(ffn_state.iter().all(|&x| x == 0.0), "ffn_states should be zero after reset");
+        }
+
+        println!("HipState reset test passed");
+    }
+
+    /// Test that forward_with_state with fresh state matches forward().
+    /// This is the fundamental correctness test for state I/O.
+    #[test]
+    fn test_forward_with_fresh_state_matches_forward() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let tokens = vec![1u32, 2, 3, 4, 5]; // Simple token sequence
+
+        // Run forward() (uses fresh state internally)
+        let logits_forward = model.forward(&tokens).expect("forward() failed");
+
+        // Run forward_with_state() with explicit fresh state
+        let mut state = HipState::new(&model.info);
+        let logits_with_state = model.forward_with_state(&tokens, &mut state)
+            .expect("forward_with_state() failed");
+
+        // Should be identical (same computation path)
+        assert_eq!(logits_forward.len(), logits_with_state.len(),
+            "Logits length mismatch");
+
+        for (i, (a, b)) in logits_forward.iter().zip(logits_with_state.iter()).enumerate() {
+            let diff = (a - b).abs();
+            assert!(diff < 1e-6,
+                "Logits mismatch at {}: forward={}, forward_with_state={}, diff={}",
+                i, a, b, diff);
+        }
+
+        println!("forward_with_state with fresh state matches forward() - PASSED");
+    }
+
+    /// Test streaming equivalence: forward([a,b,c]) == forward([a]) + forward([b]) + forward([c])
+    /// where state carries over between calls.
+    #[test]
+    fn test_streaming_equivalence() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let tokens = vec![1u32, 2, 3];
+
+        // Run forward() on all tokens at once
+        let logits_batch = model.forward(&tokens).expect("batch forward failed");
+
+        // Run token-by-token with state carryover
+        let mut state = HipState::new(&model.info);
+        let mut logits_streaming = Vec::new();
+
+        for &token in &tokens {
+            let logits = model.forward_with_state(&[token], &mut state)
+                .expect("streaming forward failed");
+            logits_streaming.extend(logits);
+        }
+
+        // Should produce same logits
+        assert_eq!(logits_batch.len(), logits_streaming.len(),
+            "Logits length mismatch: batch={}, streaming={}",
+            logits_batch.len(), logits_streaming.len());
+
+        // Allow some numerical tolerance due to different computation order
+        // Full model tolerances per plan: rtol=1e-2, atol=1e-3
+        let mut max_diff = 0.0f32;
+        for (i, (batch, stream)) in logits_batch.iter().zip(logits_streaming.iter()).enumerate() {
+            let diff = (batch - stream).abs();
+            max_diff = max_diff.max(diff);
+            let rel_diff = diff / (batch.abs().max(1e-6));
+            assert!(rel_diff < 1e-2 || diff < 1e-3,
+                "Streaming mismatch at {}: batch={}, streaming={}, diff={}, rel_diff={}",
+                i, batch, stream, diff, rel_diff);
+        }
+
+        println!("Streaming equivalence test PASSED (max_diff={})", max_diff);
+    }
+
+    /// Test chunked equivalence: forward(long_seq) == forward(chunk1) + forward(chunk2) + ...
+    #[test]
+    fn test_chunked_equivalence() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+
+        // 10 tokens, chunked into [4, 4, 2]
+        let tokens: Vec<u32> = (1..=10).collect();
+        let chunk_size = 4;
+
+        // Run forward() on all tokens at once
+        let logits_batch = model.forward(&tokens).expect("batch forward failed");
+
+        // Run in chunks with state carryover
+        let mut state = HipState::new(&model.info);
+        let mut logits_chunked = Vec::new();
+
+        for chunk in tokens.chunks(chunk_size) {
+            let logits = model.forward_with_state(chunk, &mut state)
+                .expect("chunked forward failed");
+            logits_chunked.extend(logits);
+        }
+
+        // Should produce same logits
+        assert_eq!(logits_batch.len(), logits_chunked.len(),
+            "Logits length mismatch: batch={}, chunked={}",
+            logits_batch.len(), logits_chunked.len());
+
+        // Allow same tolerances as streaming test
+        let mut max_diff = 0.0f32;
+        for (i, (batch, chunked)) in logits_batch.iter().zip(logits_chunked.iter()).enumerate() {
+            let diff = (batch - chunked).abs();
+            max_diff = max_diff.max(diff);
+            let rel_diff = diff / (batch.abs().max(1e-6));
+            assert!(rel_diff < 1e-2 || diff < 1e-3,
+                "Chunked mismatch at {}: batch={}, chunked={}, diff={}, rel_diff={}",
+                i, batch, chunked, diff, rel_diff);
+        }
+
+        println!("Chunked equivalence test PASSED (max_diff={})", max_diff);
+    }
+
+    /// Test that state changes after forward pass (non-zero state evolution).
+    #[test]
+    fn test_state_evolution() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let tokens = vec![1u32, 2, 3];
+
+        let mut state = HipState::new(&model.info);
+
+        // State should start at zero
+        let att_sum_before: f32 = state.att_states.iter()
+            .flat_map(|v| v.iter())
+            .map(|x| x.abs())
+            .sum();
+        assert_eq!(att_sum_before, 0.0, "State should start at zero");
+
+        // Run forward
+        let _ = model.forward_with_state(&tokens, &mut state)
+            .expect("forward failed");
+
+        // State should have changed
+        let att_sum_after: f32 = state.att_states.iter()
+            .flat_map(|v| v.iter())
+            .map(|x| x.abs())
+            .sum();
+        assert!(att_sum_after > 0.0, "State should be non-zero after forward pass");
+
+        let shift_sum_after: f32 = state.att_shift_states.iter()
+            .flat_map(|v| v.iter())
+            .map(|x| x.abs())
+            .sum();
+        assert!(shift_sum_after > 0.0, "Shift state should be non-zero after forward pass");
+
+        let ffn_sum_after: f32 = state.ffn_states.iter()
+            .flat_map(|v| v.iter())
+            .map(|x| x.abs())
+            .sum();
+        assert!(ffn_sum_after > 0.0, "FFN state should be non-zero after forward pass");
+
+        println!("State evolution test PASSED");
+        println!("  att_states sum: {}", att_sum_after);
+        println!("  att_shift_states sum: {}", shift_sum_after);
+        println!("  ffn_states sum: {}", ffn_sum_after);
+    }
+
+    /// Test that HipState clone creates independent copy.
+    #[test]
+    fn test_hip_state_clone() {
+        let info = Rwkv7ModelInfo {
+            n_layer: 2,
+            n_embd: 64,
+            n_head: 2,
+            head_size: 32,
+            n_vocab: 100,
+            n_hidden: 128,
+        };
+
+        let mut state1 = HipState::new(&info);
+        state1.att_states[0][0] = 1.5;
+        state1.att_shift_states[0][0] = 2.5;
+        state1.ffn_states[0][0] = 3.5;
+
+        // Clone
+        let state2 = state1.clone();
+
+        // Modify original
+        state1.att_states[0][0] = 100.0;
+        state1.att_shift_states[0][0] = 200.0;
+        state1.ffn_states[0][0] = 300.0;
+
+        // Clone should be unchanged
+        assert_eq!(state2.att_states[0][0], 1.5, "Clone att_states should be independent");
+        assert_eq!(state2.att_shift_states[0][0], 2.5, "Clone att_shift_states should be independent");
+        assert_eq!(state2.ffn_states[0][0], 3.5, "Clone ffn_states should be independent");
+
+        println!("HipState clone test passed");
     }
 }
