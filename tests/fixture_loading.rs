@@ -1258,20 +1258,20 @@ fn test_time_mix_wkv_fixture() {
     println!("  w_decay shape: {:?}", w_decay_shape);
     println!("  state_in shape: {:?}", state_shape);
 
-    // Reshape intermediates from [C, T, B, 1] to [N, T, H, B] for WKV7 kernel
-    // C = H * N, so [C, T, B, 1] -> [N*H, T, B, 1] -> [N, T, H, B]
-    fn reshape_c_to_nhb(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+    // Reshape intermediates from [C, T, B, 1] to [N, H, T, B] for WKV7 kernel
+    // C = H * N, so [C, T, B, 1] -> [N*H, T, B, 1] -> [N, H, T, B]
+    fn reshape_c_to_nhtb(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
         // Input layout: [C, T, B, 1] where C = H*N, element at (c, t, batch, 0) is at c + t*C + batch*C*T
-        // Output layout: [N, T, H, B] where element at (n, t, h, b) is at n + t*N + h*N*T + b*N*T*H
+        // Output layout: [N, H, T, B] where element at (n, h, t, b) is at n + h*N + t*N*H + b*N*H*T
         // Original C index: c = h * N + n (where h and n are head and within-head indices)
-        let mut result = vec![0.0f32; n * t * h * b];
+        let mut result = vec![0.0f32; n * h * t * b];
         for batch in 0..b {
             for time in 0..t {
                 for head in 0..h {
                     for ni in 0..n {
                         let c_idx = head * n + ni;  // c = h * N + n
                         let src_idx = c_idx + time * c + batch * c * t;
-                        let dst_idx = ni + time * n + head * n * t + batch * n * t * h;
+                        let dst_idx = ni + head * n + time * n * h + batch * n * h * t;
                         result[dst_idx] = data[src_idx];
                     }
                 }
@@ -1281,13 +1281,13 @@ fn test_time_mix_wkv_fixture() {
     }
 
     // Reshape inputs for WKV7 kernel
-    let r_wkv = reshape_c_to_nhb(r, c, t, b, n, h);
-    let k_wkv = reshape_c_to_nhb(k_ctrl, c, t, b, n, h);
-    let v_wkv = reshape_c_to_nhb(v, c, t, b, n, h);
-    let a_wkv = reshape_c_to_nhb(wkv_a, c, t, b, n, h);
-    let b_wkv = reshape_c_to_nhb(wkv_b, c, t, b, n, h);
+    let r_wkv = reshape_c_to_nhtb(r, c, t, b, n, h);
+    let k_wkv = reshape_c_to_nhtb(k_ctrl, c, t, b, n, h);
+    let v_wkv = reshape_c_to_nhtb(v, c, t, b, n, h);
+    let a_wkv = reshape_c_to_nhtb(wkv_a, c, t, b, n, h);
+    let b_wkv = reshape_c_to_nhtb(wkv_b, c, t, b, n, h);
 
-    // w_decay is already in [N, T, H, B] format from the fixture
+    // w_decay is already in [N, H, T, B] format from the fixture
 
     // Run WKV7 kernel
     // hip_wkv7 args: w_decay, q, k, v, a, b, state_in, n, h, t, batch
@@ -1299,7 +1299,7 @@ fn test_time_mix_wkv_fixture() {
     println!("  WKV7 output: {} elements", output.len());
     println!("  WKV7 state: {} elements", new_state.len());
 
-    // Reshape output from [N, T, H, B] back to [C, T, B, 1] for comparison
+    // Reshape output from [N, H, T, B] back to [C, T, B, 1] for comparison
     fn reshape_nhtb_to_c(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
         let mut result = vec![0.0f32; c * t * b];
         for batch in 0..b {
@@ -1307,7 +1307,7 @@ fn test_time_mix_wkv_fixture() {
                 for head in 0..h {
                     for ni in 0..n {
                         let c_idx = head * n + ni;
-                        let src_idx = ni + time * n + head * n * t + batch * n * t * h;
+                        let src_idx = ni + head * n + time * n * h + batch * n * h * t;
                         let dst_idx = c_idx + time * c + batch * c * t;
                         result[dst_idx] = data[src_idx];
                     }
@@ -1320,16 +1320,18 @@ fn test_time_mix_wkv_fixture() {
     let output_flat = reshape_nhtb_to_c(&output, c, t, b, n, h);
 
     // Validate WKV output
-    // Allow slightly higher tolerance for numerical differences between Python ref and HIP kernel
-    assert_tensors_close(&output_flat, expected_output, 1e-2, 0.1)
+    // Spec: rtol=1e-2, atol=1e-3 for MatMul outputs
+    // Tightened from (1e-2, 0.1) after TF32 and reshape fixes
+    assert_tensors_close(&output_flat, expected_output, 1e-2, 5e-3)
         .expect("WKV7 output doesn't match fixture");
 
     println!("  WKV7 output validated");
 
     // Validate state update
-    // State has larger differences in some elements, likely due to accumulation errors
-    // Allow higher tolerance for now - 0.03% elements differ but max diff is ~0.35
-    assert_tensors_close(&new_state, expected_state, 0.1, 0.5)
+    // Spec: FP32 state rtol=1e-5, atol=1e-6
+    // Current gap still significant due to accumulated errors in 16-step WKV
+    // Tightened from (0.1, 0.5) after fixes
+    assert_tensors_close(&new_state, expected_state, 1e-2, 0.02)
         .expect("WKV7 state doesn't match fixture");
 
     println!("  WKV7 state validated");
@@ -1631,7 +1633,9 @@ fn test_full_block_fixture() {
     let wkv_out_flat = reshape_nhtb_to_c(&wkv_output, c, t, b, n, h);
 
     println!("  Step 9 (WKV7): {} elements", wkv_out_flat.len());
-    assert_tensors_close(&wkv_out_flat, expected_wkv_out, 0.05, 0.5)
+    // Spec: rtol=1e-2, atol=1e-3. Current: max_diff=0.004, mean_err=0.00006
+    // Gap: 4x atol due to WKV kernel precision (see bd-2sh.5.8 comments)
+    assert_tensors_close(&wkv_out_flat, expected_wkv_out, 1e-2, 5e-3)
         .expect("WKV output doesn't match");
     println!("  Validated WKV output");
 
@@ -1643,7 +1647,9 @@ fn test_full_block_fixture() {
     let wkv_bonus_flat = reshape_nhtb_to_c(&wkv_bonus, c, t, b, n, h);
 
     println!("  Step 10 (WKV bonus): {} elements", wkv_bonus_flat.len());
-    assert_tensors_close(&wkv_bonus_flat, expected_wkv_bonus_out, 0.05, 0.2)
+    // Spec: rtol=1e-2, atol=1e-3. Current: max_diff=0.009, mean_err=0.00014
+    // Gap: 9x atol due to reduction summation precision
+    assert_tensors_close(&wkv_bonus_flat, expected_wkv_bonus_out, 1e-2, 1e-2)
         .expect("WKV bonus doesn't match");
     println!("  Validated WKV bonus");
 
@@ -1681,7 +1687,9 @@ fn test_full_block_fixture() {
     println!("  Step 13 (residual): {} elements", x_after_att.len());
 
     // Validate after time-mix
-    assert_tensors_close(&x_after_att, expected_after_time_mix, 0.05, 0.2)
+    // Spec: rtol=1e-2, atol=1e-3. Current: max_diff=0.027, mean_err=0.0003
+    // Gap: 27x atol due to accumulated errors through WKV + group norm + projection
+    assert_tensors_close(&x_after_att, expected_after_time_mix, 1e-2, 0.03)
         .expect("After time-mix output doesn't match");
     println!("  Time-mix validated!");
 
@@ -1721,20 +1729,27 @@ fn test_full_block_fixture() {
     println!("  Step 16 (final residual): {} elements", x_final.len());
 
     // ==== Validate Final Output ====
-    // Full block has accumulated errors, so allow higher tolerance
-    assert_tensors_close(&x_final, expected_output, 0.1, 0.5)
+    // Spec: rtol=1e-2, atol=1e-3. Current: max_diff=0.036, mean_err=0.0005
+    // Gap: 36x atol due to full pipeline accumulated errors
+    assert_tensors_close(&x_final, expected_output, 1e-2, 0.04)
         .expect("Full block output doesn't match fixture");
 
     println!("  Final output validated!");
 
     // ==== Validate State Updates ====
-    assert_tensors_close(&wkv_state_out, expected_att_state, 0.1, 0.5)
+    // Spec: FP32 state should have rtol=1e-5, atol=1e-6
+    // Current: max_diff=0.014, mean_err=0.000014. Gap: 14000x atol!
+    // This is the biggest gap - accumulated state needs kernel precision improvements
+    assert_tensors_close(&wkv_state_out, expected_att_state, 1e-2, 0.02)
         .expect("Attention state doesn't match fixture");
 
     assert_tensors_close(&new_att_token_shift_state, expected_att_token_shift_state, 1e-3, 1e-3)
         .expect("Attention token shift state doesn't match fixture");
 
-    assert_tensors_close(&new_ffn_state, expected_ffn_state, 1e-2, 0.1)
+    // FFN state spec: FP32 rtol=1e-5, atol=1e-6
+    // Current: max_diff=0.074, mean_err=0.0009. Gap: 74000x atol!
+    // Large gap due to accumulated precision loss through channel-mix pipeline
+    assert_tensors_close(&new_ffn_state, expected_ffn_state, 1e-2, 0.08)
         .expect("FFN state doesn't match fixture");
 
     println!("  All states validated!");

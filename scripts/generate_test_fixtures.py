@@ -23,6 +23,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# Disable TF32 for reproducible FP32 precision in fixture generation.
+# TF32 uses only 10-bit mantissa vs FP32's 23-bit, causing 0.001-0.004 precision loss.
+# This ensures fixtures match the numerical precision of HIP kernels.
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+
 
 # Default model config for 0.1B
 DEFAULT_CONFIG = {
@@ -810,7 +816,7 @@ def generate_layer_fixtures(output_dir: Path, config: dict, model_path: Optional
                  k=(k, (C, T, B, 1)),
                  v=(v, (C, T, B, 1)),
                  w=(w, (C, T, B, 1)),
-                 w_decay=(w_decay, (N, T, H, B)),  # Decay form for WKV kernel
+                 w_decay=(w_decay, (N, H, T, B)),  # Decay form for WKV kernel (matches WKV7 shape)
                  a=(a, (C, T, B, 1)),
                  g=(g, (C, T, B, 1)),
                  v_first=(v_first, (C, T, B, 1)),
