@@ -1272,6 +1272,233 @@ def generate_model_fixtures(output_dir: Path, config: dict, model_path: Optional
                  **{k: v[0].cpu().numpy().astype(np.float32) for k, v in spot_checks.items()},
                  **{f"{k}_shape": np.array(v[1], dtype=np.int64) for k, v in spot_checks.items()})
 
+    # ========== Full Forward Pass Fixture ==========
+    print("  Generating full forward pass fixture...")
+
+    n_layer = config['n_layer']
+    n_embd = config['n_embd']
+    n_head = config['n_head']
+    head_size = config['head_size']
+    vocab_size = config['vocab_size']
+
+    # Input tokens - use simple token sequence
+    set_seed(200)
+    input_tokens = torch.randint(0, vocab_size, (4,), dtype=torch.long)  # 4 tokens
+    B, T = 1, len(input_tokens)
+
+    # Load all weights
+    with safe_open(model_path, framework="pt") as f:
+        tensors = {key: f.get_tensor(key) for key in f.keys()}
+
+    # Get embedding and head weights
+    emb_weight = tensors["emb.weight"]  # [vocab_size, n_embd]
+    head_weight = tensors["head.weight"]  # [vocab_size, n_embd]
+    ln_out_w = tensors["ln_out.weight"]
+    ln_out_b = tensors["ln_out.bias"]
+
+    # Embedding lookup
+    x = emb_weight[input_tokens]  # [T, n_embd]
+    x = x.unsqueeze(0).to(torch.float16)  # [B=1, T, n_embd]
+
+    # Initialize states for all layers
+    att_states = [torch.zeros(B, n_head, head_size, head_size, dtype=torch.float32) for _ in range(n_layer)]
+    att_shift_states = [torch.zeros(B, n_embd, dtype=torch.float16) for _ in range(n_layer)]
+    ffn_states = [torch.zeros(B, n_embd, dtype=torch.float16) for _ in range(n_layer)]
+    v_first = None  # For value residual across layers
+
+    # Process each layer
+    for layer_idx in range(n_layer):
+        prefix = f"blocks.{layer_idx}."
+        att_prefix = prefix + "att."
+        ffn_prefix = prefix + "ffn."
+
+        # Get layer weights
+        ln1_w = tensors[prefix + "ln1.weight"]
+        ln1_b = tensors[prefix + "ln1.bias"]
+        ln2_w = tensors[prefix + "ln2.weight"]
+        ln2_b = tensors[prefix + "ln2.bias"]
+
+        # Attention weights
+        x_r = tensors[att_prefix + "x_r"].squeeze()
+        x_w = tensors[att_prefix + "x_w"].squeeze()
+        x_k = tensors[att_prefix + "x_k"].squeeze()
+        x_v = tensors[att_prefix + "x_v"].squeeze()
+        x_a = tensors[att_prefix + "x_a"].squeeze()
+        x_g = tensors[att_prefix + "x_g"].squeeze()
+
+        w0 = tensors[att_prefix + "w0"].squeeze()
+        w1 = tensors[att_prefix + "w1"]
+        w2 = tensors[att_prefix + "w2"]
+
+        a0 = tensors[att_prefix + "a0"].squeeze()
+        a1 = tensors[att_prefix + "a1"]
+        a2 = tensors[att_prefix + "a2"]
+
+        g1 = tensors[att_prefix + "g1"]
+        g2 = tensors[att_prefix + "g2"]
+
+        k_k = tensors[att_prefix + "k_k"].squeeze()
+        k_a = tensors[att_prefix + "k_a"].squeeze()
+        r_k = tensors[att_prefix + "r_k"]
+
+        r_weight = tensors[att_prefix + "receptance.weight"]
+        k_weight = tensors[att_prefix + "key.weight"]
+        v_weight = tensors[att_prefix + "value.weight"]
+        o_weight = tensors[att_prefix + "output.weight"]
+
+        ln_x_w = tensors[att_prefix + "ln_x.weight"]
+        ln_x_b = tensors[att_prefix + "ln_x.bias"]
+
+        # Value residual weights (layers > 0)
+        if layer_idx > 0 and f"{att_prefix}v0" in tensors:
+            v0 = tensors[att_prefix + "v0"].squeeze()
+            v1 = tensors[att_prefix + "v1"]
+            v2 = tensors[att_prefix + "v2"]
+            has_v_residual = True
+        else:
+            has_v_residual = False
+
+        # FFN weights
+        ffn_x_k = tensors[ffn_prefix + "x_k"].squeeze()
+        ffn_key_w = tensors[ffn_prefix + "key.weight"]
+        ffn_val_w = tensors[ffn_prefix + "value.weight"]
+
+        # Apply ln0 for layer 0 only
+        if layer_idx == 0 and "blocks.0.ln0.weight" in tensors:
+            ln0_w = tensors["blocks.0.ln0.weight"]
+            ln0_b = tensors["blocks.0.ln0.bias"]
+            x = F.layer_norm(x.float(), (n_embd,), ln0_w.float(), ln0_b.float(), eps=1e-5).to(torch.float16)
+
+        # ==== Time-Mix (Attention) ====
+        x_ln1 = F.layer_norm(x.float(), (n_embd,), ln1_w.float(), ln1_b.float(), eps=1e-5).to(torch.float16)
+
+        # Token shift
+        xx = torch.cat([att_shift_states[layer_idx].unsqueeze(1), x_ln1[:, :-1, :]], dim=1)
+        att_shift_states[layer_idx] = x_ln1[:, -1, :]
+
+        # Time-shifted inputs
+        xr = torch.lerp(x_ln1.float(), xx.float(), x_r.float()).to(torch.float16)
+        xw = torch.lerp(x_ln1.float(), xx.float(), x_w.float()).to(torch.float16)
+        xk = torch.lerp(x_ln1.float(), xx.float(), x_k.float()).to(torch.float16)
+        xv = torch.lerp(x_ln1.float(), xx.float(), x_v.float()).to(torch.float16)
+        xa = torch.lerp(x_ln1.float(), xx.float(), x_a.float()).to(torch.float16)
+        xg = torch.lerp(x_ln1.float(), xx.float(), x_g.float()).to(torch.float16)
+
+        # Linear projections
+        r = F.linear(xr.float(), r_weight.float()).to(torch.float16)
+        k = F.linear(xk.float(), k_weight.float()).to(torch.float16)
+        v = F.linear(xv.float(), v_weight.float()).to(torch.float16)
+
+        # w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
+        w_lora = torch.tanh(xw.float() @ w1.float().t()) @ w2.float().t()
+        w = (-F.softplus(-(w0.float() + w_lora)) - 0.5).to(torch.float16)
+
+        # a = sigmoid(a0 + (xa @ a1) @ a2)
+        a_lora = (xa.float() @ a1.float().t()) @ a2.float().t()
+        a = torch.sigmoid(a0.float() + a_lora).to(torch.float16)
+
+        # g = sigmoid(xg @ g1) @ g2
+        g = (torch.sigmoid(xg.float() @ g1.float().t()) @ g2.float().t()).to(torch.float16)
+
+        # Value residual (layers > 0)
+        if has_v_residual and v_first is not None:
+            v_lora = (v.float() @ v1.float().t()) @ v2.float().t()
+            v_residual = torch.sigmoid(v0.float() + v_lora)
+            v = (v.float() + (v_first.float() - v.float()) * v_residual).to(torch.float16)
+        elif layer_idx == 0:
+            v_first = v.clone()
+
+        # L2 normalize k
+        kk = F.normalize((k.float() * k_k.float()).view(B, T, n_head, -1), dim=-1, p=2.0)
+        kk = kk.view(B, T, n_embd).to(torch.float16)
+
+        # Control K: k = k * (1 + (a - 1) * k_a)
+        k_ctrl = (k.float() * (1.0 + (a.float() - 1.0) * k_a.float())).to(torch.float16)
+
+        # WKV inputs
+        wkv_a = -kk
+        wkv_b = kk * a
+        w_decay = torch.exp(w.float())
+
+        # Reshape for WKV7: [B, T, C] -> [B, T, H, N]
+        r_wkv = r.float().view(B, T, n_head, head_size)
+        k_wkv = k_ctrl.float().view(B, T, n_head, head_size)
+        v_wkv = v.float().view(B, T, n_head, head_size)
+        w_wkv = w_decay.view(B, T, n_head, head_size)
+        a_wkv = wkv_a.float().view(B, T, n_head, head_size)
+        b_wkv = wkv_b.float().view(B, T, n_head, head_size)
+
+        # Run WKV7 reference
+        wkv_output = torch.empty(B, T, n_head, head_size, dtype=torch.float32)
+        state = att_states[layer_idx].clone()
+
+        for t in range(T):
+            for batch in range(B):
+                for head in range(n_head):
+                    s = state[batch, head]
+                    q_t = r_wkv[batch, t, head]
+                    w_t = w_wkv[batch, t, head]
+                    k_t = k_wkv[batch, t, head]
+                    v_t = v_wkv[batch, t, head]
+                    a_t = a_wkv[batch, t, head]
+                    b_t = b_wkv[batch, t, head]
+
+                    sa = pairwise_sum(s * a_t.unsqueeze(0), dim=1)
+                    s = s * w_t.unsqueeze(0) + sa.unsqueeze(1) * b_t.unsqueeze(0) + v_t.unsqueeze(1) * k_t.unsqueeze(0)
+                    y = pairwise_sum(s * q_t.unsqueeze(0), dim=1)
+                    wkv_output[batch, t, head] = y
+                    state[batch, head] = s
+
+        att_states[layer_idx] = state
+
+        # WKV bonus: u = (r * k * r_k).sum(-1) * v
+        r_k_reshaped = r_k.view(n_head, head_size)
+        bonus_sum = (r_wkv * k_wkv * r_k_reshaped).sum(dim=-1, keepdim=True)
+        wkv_bonus = (bonus_sum * v_wkv).view(B, T, n_embd)
+
+        # Combine WKV output and bonus
+        x_att = wkv_output.view(B, T, n_embd) + wkv_bonus
+
+        # Group norm (per-head normalization)
+        x_att_gn = F.group_norm(x_att.view(B * T, n_embd).float(), n_head, ln_x_w.float(), ln_x_b.float(), eps=64e-5)
+        x_att_gn = x_att_gn.view(B, T, n_embd).to(torch.float16)
+
+        # Gate and output projection
+        x_att_gated = (x_att_gn.float() * g.float()).to(torch.float16)
+        x_att_out = F.linear(x_att_gated.float(), o_weight.float()).to(torch.float16)
+
+        # Residual
+        x = x + x_att_out
+
+        # ==== Channel-Mix (FFN) ====
+        x_ln2 = F.layer_norm(x.float(), (n_embd,), ln2_w.float(), ln2_b.float(), eps=1e-5).to(torch.float16)
+
+        # Token shift
+        xx_ffn = torch.cat([ffn_states[layer_idx].unsqueeze(1), x_ln2[:, :-1, :]], dim=1)
+        ffn_states[layer_idx] = x_ln2[:, -1, :]
+
+        xk_ffn = torch.lerp(x_ln2.float(), xx_ffn.float(), ffn_x_k.float()).to(torch.float16)
+
+        # Key projection + squared ReLU
+        k_ffn = F.linear(xk_ffn.float(), ffn_key_w.float())
+        k_sq = (F.relu(k_ffn) ** 2).to(torch.float16)
+
+        # Value projection
+        x_ffn_out = F.linear(k_sq.float(), ffn_val_w.float()).to(torch.float16)
+
+        # Residual
+        x = x + x_ffn_out
+
+    # ==== Output Head ====
+    x_ln_out = F.layer_norm(x.float(), (n_embd,), ln_out_w.float(), ln_out_b.float(), eps=1e-5)
+    logits = F.linear(x_ln_out, head_weight.float())  # [B, T, vocab_size]
+
+    # Save fixture
+    save_fixture(model_dir / "forward_pass.npz",
+                 input_tokens=(input_tokens, (T, 1, 1, 1)),
+                 expected_logits=(logits.squeeze(0), (vocab_size, T, 1, 1)))
+
+    print(f"    Forward pass fixture: {T} tokens -> [{vocab_size}, {T}] logits")
     print("  Model fixtures generated")
 
 

@@ -109,17 +109,32 @@ When working on tickets, follow this process:
 
 1. **Select a ticket**: Run `br ready` to see unblocked issues sorted by priority
 2. **Review the ticket**: Run `br show <id>` to understand requirements and acceptance criteria
-3. **Claim the ticket**: Run `br update <id> --claim` to mark it in progress
-4. **Implement the changes**: Write code, tests, and documentation as needed
-5. **Commit the changes**: Create a git commit with the ticket ID in the message (e.g., `(bd-2sh.2.1)`)
-6. **Close the ticket**: Run `br close <id> -r "Brief summary of what was done"` or `br close <id> --suggest-next`
+3. **Review plan documents**: If the ticket references a plan (e.g., `docs/RWKV7_HIP_BACKEND_PLAN.md`), read and follow the architectural decisions specified there
+4. **Claim the ticket**: Run `br update <id> --claim` to mark it in progress
+5. **Implement the changes**: Write code, tests, and documentation as needed
+6. **Verify acceptance criteria**: Ensure ALL acceptance criteria in the ticket are met
+7. **Commit the changes**: Create a git commit with the ticket ID in the message (e.g., `(bd-2sh.2.1)`)
+8. **Close the ticket**: Run `br close <id> -r "Brief summary of what was done"` or `br close <id> --suggest-next`
+
+**CRITICAL - Before Closing a Ticket:**
+- [ ] All code changes are **committed** (check `git status` - no uncommitted work)
+- [ ] All acceptance criteria are **verified and met**
+- [ ] Tests pass at the tolerances specified in the ticket/plan
+- [ ] Implementation follows architectural decisions from referenced plan documents
+
+**Do NOT close a ticket if:**
+- There is uncommitted work in the working directory
+- Acceptance criteria checkboxes are not satisfied
+- Tests pass only with loosened tolerances (document the gap instead)
 
 Example workflow:
 ```bash
 br ready                           # Find next ticket
 br show bd-2sh.2.1                 # Review requirements
+# Read any referenced plan docs!
 br update bd-2sh.2.1 --claim       # Claim it
 # ... implement changes ...
+git status                         # Verify no uncommitted changes remain
 git add . && git commit -m "Add feature X (bd-2sh.2.1)"
 br close bd-2sh.2.1 -r "Implemented feature X with tests"
 ```
@@ -199,3 +214,12 @@ br list -a
 # Blocked issues
 br blocked
 ```
+
+## Compact Instructions
+
+When context is compacted, preserve:
+- The `br` issue tracker workflow (ready, show, claim, close)
+- **Ticket closure requirements** (commit before close, verify acceptance criteria)
+- Current branch context and recent commits
+- References to plan documents (e.g., `docs/RWKV7_HIP_BACKEND_PLAN.md`)
+- Architectural decisions (e.g., column-major GEMM, tolerance specifications)

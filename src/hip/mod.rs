@@ -234,6 +234,17 @@ extern "C" {
         beta: f32,
         c: *mut f32     // M×N matrix
     ) -> RocblasStatus;
+    fn launch_sgemm_ta(
+        handle: RocblasHandle,
+        m: c_int,       // rows of output C (output features)
+        n: c_int,       // cols of B and C (tokens)
+        k: c_int,       // input features
+        alpha: f32,
+        a: *const f32,  // stored as K×M (row-major [M, K])
+        b: *const f32,  // K×N matrix
+        beta: f32,
+        c: *mut f32     // M×N matrix
+    ) -> RocblasStatus;
     fn rocblas_to_hip_error(status: RocblasStatus) -> HipError;
 }
 
@@ -2652,12 +2663,15 @@ pub fn sgemm_f32(
     Ok(())
 }
 
-/// High-level SGEMM that manages device memory allocation.
+/// High-level SGEMM that manages device memory allocation (column-major weights).
 ///
 /// Performs: output = weight @ input (FP32 matrix multiply)
 ///
+/// NOTE: This expects weights in column-major format. For row-major weights
+/// (e.g., from SafeTensors), use `hip_sgemm_ta` instead.
+///
 /// # Arguments
-/// * `weight` - Weight matrix [N, K] where N is output features, K is input features (flattened)
+/// * `weight` - Weight matrix [N, K] where N is output features, K is input features (flattened, column-major)
 /// * `input` - Input matrix [K, A] where K is input features, A is tokens (flattened)
 /// * `m` - Number of output features (N)
 /// * `k` - Number of input features (K)
@@ -2665,6 +2679,7 @@ pub fn sgemm_f32(
 ///
 /// # Returns
 /// * Output vector [N, A] (flattened)
+#[allow(dead_code)]
 pub fn hip_sgemm(
     weight: &[f32],
     input: &[f32],
@@ -2716,6 +2731,91 @@ pub fn hip_sgemm(
     rocblas_destroy(handle)?;
 
     // Copy back result
+    d_output.to_vec(&stream)
+}
+
+/// High-level SGEMM with transposed A (for row-major weights - DEPRECATED).
+///
+/// NOTE: This function is deprecated. Use `hip_sgemm` with column-major weights
+/// loaded via `load_weight_matrix_f32` instead. Per docs/RWKV7_HIP_BACKEND_PLAN.md:
+/// "Use rocBLAS-native column-major storage for GEMM/GEMV...
+///  This avoids per-call row/col mapping in rocBLAS"
+///
+/// Performs: output = weight^T @ input (FP32 matrix multiply)
+///
+/// # Arguments
+/// * `weight` - Weight matrix stored as row-major [M, K] (flattened)
+/// * `input` - Input matrix [K, N] where K is input features, N is tokens (flattened)
+/// * `m` - Number of output features
+/// * `k` - Number of input features
+/// * `n` - Number of tokens
+///
+/// # Returns
+/// * Output vector [M, N] (flattened)
+#[deprecated(note = "Use hip_sgemm with column-major weights instead")]
+pub fn hip_sgemm_ta(
+    weight: &[f32],
+    input: &[f32],
+    m: usize,   // output features
+    k: usize,   // input features
+    n: usize,   // tokens
+) -> Result<Vec<f32>> {
+    if weight.len() != m * k {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Weight size mismatch: expected {}×{}={}, got {}",
+                m, k, m * k, weight.len()
+            ),
+        });
+    }
+    if input.len() != k * n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}×{}={}, got {}",
+                k, n, k * n, input.len()
+            ),
+        });
+    }
+
+    let stream = Stream::new()?;
+
+    // For transposed A:
+    // weight is stored as row-major [M, K] = column-major [K, M]
+    // We tell rocBLAS to use shape [K, M] and transpose to get [M, K]
+    let weight_shape = TensorShape::new(k, m, 1, 1);  // stored shape
+    let input_shape = TensorShape::new(k, n, 1, 1);
+    let output_shape = TensorShape::new(m, n, 1, 1);
+
+    let d_weight = TensorHip::from_slice(weight, weight_shape, &stream)?;
+    let d_input = TensorHip::from_slice(input, input_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(output_shape)?;
+
+    let handle = rocblas_create()?;
+    rocblas_set_stream(handle, &stream)?;
+
+    let status = unsafe {
+        launch_sgemm_ta(
+            handle,
+            m as c_int, n as c_int, k as c_int,
+            1.0,  // alpha
+            d_weight.as_ptr(),
+            d_input.as_ptr(),
+            0.0,  // beta
+            d_output.as_mut_ptr(),
+        )
+    };
+
+    rocblas_destroy(handle)?;
+
+    if status != ROCBLAS_STATUS_SUCCESS {
+        return Err(HipErrorKind {
+            code: unsafe { rocblas_to_hip_error(status) },
+            message: format!("rocBLAS SGEMM_TA failed: status {}", status),
+        });
+    }
+
     d_output.to_vec(&stream)
 }
 
@@ -2939,6 +3039,27 @@ impl From<std::io::Error> for ModelLoadError {
     }
 }
 
+/// Transpose a 2D matrix from row-major to column-major layout.
+///
+/// Row-major [M, K]: element (i, j) at index i * K + j
+/// Column-major [M, K]: element (i, j) at index j * M + i
+///
+/// This is used at load time to convert SafeTensors (row-major) weights
+/// to rocBLAS-native column-major format, per the plan:
+/// "Use rocBLAS-native column-major storage for GEMM/GEMV...
+///  This avoids per-call row/col mapping in rocBLAS"
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut transposed = vec![0.0f32; data.len()];
+    for i in 0..rows {
+        for j in 0..cols {
+            // row-major index: i * cols + j
+            // column-major index: j * rows + i
+            transposed[j * rows + i] = data[i * cols + j];
+        }
+    }
+    transposed
+}
+
 /// Load a tensor from SafeTensors, converting f16 to f32 and loading into managed HIP memory.
 fn load_tensor_f32(
     st: &safetensors::SafeTensors,
@@ -2982,6 +3103,67 @@ fn load_tensor_f32(
     };
 
     TensorHip::from_slice_managed(&f32_data, hip_shape, stream).map_err(ModelLoadError::from)
+}
+
+/// Load a weight matrix from SafeTensors, transposing to column-major for rocBLAS.
+///
+/// SafeTensors stores weights as row-major [out_features, in_features].
+/// rocBLAS requires column-major storage for efficient GEMM.
+/// This function transposes at load time to avoid per-inference transpose.
+///
+/// Per docs/RWKV7_HIP_BACKEND_PLAN.md:
+/// "Use rocBLAS-native column-major storage for GEMM/GEMV...
+///  This avoids per-call row/col mapping in rocBLAS"
+///
+/// Shape is stored as [M, K] where M=out_features, K=in_features.
+/// Use dim(0) to get M (out_features) and dim(1) to get K (in_features).
+fn load_weight_matrix_f32(
+    st: &safetensors::SafeTensors,
+    name: &str,
+    stream: &Stream,
+) -> std::result::Result<TensorHip<f32>, ModelLoadError> {
+    let tensor = st.tensor(name).map_err(|e| ModelLoadError::SafeTensor(format!("{}: {}", name, e)))?;
+
+    let shape_st = tensor.shape();
+    let dtype = tensor.dtype();
+    let data = tensor.data();
+
+    if shape_st.len() != 2 {
+        return Err(ModelLoadError::InvalidModel(format!(
+            "Weight matrix {} must be 2D, got {:?}", name, shape_st
+        )));
+    }
+
+    let rows = shape_st[0];  // out_features (M)
+    let cols = shape_st[1];  // in_features (K)
+
+    // Convert f16 bytes to f32 vec
+    let f32_data: Vec<f32> = match dtype {
+        safetensors::Dtype::F16 => {
+            let f16_slice: &[f16] = bytemuck::cast_slice(data);
+            f16_slice.iter().map(|x| x.to_f32()).collect()
+        }
+        safetensors::Dtype::F32 => {
+            bytemuck::cast_slice(data).to_vec()
+        }
+        safetensors::Dtype::BF16 => {
+            let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
+            bf16_slice.iter().map(|x| x.to_f32()).collect()
+        }
+        _ => return Err(ModelLoadError::InvalidModel(format!(
+            "Unsupported dtype {:?} for tensor {}", dtype, name
+        ))),
+    };
+
+    // Transpose from row-major to column-major
+    let transposed = transpose_2d(&f32_data, rows, cols);
+
+    // Shape is [M, K] where M=rows (out_features), K=cols (in_features)
+    // This is the natural column-major representation for rocBLAS
+    // Note: This differs from load_tensor_f32 which reverses dimensions
+    let hip_shape = TensorShape::new(rows, cols, 1, 1);
+
+    TensorHip::from_slice_managed(&transposed, hip_shape, stream).map_err(ModelLoadError::from)
 }
 
 /// Load layer normalization weights.
@@ -3061,16 +3243,16 @@ impl Rwkv7Hip {
         log::info!("Loading RWKV7 model: {} layers, {} embd, {} heads, {} vocab",
             n_layer, n_embd, n_head, n_vocab);
 
-        // Load embedding
+        // Load embedding (no transpose - it's a lookup table, not GEMM)
         let embed = EmbedHip {
             ln: load_layer_norm(&st, "blocks.0.ln0", &stream)?,
             w: load_tensor_f32(&st, "emb.weight", &stream)?,
         };
 
-        // Load output head
+        // Load output head (transpose to column-major for GEMM)
         let head = HeadHip {
             ln: load_layer_norm(&st, "ln_out", &stream)?,
-            w: load_tensor_f32(&st, "head.weight", &stream)?,
+            w: load_weight_matrix_f32(&st, "head.weight", &stream)?,
         };
 
         // Load layers
@@ -3094,15 +3276,15 @@ impl Rwkv7Hip {
                 x_g: load_tensor_f32(&st, &format!("{}.att.x_g", prefix), &stream)?,
 
                 w0: load_tensor_f32(&st, &format!("{}.att.w0", prefix), &stream)?,
-                w1: load_tensor_f32(&st, &format!("{}.att.w1", prefix), &stream)?,
-                w2: load_tensor_f32(&st, &format!("{}.att.w2", prefix), &stream)?,
+                w1: load_weight_matrix_f32(&st, &format!("{}.att.w1", prefix), &stream)?,
+                w2: load_weight_matrix_f32(&st, &format!("{}.att.w2", prefix), &stream)?,
 
                 a0: load_tensor_f32(&st, &format!("{}.att.a0", prefix), &stream)?,
-                a1: load_tensor_f32(&st, &format!("{}.att.a1", prefix), &stream)?,
-                a2: load_tensor_f32(&st, &format!("{}.att.a2", prefix), &stream)?,
+                a1: load_weight_matrix_f32(&st, &format!("{}.att.a1", prefix), &stream)?,
+                a2: load_weight_matrix_f32(&st, &format!("{}.att.a2", prefix), &stream)?,
 
-                g1: load_tensor_f32(&st, &format!("{}.att.g1", prefix), &stream)?,
-                g2: load_tensor_f32(&st, &format!("{}.att.g2", prefix), &stream)?,
+                g1: load_weight_matrix_f32(&st, &format!("{}.att.g1", prefix), &stream)?,
+                g2: load_weight_matrix_f32(&st, &format!("{}.att.g2", prefix), &stream)?,
 
                 // Value residual LoRA (only for layers > 0)
                 v0: if layer_idx > 0 {
@@ -3111,12 +3293,12 @@ impl Rwkv7Hip {
                     None
                 },
                 v1: if layer_idx > 0 {
-                    Some(load_tensor_f32(&st, &format!("{}.att.v1", prefix), &stream)?)
+                    Some(load_weight_matrix_f32(&st, &format!("{}.att.v1", prefix), &stream)?)
                 } else {
                     None
                 },
                 v2: if layer_idx > 0 {
-                    Some(load_tensor_f32(&st, &format!("{}.att.v2", prefix), &stream)?)
+                    Some(load_weight_matrix_f32(&st, &format!("{}.att.v2", prefix), &stream)?)
                 } else {
                     None
                 },
@@ -3125,19 +3307,19 @@ impl Rwkv7Hip {
                 k_k: load_tensor_f32(&st, &format!("{}.att.k_k", prefix), &stream)?,
                 k_a: load_tensor_f32(&st, &format!("{}.att.k_a", prefix), &stream)?,
 
-                w_r: load_tensor_f32(&st, &format!("{}.att.receptance.weight", prefix), &stream)?,
-                w_k: load_tensor_f32(&st, &format!("{}.att.key.weight", prefix), &stream)?,
-                w_v: load_tensor_f32(&st, &format!("{}.att.value.weight", prefix), &stream)?,
-                w_o: load_tensor_f32(&st, &format!("{}.att.output.weight", prefix), &stream)?,
+                w_r: load_weight_matrix_f32(&st, &format!("{}.att.receptance.weight", prefix), &stream)?,
+                w_k: load_weight_matrix_f32(&st, &format!("{}.att.key.weight", prefix), &stream)?,
+                w_v: load_weight_matrix_f32(&st, &format!("{}.att.value.weight", prefix), &stream)?,
+                w_o: load_weight_matrix_f32(&st, &format!("{}.att.output.weight", prefix), &stream)?,
 
                 gn: load_layer_norm(&st, &format!("{}.att.ln_x", prefix), &stream)?,
             };
 
-            // FFN weights
+            // FFN weights (transpose weight matrices to column-major for GEMM)
             let ffn = FfnHip {
                 x_k: load_tensor_f32(&st, &format!("{}.ffn.x_k", prefix), &stream)?,
-                w_k: load_tensor_f32(&st, &format!("{}.ffn.key.weight", prefix), &stream)?,
-                w_v: load_tensor_f32(&st, &format!("{}.ffn.value.weight", prefix), &stream)?,
+                w_k: load_weight_matrix_f32(&st, &format!("{}.ffn.key.weight", prefix), &stream)?,
+                w_v: load_weight_matrix_f32(&st, &format!("{}.ffn.value.weight", prefix), &stream)?,
             };
 
             layers.push(LayerHip { att_ln, ffn_ln, att, ffn });
@@ -3225,6 +3407,235 @@ impl Rwkv7Hip {
         let all_data = tensor.to_vec(&stream)?;
         let n = n.min(all_data.len());
         Ok(all_data[..n].to_vec())
+    }
+
+    /// Run a full forward pass on input tokens.
+    ///
+    /// This processes tokens through all layers (embedding, attention, FFN, head)
+    /// and returns logits for the next token prediction.
+    ///
+    /// # Arguments
+    /// * `tokens` - Input token IDs
+    ///
+    /// # Returns
+    /// Logits tensor of shape [vocab_size, T] for each input token.
+    pub fn forward(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let stream = Stream::null();
+        let n_embd = self.info.n_embd;
+        let n_head = self.info.n_head;
+        let head_size = self.info.head_size;
+        let n_vocab = self.info.n_vocab;
+        let n_layer = self.info.n_layer;
+        let n_hidden = self.info.n_hidden;
+        let t = tokens.len();
+        let b = 1; // batch size = 1 for now
+
+        // Embedding lookup: tokens -> [n_embd, T] (output is row-major [T, n_embd])
+        // embed.w is row-major [n_vocab, n_embd], so embed[token, e] = emb_data[token * n_embd + e]
+        let emb_data = self.embed.w.to_vec(&stream)?;
+        let mut x = vec![0.0f32; n_embd * t];
+        for (ti, &token) in tokens.iter().enumerate() {
+            let token = token as usize;
+            for e in 0..n_embd {
+                x[e + ti * n_embd] = emb_data[token * n_embd + e];
+            }
+        }
+
+        // Initialize states (zeros for fresh inference)
+        let mut att_states: Vec<Vec<f32>> = (0..n_layer)
+            .map(|_| vec![0.0f32; head_size * head_size * n_head])
+            .collect();
+        let mut att_shift_states: Vec<Vec<f32>> = (0..n_layer)
+            .map(|_| vec![0.0f32; n_embd])
+            .collect();
+        let mut ffn_states: Vec<Vec<f32>> = (0..n_layer)
+            .map(|_| vec![0.0f32; n_embd])
+            .collect();
+        let mut v_first: Option<Vec<f32>> = None;
+
+        // Process each layer
+        for layer_idx in 0..n_layer {
+            let layer = &self.layers[layer_idx];
+
+            // Apply ln0 for layer 0
+            if layer_idx == 0 {
+                let ln0_w = self.embed.ln.weight.to_vec(&stream)?;
+                let ln0_b = self.embed.ln.bias.to_vec(&stream)?;
+                x = hip_layer_norm(&x, &ln0_w, &ln0_b, n_embd, t * b, 1e-5)?;
+            }
+
+            // ==== Time-Mix (Attention) ====
+            let ln1_w = layer.att_ln.weight.to_vec(&stream)?;
+            let ln1_b = layer.att_ln.bias.to_vec(&stream)?;
+            let x_ln1 = hip_layer_norm(&x, &ln1_w, &ln1_b, n_embd, t * b, 1e-5)?;
+
+            // Token shift for attention - all shifts use the same old state
+            let att_shift_state = &att_shift_states[layer_idx];
+            let x_r = layer.att.x_r.to_vec(&stream)?;
+            let x_w = layer.att.x_w.to_vec(&stream)?;
+            let x_k = layer.att.x_k.to_vec(&stream)?;
+            let x_v = layer.att.x_v.to_vec(&stream)?;
+            let x_a = layer.att.x_a.to_vec(&stream)?;
+            let x_g = layer.att.x_g.to_vec(&stream)?;
+
+            let (xr, new_att_shift) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_r, n_embd, t, b)?;
+            let (xw, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_w, n_embd, t, b)?;
+            let (xk, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_k, n_embd, t, b)?;
+            let (xv, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_v, n_embd, t, b)?;
+            let (xa, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_a, n_embd, t, b)?;
+            let (xg, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_g, n_embd, t, b)?;
+
+            // Update shift state after all shifts are computed
+            att_shift_states[layer_idx] = new_att_shift;
+
+            // Linear projections: r, k, v
+            let w_r = layer.att.w_r.to_vec(&stream)?;
+            let w_k = layer.att.w_k.to_vec(&stream)?;
+            let w_v = layer.att.w_v.to_vec(&stream)?;
+            let r = hip_sgemm(&w_r, &xr, n_embd, n_embd, t * b)?;
+            let k = hip_sgemm(&w_k, &xk, n_embd, n_embd, t * b)?;
+            let mut v = hip_sgemm(&w_v, &xv, n_embd, n_embd, t * b)?;
+
+            // w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
+            let w0 = layer.att.w0.to_vec(&stream)?;
+            let w1 = layer.att.w1.to_vec(&stream)?;
+            let w2 = layer.att.w2.to_vec(&stream)?;
+            // Column-major weights: dim(0) is output features (LoRA dim for w1)
+            let w1_dim = layer.att.w1.shape().dim(0);
+            let w_lora1 = hip_sgemm(&w1, &xw, w1_dim, n_embd, t * b)?;
+            let w_lora1_tanh = hip_tanh(&w_lora1)?;
+            let w_lora2 = hip_sgemm(&w2, &w_lora1_tanh, n_embd, w1_dim, t * b)?;
+            let mut w: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
+                .zip(w_lora2.iter())
+                .map(|(&a, &b)| a + b)
+                .collect();
+            w = hip_softplus_decay(&w)?;
+
+            // a = sigmoid(a0 + (xa @ a1) @ a2)
+            let a0 = layer.att.a0.to_vec(&stream)?;
+            let a1 = layer.att.a1.to_vec(&stream)?;
+            let a2 = layer.att.a2.to_vec(&stream)?;
+            let a1_dim = layer.att.a1.shape().dim(0);
+            let a_lora1 = hip_sgemm(&a1, &xa, a1_dim, n_embd, t * b)?;
+            let a_lora2 = hip_sgemm(&a2, &a_lora1, n_embd, a1_dim, t * b)?;
+            let a_biased: Vec<f32> = a0.iter().cycle().take(a_lora2.len())
+                .zip(a_lora2.iter())
+                .map(|(&a, &b)| a + b)
+                .collect();
+            let a = hip_sigmoid(&a_biased)?;
+
+            // g = sigmoid(xg @ g1) @ g2
+            let g1 = layer.att.g1.to_vec(&stream)?;
+            let g2 = layer.att.g2.to_vec(&stream)?;
+            let g1_dim = layer.att.g1.shape().dim(0);
+            let g_lora1 = hip_sgemm(&g1, &xg, g1_dim, n_embd, t * b)?;
+            let g_lora1_sigmoid = hip_sigmoid(&g_lora1)?;
+            let g = hip_sgemm(&g2, &g_lora1_sigmoid, n_embd, g1_dim, t * b)?;
+
+            // Value residual (layers > 0)
+            if layer_idx > 0 {
+                if let (Some(v0), Some(v1), Some(v2), Some(ref vf)) =
+                    (&layer.att.v0, &layer.att.v1, &layer.att.v2, &v_first) {
+                    let v0_data = v0.to_vec(&stream)?;
+                    let v1_data = v1.to_vec(&stream)?;
+                    let v2_data = v2.to_vec(&stream)?;
+                    let v1_dim = v1.shape().dim(0);
+                    let v_lora1 = hip_sgemm(&v1_data, &v, v1_dim, n_embd, t * b)?;
+                    let v_lora2 = hip_sgemm(&v2_data, &v_lora1, n_embd, v1_dim, t * b)?;
+                    let v_biased: Vec<f32> = v0_data.iter().cycle().take(v_lora2.len())
+                        .zip(v_lora2.iter())
+                        .map(|(&a, &b)| a + b)
+                        .collect();
+                    let v_residual = hip_sigmoid(&v_biased)?;
+                    // v = v + (v_first - v) * v_residual
+                    v = v.iter().zip(vf.iter()).zip(v_residual.iter())
+                        .map(|((&vi, &vfi), &vri)| vi + (vfi - vi) * vri)
+                        .collect();
+                }
+            } else {
+                v_first = Some(v.clone());
+            }
+
+            // L2 normalize k
+            let k_k = layer.att.k_k.to_vec(&stream)?;
+            let k_scaled: Vec<f32> = k.iter().zip(k_k.iter().cycle())
+                .map(|(&ki, &kki)| ki * kki)
+                .collect();
+            let kk = hip_l2_norm(&k_scaled, n_embd, t * b, head_size, 1e-12)?;
+
+            // Control K: k = k * (1 + (a - 1) * k_a)
+            let k_a = layer.att.k_a.to_vec(&stream)?;
+            let k_ctrl = hip_control_k(&k_a, &a, &k, n_embd, t, b)?;
+
+            // WKV inputs
+            let wkv_a: Vec<f32> = kk.iter().map(|&x| -x).collect();
+            let wkv_b: Vec<f32> = kk.iter().zip(a.iter()).map(|(&kki, &ai)| kki * ai).collect();
+            let w_decay: Vec<f32> = w.iter().map(|&wi| wi.exp()).collect();
+
+            // Run WKV7
+            let (wkv_output, new_att_state) = hip_wkv7(
+                &w_decay, &r, &k_ctrl, &v, &wkv_a, &wkv_b,
+                &att_states[layer_idx], head_size, n_head, t, b
+            )?;
+            att_states[layer_idx] = new_att_state;
+
+            // WKV bonus
+            let r_k = layer.att.r_k.to_vec(&stream)?;
+            let wkv_bonus = hip_wkv_bonus(&r, &k_ctrl, &v, &r_k, head_size, n_head, t, b)?;
+
+            // Combine WKV output and bonus
+            let x_att: Vec<f32> = wkv_output.iter().zip(wkv_bonus.iter())
+                .map(|(&a, &b)| a + b)
+                .collect();
+
+            // Group norm
+            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
+            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
+            let x_att_gn = hip_group_norm(&x_att, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
+
+            // Gate and output projection
+            let x_att_gated: Vec<f32> = x_att_gn.iter().zip(g.iter())
+                .map(|(&xi, &gi)| xi * gi)
+                .collect();
+            let w_o = layer.att.w_o.to_vec(&stream)?;
+            let x_att_out = hip_sgemm(&w_o, &x_att_gated, n_embd, n_embd, t * b)?;
+
+            // Residual
+            x = x.iter().zip(x_att_out.iter()).map(|(&a, &b)| a + b).collect();
+
+            // ==== Channel-Mix (FFN) ====
+            let ln2_w = layer.ffn_ln.weight.to_vec(&stream)?;
+            let ln2_b = layer.ffn_ln.bias.to_vec(&stream)?;
+            let x_ln2 = hip_layer_norm(&x, &ln2_w, &ln2_b, n_embd, t * b, 1e-5)?;
+
+            // Token shift for FFN
+            let ffn_x_k = layer.ffn.x_k.to_vec(&stream)?;
+            let (xk_ffn, new_ffn_state) = hip_channel_mix_state(&x_ln2, &ffn_states[layer_idx], &ffn_x_k, n_embd, t, b)?;
+            ffn_states[layer_idx] = new_ffn_state;
+
+            // Key projection + squared ReLU
+            let ffn_w_k = layer.ffn.w_k.to_vec(&stream)?;
+            let k_ffn = hip_sgemm(&ffn_w_k, &xk_ffn, n_hidden, n_embd, t * b)?;
+            let k_sq = hip_squared_relu(&k_ffn)?;
+
+            // Value projection
+            let ffn_w_v = layer.ffn.w_v.to_vec(&stream)?;
+            let x_ffn_out = hip_sgemm(&ffn_w_v, &k_sq, n_embd, n_hidden, t * b)?;
+
+            // Residual
+            x = x.iter().zip(x_ffn_out.iter()).map(|(&a, &b)| a + b).collect();
+        }
+
+        // ==== Output Head ====
+        let ln_out_w = self.head.ln.weight.to_vec(&stream)?;
+        let ln_out_b = self.head.ln.bias.to_vec(&stream)?;
+        let x_ln_out = hip_layer_norm(&x, &ln_out_w, &ln_out_b, n_embd, t * b, 1e-5)?;
+
+        // Head projection
+        let head_w = self.head.w.to_vec(&stream)?;
+        let logits = hip_sgemm(&head_w, &x_ln_out, n_vocab, n_embd, t * b)?;
+
+        Ok(logits)
     }
 }
 

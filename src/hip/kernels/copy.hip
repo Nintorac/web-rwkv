@@ -1265,6 +1265,33 @@ rocblas_status launch_sgemm(
     );
 }
 
+// SGEMM with transposed A: C = alpha * A^T * B + beta * C
+// A is stored as K×M (row-major [M, K]), B is K×N, C is M×N
+// This is used when loading row-major weights from SafeTensors
+rocblas_status launch_sgemm_ta(
+    rocblas_handle handle,
+    int M,              // rows of output C (output features)
+    int N,              // cols of B and C (tokens)
+    int K,              // input features
+    float alpha,
+    const float* A,     // stored as K×M (row-major [M, K])
+    const float* B,     // K×N matrix
+    float beta,
+    float* C            // M×N matrix
+) {
+    return rocblas_sgemm(
+        handle,
+        rocblas_operation_transpose,  // opA: transpose A
+        rocblas_operation_none,       // opB
+        M, N, K,
+        &alpha,
+        A, K,       // lda = K (leading dim of stored K×M matrix)
+        B, K,       // ldb = K
+        &beta,
+        C, M        // ldc = M
+    );
+}
+
 // HGEMM: same as SGEMM but with FP16
 rocblas_status launch_hgemm(
     rocblas_handle handle,

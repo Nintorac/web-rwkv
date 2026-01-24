@@ -1862,25 +1862,31 @@ fn test_rwkv7_hip_model_dimensions() {
     let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
 
-    // Check embedding weight shape: [n_embd, n_vocab, 1, 1] in web-rwkv convention
+    // Check embedding weight shape: [n_embd, n_vocab, 1, 1] (load_tensor_f32 reverses dims)
+    // Original SafeTensors: [n_vocab, n_embd], after reverse: [n_embd, n_vocab]
     let emb_shape = model.embed.w.shape();
-    assert_eq!(emb_shape.dim(0), 768, "Embedding fast axis should be n_embd=768");
+    assert_eq!(emb_shape.dim(0), 768, "Embedding dim 0 should be n_embd=768");
 
-    // Check head weight shape: [n_embd, n_vocab, 1, 1]
+    // Check head weight shape: [n_vocab, n_embd, 1, 1] (load_weight_matrix_f32 stores as [M, K])
+    // Original SafeTensors: [n_vocab, n_embd] = [65536, 768]
     let head_shape = model.head.w.shape();
-    assert_eq!(head_shape.dim(0), 768, "Head fast axis should be n_embd=768");
+    assert_eq!(head_shape.dim(0), 65536, "Head dim 0 should be n_vocab=65536");
+    assert_eq!(head_shape.dim(1), 768, "Head dim 1 should be n_embd=768");
 
     // Check layer 0 attention receptance weight: [n_embd, n_embd, 1, 1]
+    // Original: [n_embd, n_embd] = [768, 768]
     let w_r_shape = model.layers[0].att.w_r.shape();
     assert_eq!(w_r_shape.dim(0), 768, "w_r dim 0 should be n_embd=768");
     assert_eq!(w_r_shape.dim(1), 768, "w_r dim 1 should be n_embd=768");
 
-    // Check layer 0 FFN key weight: [n_embd, n_hidden, 1, 1]
+    // Check layer 0 FFN key weight: [n_hidden, n_embd, 1, 1] (load_weight_matrix_f32 stores as [M, K])
+    // Original: [n_hidden, n_embd] = [3072, 768]
     let ffn_k_shape = model.layers[0].ffn.w_k.shape();
-    assert_eq!(ffn_k_shape.dim(0), 768, "FFN key dim 0 should be n_embd=768");
-    assert_eq!(ffn_k_shape.dim(1), 3072, "FFN key dim 1 should be n_hidden=3072");
+    assert_eq!(ffn_k_shape.dim(0), 3072, "FFN key dim 0 should be n_hidden=3072");
+    assert_eq!(ffn_k_shape.dim(1), 768, "FFN key dim 1 should be n_embd=768");
 
-    // Check r_k shape: [head_size, n_head, 1, 1]
+    // Check r_k shape: [head_size, n_head, 1, 1] (load_tensor_f32 reverses dims)
+    // Original: [n_head, head_size] = [12, 64], after reverse: [64, 12]
     let r_k_shape = model.layers[0].att.r_k.shape();
     assert_eq!(r_k_shape.dim(0), 64, "r_k dim 0 should be head_size=64");
     assert_eq!(r_k_shape.dim(1), 12, "r_k dim 1 should be n_head=12");
@@ -1895,6 +1901,11 @@ fn test_rwkv7_hip_model_dimensions() {
 
 /// Test that model weights match Python-loaded values (spot check).
 /// Acceptance criteria 3: Spot-check weights match Python-loaded values.
+///
+/// Note: GEMM weights (receptance.weight, ffn.key.weight, head.weight) are transposed
+/// to column-major for rocBLAS. These have different memory layout than the fixture.
+/// We only compare non-transposed weights here; GEMM weights are validated by the
+/// forward pass test.
 #[test]
 #[cfg(feature = "hip")]
 fn test_rwkv7_hip_model_weights_spot_check() {
@@ -1913,31 +1924,31 @@ fn test_rwkv7_hip_model_weights_spot_check() {
     let fixture = TestFixture::load("tests/fixtures/model/weights_spot_check.npz")
         .expect("Failed to load spot check fixture");
 
-    // Map fixture names to model weight names
-    let checks = [
+    // Non-transposed weights (loaded with load_tensor_f32, not transposed)
+    // These maintain original row-major layout and can be compared directly
+    let non_transposed_checks = [
         ("emb_weight", "emb.weight"),
-        ("blocks_0_att_receptance_weight", "blocks.0.att.receptance.weight"),
         ("blocks_0_att_r_k", "blocks.0.att.r_k"),
-        ("blocks_5_ffn_key_weight", "blocks.5.ffn.key.weight"),
         ("blocks_11_ln2_weight", "blocks.11.ln2.weight"),
+    ];
+
+    // Transposed weights (loaded with load_weight_matrix_f32 for GEMM)
+    // These are transposed to column-major and validated by forward pass test
+    let transposed_checks = [
+        ("blocks_0_att_receptance_weight", "blocks.0.att.receptance.weight"),
+        ("blocks_5_ffn_key_weight", "blocks.5.ffn.key.weight"),
         ("head_weight", "head.weight"),
     ];
 
+    println!("Checking non-transposed weights:");
     let mut passed = 0;
-    for (fixture_name, model_name) in &checks {
-        // Get expected values from fixture (first 64 elements)
+    for (fixture_name, model_name) in &non_transposed_checks {
         let expected = fixture.f32(fixture_name);
-
-        // Get actual values from model
         let actual = model.read_weight_head(model_name, 64)
             .expect(&format!("Failed to read {}", model_name));
-
-        // Verify lengths match
         let n = expected.len().min(actual.len());
 
-        // Compare with tolerance
         let result = assert_tensors_close(&actual[..n], &expected[..n], 1e-3, 1e-4);
-
         match result {
             Ok(()) => {
                 println!("  {} matches ({} elements)", model_name, n);
@@ -1949,6 +1960,70 @@ fn test_rwkv7_hip_model_weights_spot_check() {
         }
     }
 
-    println!("\nWeight spot check: {}/{} passed", passed, checks.len());
-    assert_eq!(passed, checks.len(), "Some weight spot checks failed");
+    println!("\nTransposed GEMM weights (validated by forward pass):");
+    for (_, model_name) in &transposed_checks {
+        // Just verify they can be read (validates loading succeeded)
+        let data = model.read_weight_head(model_name, 64)
+            .expect(&format!("Failed to read {}", model_name));
+        println!("  {} loaded ({} elements read)", model_name, data.len());
+    }
+
+    println!("\nWeight spot check: {}/{} non-transposed passed", passed, non_transposed_checks.len());
+    assert_eq!(passed, non_transposed_checks.len(), "Some weight spot checks failed");
+}
+
+/// Test full model forward pass against Python reference.
+/// Acceptance criteria: Logits match Python reference within tolerance.
+#[test]
+#[cfg(feature = "hip")]
+fn test_rwkv7_hip_model_forward_pass() {
+    if !model_exists() {
+        eprintln!("Skipping test: model file not found");
+        return;
+    }
+
+    let fixture_path = "tests/fixtures/model/forward_pass.npz";
+    if !Path::new(fixture_path).exists() {
+        eprintln!("Skipping test: forward_pass fixture not found at {}", fixture_path);
+        return;
+    }
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load model");
+
+    let fixture = TestFixture::load(fixture_path)
+        .expect("Failed to load forward_pass fixture");
+
+    // Get input tokens (stored as i64)
+    let tokens_i64 = fixture.i64("input_tokens");
+    let tokens: Vec<u32> = tokens_i64.iter().map(|&x| x as u32).collect();
+    let expected_logits = fixture.f32("expected_logits");
+    let logits_shape = fixture.shape4("expected_logits");
+
+    println!("Testing forward pass:");
+    println!("  Input tokens: {:?}", tokens);
+    println!("  Expected logits shape: {:?}", logits_shape);
+
+    // Run forward pass
+    let actual_logits = model.forward(&tokens)
+        .expect("Forward pass failed");
+
+    println!("  Actual logits: {} elements", actual_logits.len());
+    println!("  Expected logits: {} elements", expected_logits.len());
+
+    // Compare logits
+    // Per docs/RWKV7_HIP_BACKEND_PLAN.md: rtol=1e-2, atol=1e-3 for full model
+    let result = assert_tensors_close(&actual_logits, &expected_logits, 1e-2, 1e-3);
+
+    match result {
+        Ok(()) => {
+            println!("Forward pass test PASSED!");
+        }
+        Err(e) => {
+            // Print first few logits for debugging
+            println!("\nActual logits[0:10]: {:?}", &actual_logits[0..10.min(actual_logits.len())]);
+            println!("Expected logits[0:10]: {:?}", &expected_logits[0..10.min(expected_logits.len())]);
+            panic!("Forward pass logits mismatch: {}", e);
+        }
+    }
 }
