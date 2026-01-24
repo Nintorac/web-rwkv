@@ -1342,6 +1342,23 @@ fn test_time_mix_wkv_fixture() {
 /// Full block computation:
 /// 1. Layer norm (ln1) -> Time-mix -> Residual
 /// 2. Layer norm (ln2) -> Channel-mix -> Residual
+///
+/// ## Tolerance Notes (bd-2sh.5.8)
+///
+/// The spec in `docs/FIXTURE_GENERATION_SPEC.md` defines target tolerances:
+/// - FP16 activations: (rtol=1e-3, atol=1e-4)
+/// - FP32 state: (rtol=1e-5, atol=1e-6)
+/// - Normalized values: (rtol=1e-3, atol=1e-4)
+/// - MatMul outputs: (rtol=1e-2, atol=1e-3)
+/// - Full model logits: (rtol=1e-2, atol=1e-3)
+///
+/// Current achievable tolerances for HIP (rocBLAS) backend:
+/// - MatMul outputs: (1e-2, 5e-3) - 5x gap due to rocBLAS vs PyTorch CUDA differences
+/// - LoRA projections (a, g): (2e-2, 2e-2) - accumulated errors from chained matmuls
+/// - WKV output: (5e-2, 5e-2) - larger errors in attention computation
+/// - FP32 state: (1e-1, 5e-1) - 500,000x gap, requires WKV7 kernel investigation
+///
+/// TODO(bd-2sh.5.8): Investigate and fix WKV7 kernel state accumulation precision.
 #[test]
 #[cfg(feature = "hip")]
 fn test_full_block_fixture() {
@@ -1449,7 +1466,8 @@ fn test_full_block_fixture() {
     ).expect("Layer norm 1 failed");
 
     println!("  Step 1 (ln1): {} elements", after_ln1.len());
-    assert_tensors_close(&after_ln1, expected_after_ln1, 1e-3, 1e-3)
+    // Spec: normalized values (1e-3, 1e-4) - meets spec
+    assert_tensors_close(&after_ln1, expected_after_ln1, 1e-3, 1e-4)
         .expect("Layer norm 1 output doesn't match");
 
     // ==== Step 2: Token Shift for Time-Mix ====
@@ -1481,11 +1499,12 @@ fn test_full_block_fixture() {
     println!("  Step 3 (r, k, v projections): done");
 
     // Validate r, k, v projections
-    assert_tensors_close(&r_proj, expected_r_proj, 1e-2, 0.05)
+    // Spec: matmul (1e-2, 1e-3), achievable: (1e-2, 5e-3) due to rocBLAS precision
+    assert_tensors_close(&r_proj, expected_r_proj, 1e-2, 5e-3)
         .expect("R projection doesn't match");
-    assert_tensors_close(&k_proj, expected_k_proj, 1e-2, 0.05)
+    assert_tensors_close(&k_proj, expected_k_proj, 1e-2, 5e-3)
         .expect("K projection doesn't match");
-    assert_tensors_close(&v_proj, expected_v_proj, 1e-2, 0.05)
+    assert_tensors_close(&v_proj, expected_v_proj, 1e-2, 5e-3)
         .expect("V projection doesn't match");
     println!("  Validated r, k, v projections");
 
@@ -1508,7 +1527,8 @@ fn test_full_block_fixture() {
     let w_decay = web_rwkv::hip::hip_softplus_decay(&w_biased).expect("Softplus decay failed");
 
     println!("  Step 4 (w decay): {} elements", w_decay.len());
-    assert_tensors_close(&w_decay, expected_w_proj, 1e-2, 0.05)
+    // Spec: matmul (1e-2, 1e-3), achievable: (1e-2, 5e-3) - LoRA chain adds error
+    assert_tensors_close(&w_decay, expected_w_proj, 1e-2, 5e-3)
         .expect("W projection doesn't match");
     println!("  Validated w projection");
 
@@ -1526,7 +1546,9 @@ fn test_full_block_fixture() {
     let a_proj = web_rwkv::hip::hip_sigmoid(&a_biased).expect("A sigmoid failed");
 
     println!("  Step 5 (a learning rate): {} elements", a_proj.len());
-    assert_tensors_close(&a_proj, expected_a_proj, 1e-2, 0.05)
+    // Spec: FP16 activation (1e-3, 1e-4), achievable: (2e-2, 2e-2) - chained matmuls accumulate error
+    // TODO(bd-2sh.5.8): Investigate precision loss in LoRA chain
+    assert_tensors_close(&a_proj, expected_a_proj, 2e-2, 2e-2)
         .expect("A projection doesn't match");
     println!("  Validated a projection");
 
@@ -1540,7 +1562,9 @@ fn test_full_block_fixture() {
         .expect("G LoRA2 failed");
 
     println!("  Step 6 (g gate): {} elements", g_proj.len());
-    assert_tensors_close(&g_proj, expected_g_proj, 1e-2, 0.05)
+    // Spec: FP16 activation (1e-3, 1e-4), achievable: (2e-2, 2e-2) - chained matmuls accumulate error
+    // TODO(bd-2sh.5.8): Investigate precision loss in LoRA chain
+    assert_tensors_close(&g_proj, expected_g_proj, 2e-2, 2e-2)
         .expect("G projection doesn't match");
     println!("  Validated g projection");
 
@@ -1553,7 +1577,8 @@ fn test_full_block_fixture() {
     let kk = web_rwkv::hip::hip_l2_norm(&k_scaled, c, t * b, n, 1e-12).expect("L2 norm failed");
 
     println!("  Step 7 (kk L2 norm): {} elements", kk.len());
-    assert_tensors_close(&kk, expected_kk, 1e-2, 0.05)
+    // Spec: normalized (1e-3, 1e-4), achievable: (1e-2, 1e-2) - input has matmul error
+    assert_tensors_close(&kk, expected_kk, 1e-2, 1e-2)
         .expect("kk (L2 norm) doesn't match");
     println!("  Validated kk");
 
@@ -1566,7 +1591,9 @@ fn test_full_block_fixture() {
         .collect();
 
     println!("  Step 8 (k_ctrl): {} elements", k_ctrl.len());
-    assert_tensors_close(&k_ctrl, expected_k_ctrl, 1e-2, 0.1)
+    // Spec: FP16 activation (1e-3, 1e-4), achievable: (1e-1, 1e-1) - combines k and a errors
+    // Max observed diff ~0.068 due to accumulated LoRA errors
+    assert_tensors_close(&k_ctrl, expected_k_ctrl, 1e-1, 1e-1)
         .expect("k_ctrl doesn't match");
     println!("  Validated k_ctrl");
 
@@ -1631,7 +1658,9 @@ fn test_full_block_fixture() {
     let wkv_out_flat = reshape_nhtb_to_c(&wkv_output, c, t, b, n, h);
 
     println!("  Step 9 (WKV7): {} elements", wkv_out_flat.len());
-    assert_tensors_close(&wkv_out_flat, expected_wkv_out, 0.05, 0.5)
+    // Spec: matmul (1e-2, 1e-3), achievable: (5e-2, 5e-2) - WKV kernel accumulation errors
+    // TODO(bd-2sh.5.8): Investigate WKV7 kernel precision
+    assert_tensors_close(&wkv_out_flat, expected_wkv_out, 5e-2, 5e-2)
         .expect("WKV output doesn't match");
     println!("  Validated WKV output");
 
@@ -1643,7 +1672,8 @@ fn test_full_block_fixture() {
     let wkv_bonus_flat = reshape_nhtb_to_c(&wkv_bonus, c, t, b, n, h);
 
     println!("  Step 10 (WKV bonus): {} elements", wkv_bonus_flat.len());
-    assert_tensors_close(&wkv_bonus_flat, expected_wkv_bonus_out, 0.05, 0.2)
+    // Spec: FP16 activation (1e-3, 1e-4), achievable: (5e-2, 5e-2) - input errors propagate
+    assert_tensors_close(&wkv_bonus_flat, expected_wkv_bonus_out, 5e-2, 5e-2)
         .expect("WKV bonus doesn't match");
     println!("  Validated WKV bonus");
 
@@ -1681,7 +1711,8 @@ fn test_full_block_fixture() {
     println!("  Step 13 (residual): {} elements", x_after_att.len());
 
     // Validate after time-mix
-    assert_tensors_close(&x_after_att, expected_after_time_mix, 0.05, 0.2)
+    // Spec: logits (1e-2, 1e-3), achievable: (1e-1, 1e-1) - accumulated errors
+    assert_tensors_close(&x_after_att, expected_after_time_mix, 1e-1, 1e-1)
         .expect("After time-mix output doesn't match");
     println!("  Time-mix validated!");
 
@@ -1721,20 +1752,24 @@ fn test_full_block_fixture() {
     println!("  Step 16 (final residual): {} elements", x_final.len());
 
     // ==== Validate Final Output ====
-    // Full block has accumulated errors, so allow higher tolerance
-    assert_tensors_close(&x_final, expected_output, 0.1, 0.5)
+    // Spec: logits (1e-2, 1e-3), achievable: (1e-1, 2e-1) - full block error accumulation
+    assert_tensors_close(&x_final, expected_output, 1e-1, 2e-1)
         .expect("Full block output doesn't match fixture");
 
     println!("  Final output validated!");
 
     // ==== Validate State Updates ====
-    assert_tensors_close(&wkv_state_out, expected_att_state, 0.1, 0.5)
+    // Spec: FP32 state (1e-5, 1e-6), achievable: (1e-1, 5e-1) - WKV7 kernel state precision
+    // TODO(bd-2sh.5.8): This is the largest gap - WKV7 state accumulation needs investigation
+    assert_tensors_close(&wkv_state_out, expected_att_state, 1e-1, 5e-1)
         .expect("Attention state doesn't match fixture");
 
-    assert_tensors_close(&new_att_token_shift_state, expected_att_token_shift_state, 1e-3, 1e-3)
+    // Spec: FP16 (1e-3, 1e-4), achievable: meets spec
+    assert_tensors_close(&new_att_token_shift_state, expected_att_token_shift_state, 1e-3, 1e-4)
         .expect("Attention token shift state doesn't match fixture");
 
-    assert_tensors_close(&new_ffn_state, expected_ffn_state, 1e-2, 0.1)
+    // Spec: FP16 (1e-3, 1e-4), achievable: (1e-2, 1e-1) - FFN has accumulated error
+    assert_tensors_close(&new_ffn_state, expected_ffn_state, 1e-2, 1e-1)
         .expect("FFN state doesn't match fixture");
 
     println!("  All states validated!");
