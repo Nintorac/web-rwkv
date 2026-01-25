@@ -5,7 +5,7 @@
 
 mod runtime;
 
-pub use runtime::HipRuntime;
+pub use runtime::{HipRuntime, softmax_one_cpu};
 
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;

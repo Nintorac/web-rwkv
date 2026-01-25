@@ -40,6 +40,7 @@ use std::path::Path;
 pub enum FixtureArray {
     F16(Vec<f16>),
     F32(Vec<f32>),
+    I32(Vec<i32>),
     I64(Vec<i64>),
     U32(Vec<u32>),
     Str(String),
@@ -72,6 +73,13 @@ impl TestFixture {
             if let Ok(arr) = npz.by_name::<ndarray::OwnedRepr<f32>, ndarray::IxDyn>(&name) {
                 let (vec, _offset) = arr.into_raw_vec_and_offset();
                 data.insert(name_clone, FixtureArray::F32(vec));
+                continue;
+            }
+
+            // Try i32 (for token arrays)
+            if let Ok(arr) = npz.by_name::<ndarray::OwnedRepr<i32>, ndarray::IxDyn>(&name) {
+                let (vec, _offset) = arr.into_raw_vec_and_offset();
+                data.insert(name_clone, FixtureArray::I32(vec));
                 continue;
             }
 
@@ -116,6 +124,15 @@ impl TestFixture {
         match self.data.get(name) {
             Some(FixtureArray::F32(v)) => v,
             _ => panic!("Expected f32 array for '{}', available keys: {:?}", name, self.tensor_keys()),
+        }
+    }
+
+    /// Get an int32 array.
+    #[allow(dead_code)] // Used by future HIP kernel tests
+    pub fn i32(&self, name: &str) -> &[i32] {
+        match self.data.get(name) {
+            Some(FixtureArray::I32(v)) => v,
+            _ => panic!("Expected i32 array for '{}', available keys: {:?}", name, self.tensor_keys()),
         }
     }
 

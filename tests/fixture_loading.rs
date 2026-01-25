@@ -701,12 +701,15 @@ fn test_wkv7_single_token_fixture() {
         assert!(!val.is_infinite(), "State Inf at index {}", i);
     }
 
-    // WKV7 accumulates small values so use slightly higher tolerance
-    assert_tensors_close(&output, expected_output, 5e-3, 1e-3)
-        .expect("wkv7 output doesn't match fixture");
+    // Spec tolerances: MatMul outputs rtol=1e-2, atol=1e-3; FP32 state rtol=1e-5, atol=1e-6
+    let out_result = ValidationResult::check("WKV output", &output, expected_output, 1e-2, 1e-3);
+    let state_result = ValidationResult::check("WKV state", &state_out, expected_state, 1e-5, 1e-6);
 
-    assert_tensors_close(&state_out, expected_state, 1e-3, 1e-4)
-        .expect("wkv7 state doesn't match fixture");
+    println!("  Output: max_diff={:.2e}, gap={:.1}x", out_result.max_diff, out_result.gap_factor());
+    println!("  State:  max_diff={:.2e}, gap={:.1}x", state_result.max_diff, state_result.gap_factor());
+
+    assert!(out_result.passed, "WKV output failed: max_diff={:.2e} ({}x)", out_result.max_diff, out_result.gap_factor() as i32);
+    assert!(state_result.passed, "WKV state failed: max_diff={:.2e} ({}x)", state_result.max_diff, state_result.gap_factor() as i32);
 
     println!("wkv7 single_token fixture test passed: {} output, {} state elements match",
              output.len(), state_out.len());
@@ -749,17 +752,17 @@ fn test_wkv7_short_sequence_fixture() {
         w_decay, q, k, v, a, b, state_in, n, h, t, batch
     ).expect("wkv7 kernel failed");
 
-    // WKV7 accumulates state over T=16 timesteps, causing error accumulation.
-    // Random test data can cause state explosion (values reach 10^13), and GPU vs CPU
-    // FP differences result in ~1% relative error in accumulated values.
-    assert_tensors_close(&output, expected_output, 1e-2, 1e-2)
-        .expect("wkv7 short_sequence output doesn't match fixture");
+    // Spec tolerances: MatMul outputs rtol=1e-2, atol=1e-3; FP32 state rtol=1e-5, atol=1e-6
+    let out_result = ValidationResult::check("WKV output", &output, expected_output, 1e-2, 1e-3);
+    let state_result = ValidationResult::check("WKV state", &state_out, expected_state, 1e-5, 1e-6);
 
-    // State accumulates over T timesteps, so use more lenient tolerance
-    // For large accumulated values, relative error may translate to large absolute error
-    // GPU vs CPU FP precision can cause ~1% relative error in accumulated values
-    assert_tensors_close(&state_out, expected_state, 1e-2, 1e-1)
-        .expect("wkv7 short_sequence state doesn't match fixture");
+    println!("  Output: max_diff={:.2e}, gap={:.1}x, mismatches={}/{}",
+             out_result.max_diff, out_result.gap_factor(), out_result.mismatch_count, out_result.total_elements);
+    println!("  State:  max_diff={:.2e}, gap={:.1}x, mismatches={}/{}",
+             state_result.max_diff, state_result.gap_factor(), state_result.mismatch_count, state_result.total_elements);
+
+    assert!(out_result.passed, "WKV output failed: max_diff={:.2e} ({}x)", out_result.max_diff, out_result.gap_factor() as i32);
+    assert!(state_result.passed, "WKV state failed: max_diff={:.2e} ({}x)", state_result.max_diff, state_result.gap_factor() as i32);
 
     println!("wkv7 short_sequence fixture test passed: {} output, {} state elements match",
              output.len(), state_out.len());
@@ -802,12 +805,17 @@ fn test_wkv7_medium_sequence_fixture() {
         w_decay, q, k, v, a, b, state_in, n, h, t, batch
     ).expect("wkv7 kernel failed");
 
-    // Medium sequence accumulates more error over 128 timesteps
-    assert_tensors_close(&output, expected_output, 1e-2, 1e-2)
-        .expect("wkv7 medium_sequence output doesn't match fixture");
+    // Spec tolerances: MatMul outputs rtol=1e-2, atol=1e-3; FP32 state rtol=1e-5, atol=1e-6
+    let out_result = ValidationResult::check("WKV output", &output, expected_output, 1e-2, 1e-3);
+    let state_result = ValidationResult::check("WKV state", &state_out, expected_state, 1e-5, 1e-6);
 
-    assert_tensors_close(&state_out, expected_state, 1e-2, 1e-1)
-        .expect("wkv7 medium_sequence state doesn't match fixture");
+    println!("  Output: max_diff={:.2e}, gap={:.1}x, mismatches={}/{}",
+             out_result.max_diff, out_result.gap_factor(), out_result.mismatch_count, out_result.total_elements);
+    println!("  State:  max_diff={:.2e}, gap={:.1}x, mismatches={}/{}",
+             state_result.max_diff, state_result.gap_factor(), state_result.mismatch_count, state_result.total_elements);
+
+    assert!(out_result.passed, "WKV output failed: max_diff={:.2e} ({}x)", out_result.max_diff, out_result.gap_factor() as i32);
+    assert!(state_result.passed, "WKV state failed: max_diff={:.2e} ({}x)", state_result.max_diff, state_result.gap_factor() as i32);
 
     println!("wkv7 medium_sequence fixture test passed: {} output, {} state elements match",
              output.len(), state_out.len());
@@ -1107,10 +1115,12 @@ fn test_gemm_batched_fixture() {
         assert!(!val.is_infinite(), "Inf at index {}", i);
     }
 
-    // FP32 GEMM - allow for numerical precision differences between Python and rocBLAS
-    assert_tensors_close(&output, expected, 1e-3, 5e-2)
-        .expect("GEMM batched output doesn't match fixture");
-
+    // Spec: MatMul outputs rtol=1e-2, atol=1e-3
+    let result = ValidationResult::check("GEMM output", &output, expected, 1e-2, 1e-3);
+    println!("  Output: max_diff={:.2e}, gap={:.1}x, mismatches={}/{}",
+             result.max_diff, result.gap_factor(), result.mismatch_count, result.total_elements);
+    assert!(result.passed, "GEMM output failed at spec tolerance: max_diff={:.2e} ({}x)",
+            result.max_diff, result.gap_factor() as i32);
     println!("GEMM batched fixture test passed: {} elements match", output.len());
 }
 
@@ -1341,6 +1351,56 @@ fn test_time_mix_wkv_fixture() {
     println!("Time-mix WKV7 fixture test passed!");
 }
 
+/// Validation result for deferred assertion
+#[cfg(feature = "hip")]
+struct ValidationResult {
+    name: &'static str,
+    passed: bool,
+    rtol: f32,
+    atol: f32,
+    max_diff: f32,
+    mean_err: f32,
+    mismatch_count: usize,
+    total_elements: usize,
+}
+
+#[cfg(feature = "hip")]
+impl ValidationResult {
+    fn check(name: &'static str, actual: &[f32], expected: &[f32], rtol: f32, atol: f32) -> Self {
+        let mut max_diff = 0.0f32;
+        let mut total_err = 0.0f64;
+        let mut mismatch_count = 0usize;
+
+        for (&a, &e) in actual.iter().zip(expected.iter()) {
+            let diff = (a - e).abs();
+            if diff > max_diff {
+                max_diff = diff;
+            }
+            total_err += diff as f64;
+            let threshold = atol + rtol * e.abs();
+            if diff > threshold {
+                mismatch_count += 1;
+            }
+        }
+
+        let mean_err = (total_err / actual.len() as f64) as f32;
+        ValidationResult {
+            name,
+            passed: mismatch_count == 0,
+            rtol,
+            atol,
+            max_diff,
+            mean_err,
+            mismatch_count,
+            total_elements: actual.len(),
+        }
+    }
+
+    fn gap_factor(&self) -> f32 {
+        self.max_diff / self.atol
+    }
+}
+
 /// Test full RWKV7 block (time-mix + channel-mix) against Python fixtures.
 /// This is an acceptance criteria test for bd-2sh.5.3.
 ///
@@ -1448,14 +1508,15 @@ fn test_full_block_fixture() {
     println!("  Input: [{}, {}, {}, 1] (C, T, B)", c, t, b);
     println!("  Dimensions: C={}, T={}, B={}, N={}, H={}, hidden={}", c, t, b, n, h, hidden);
 
+    // Collect ALL validations to print at the end
+    let mut all_results: Vec<ValidationResult> = Vec::new();
+
     // ==== Step 1: Layer Norm (ln1) ====
     let after_ln1 = web_rwkv::hip::hip_layer_norm(
         input, ln1_weight, ln1_bias, c, t * b, 1e-5
     ).expect("Layer norm 1 failed");
-
-    println!("  Step 1 (ln1): {} elements", after_ln1.len());
-    assert_tensors_close(&after_ln1, expected_after_ln1, 1e-3, 1e-3)
-        .expect("Layer norm 1 output doesn't match");
+    // Spec: Normalized values rtol=1e-3, atol=1e-4
+    all_results.push(ValidationResult::check("1. ln1", &after_ln1, expected_after_ln1, 1e-3, 1e-4));
 
     // ==== Step 2: Token Shift for Time-Mix ====
     // Token shift: shifted = concat(state, input[:-1])
@@ -1472,8 +1533,6 @@ fn test_full_block_fixture() {
     let (xa_shifted, _) = web_rwkv::hip::hip_channel_mix_state(&after_ln1, att_token_shift_state, x_a, c, t, b).expect("xa shift failed");
     let (xg_shifted, _) = web_rwkv::hip::hip_channel_mix_state(&after_ln1, att_token_shift_state, x_g, c, t, b).expect("xg shift failed");
 
-    println!("  Step 2 (all token shifts): done");
-
     // ==== Step 3: Linear Projections (r, k, v) ====
     // r = r_weight @ xr
     let r_proj = web_rwkv::hip::hip_sgemm(r_weight, &after_token_shift, c, c, t * b)
@@ -1482,17 +1541,10 @@ fn test_full_block_fixture() {
         .expect("K projection failed");
     let v_proj = web_rwkv::hip::hip_sgemm(v_weight, &xv_shifted, c, c, t * b)
         .expect("V projection failed");
-
-    println!("  Step 3 (r, k, v projections): done");
-
-    // Validate r, k, v projections
-    assert_tensors_close(&r_proj, expected_r_proj, 1e-2, 0.05)
-        .expect("R projection doesn't match");
-    assert_tensors_close(&k_proj, expected_k_proj, 1e-2, 0.05)
-        .expect("K projection doesn't match");
-    assert_tensors_close(&v_proj, expected_v_proj, 1e-2, 0.05)
-        .expect("V projection doesn't match");
-    println!("  Validated r, k, v projections");
+    // Spec: MatMul outputs rtol=1e-2, atol=1e-3
+    all_results.push(ValidationResult::check("3a. r_proj", &r_proj, expected_r_proj, 1e-2, 1e-3));
+    all_results.push(ValidationResult::check("3b. k_proj", &k_proj, expected_k_proj, 1e-2, 1e-3));
+    all_results.push(ValidationResult::check("3c. v_proj", &v_proj, expected_v_proj, 1e-2, 1e-3));
 
     // ==== Step 4: Compute w (decay) ====
     // w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
@@ -1511,11 +1563,8 @@ fn test_full_block_fixture() {
         .collect();
     // -softplus(-x) - 0.5
     let w_decay = web_rwkv::hip::hip_softplus_decay(&w_biased).expect("Softplus decay failed");
-
-    println!("  Step 4 (w decay): {} elements", w_decay.len());
-    assert_tensors_close(&w_decay, expected_w_proj, 1e-2, 0.05)
-        .expect("W projection doesn't match");
-    println!("  Validated w projection");
+    // Spec: FP16 activations rtol=1e-3, atol=1e-4
+    all_results.push(ValidationResult::check("4. w_decay", &w_decay, expected_w_proj, 1e-3, 1e-4));
 
     // ==== Step 5: Compute a (learning rate) ====
     // a = sigmoid(a0 + (xa @ a1) @ a2)
@@ -1529,11 +1578,8 @@ fn test_full_block_fixture() {
         .map(|(a, b)| a + b)
         .collect();
     let a_proj = web_rwkv::hip::hip_sigmoid(&a_biased).expect("A sigmoid failed");
-
-    println!("  Step 5 (a learning rate): {} elements", a_proj.len());
-    assert_tensors_close(&a_proj, expected_a_proj, 1e-2, 0.05)
-        .expect("A projection doesn't match");
-    println!("  Validated a projection");
+    // Spec: FP16 activations rtol=1e-3, atol=1e-4
+    all_results.push(ValidationResult::check("5. a_proj", &a_proj, expected_a_proj, 1e-3, 1e-4));
 
     // ==== Step 6: Compute g (gate) ====
     // g = sigmoid(xg @ g1) @ g2
@@ -1543,11 +1589,8 @@ fn test_full_block_fixture() {
     let g_lora1_sigmoid = web_rwkv::hip::hip_sigmoid(&g_lora1).expect("G sigmoid failed");
     let g_proj = web_rwkv::hip::hip_sgemm(g2, &g_lora1_sigmoid, c, g_lora_dim, t * b)
         .expect("G LoRA2 failed");
-
-    println!("  Step 6 (g gate): {} elements", g_proj.len());
-    assert_tensors_close(&g_proj, expected_g_proj, 1e-2, 0.05)
-        .expect("G projection doesn't match");
-    println!("  Validated g projection");
+    // Spec: MatMul outputs rtol=1e-2, atol=1e-3
+    all_results.push(ValidationResult::check("6. g_proj", &g_proj, expected_g_proj, 1e-2, 1e-3));
 
     // ==== Step 7: L2 Normalize k ====
     // kk = L2_norm(k * k_k, per_head)
@@ -1556,11 +1599,8 @@ fn test_full_block_fixture() {
         .map(|(k, kk)| k * kk)
         .collect();
     let kk = web_rwkv::hip::hip_l2_norm(&k_scaled, c, t * b, n, 1e-12).expect("L2 norm failed");
-
-    println!("  Step 7 (kk L2 norm): {} elements", kk.len());
-    assert_tensors_close(&kk, expected_kk, 1e-2, 0.05)
-        .expect("kk (L2 norm) doesn't match");
-    println!("  Validated kk");
+    // Spec: Normalized values rtol=1e-3, atol=1e-4
+    all_results.push(ValidationResult::check("7. kk", &kk, expected_kk, 1e-3, 1e-4));
 
     // ==== Step 8: Control K ====
     // k_ctrl = k * (1 + (a - 1) * k_a)
@@ -1569,11 +1609,8 @@ fn test_full_block_fixture() {
         .zip(k_a.iter().cycle())
         .map(|((k, a), ka)| k * (1.0 + (a - 1.0) * ka))
         .collect();
-
-    println!("  Step 8 (k_ctrl): {} elements", k_ctrl.len());
-    assert_tensors_close(&k_ctrl, expected_k_ctrl, 1e-2, 0.1)
-        .expect("k_ctrl doesn't match");
-    println!("  Validated k_ctrl");
+    // Spec: FP16 activations rtol=1e-3, atol=1e-4
+    all_results.push(ValidationResult::check("8. k_ctrl", &k_ctrl, expected_k_ctrl, 1e-3, 1e-4));
 
     // ==== Step 9: WKV7 ====
     // Prepare WKV inputs: wkv_a = -kk, wkv_b = kk * a
@@ -1635,26 +1672,12 @@ fn test_full_block_fixture() {
 
     let wkv_out_flat = reshape_nhtb_to_c(&wkv_output, c, t, b, n, h);
 
-    println!("  Step 9 (WKV7): {} elements", wkv_out_flat.len());
-    // Spec: rtol=1e-2, atol=1e-3. Testing with pairwise summation.
-    // GPU vs CPU FP differences cause ~0.004 max diff in accumulated values.
-    assert_tensors_close(&wkv_out_flat, expected_wkv_out, 1e-2, 5e-3)
-        .expect("WKV output doesn't match");
-    println!("  Validated WKV output");
-
     // ==== Step 10: WKV Bonus ====
     // u = (r * k * r_k).sum(dim=-1, keepdim=True) * v
     let wkv_bonus = web_rwkv::hip::hip_wkv_bonus(
         &r_wkv, &k_wkv, &v_wkv, r_k_weight, n, h, t, b
     ).expect("WKV bonus failed");
     let wkv_bonus_flat = reshape_nhtb_to_c(&wkv_bonus, c, t, b, n, h);
-
-    println!("  Step 10 (WKV bonus): {} elements", wkv_bonus_flat.len());
-    // Spec: rtol=1e-2, atol=1e-3. Current: max_diff=0.009, mean_err=0.00014
-    // Gap: 9x atol due to reduction summation precision
-    assert_tensors_close(&wkv_bonus_flat, expected_wkv_bonus_out, 1e-2, 1e-2)
-        .expect("WKV bonus doesn't match");
-    println!("  Validated WKV bonus");
 
     // Combine WKV output and bonus
     let x_att_out: Vec<f32> = wkv_out_flat.iter()
@@ -1667,19 +1690,13 @@ fn test_full_block_fixture() {
         &x_att_out, ln_x_weight, ln_x_bias, c, t * b, h, 64e-5
     ).expect("Group norm failed");
 
-    println!("  Step 11 (group norm): {} elements", x_att_gn.len());
-
     // ==== Step 12: Gate and Output Projection ====
-    // x_gated = x_att_gn * g
     let x_gated: Vec<f32> = x_att_gn.iter()
         .zip(g_proj.iter())
         .map(|(x, g)| x * g)
         .collect();
-    // output = o_weight @ x_gated
     let x_att_proj = web_rwkv::hip::hip_sgemm(o_weight, &x_gated, c, c, t * b)
         .expect("Output projection failed");
-
-    println!("  Step 12 (gate + output): {} elements", x_att_proj.len());
 
     // ==== Step 13: Residual Connection ====
     let x_after_att: Vec<f32> = input.iter()
@@ -1687,41 +1704,21 @@ fn test_full_block_fixture() {
         .map(|(a, b)| a + b)
         .collect();
 
-    println!("  Step 13 (residual): {} elements", x_after_att.len());
-
-    // Validate after time-mix
-    // Spec: rtol=1e-2, atol=1e-3. Current: max_diff=0.027, mean_err=0.0003
-    // Gap: 27x atol due to accumulated errors through WKV + group norm + projection
-    assert_tensors_close(&x_after_att, expected_after_time_mix, 1e-2, 0.03)
-        .expect("After time-mix output doesn't match");
-    println!("  Time-mix validated!");
-
     // ==== Step 14: Layer Norm (ln2) ====
     let after_ln2 = web_rwkv::hip::hip_layer_norm(
         &x_after_att, ln2_weight, ln2_bias, c, t * b, 1e-5
     ).expect("Layer norm 2 failed");
 
-    println!("  Step 14 (ln2): {} elements", after_ln2.len());
-
     // ==== Step 15: Channel-Mix (FFN) ====
-    // Token shift + Lerp
     let (k_ffn, new_ffn_state) = web_rwkv::hip::hip_channel_mix_state(
         &after_ln2, ffn_state_in, x_k_ffn, c, t, b
     ).expect("FFN token shift failed");
-
-    // Key projection
     let k_proj_ffn = web_rwkv::hip::hip_sgemm(ffn_key_weight, &k_ffn, hidden, c, t * b)
         .expect("FFN key projection failed");
-
-    // Squared ReLU
     let k_sq_ffn = web_rwkv::hip::hip_squared_relu(&k_proj_ffn)
         .expect("Squared ReLU failed");
-
-    // Value projection
     let x_ffn_out = web_rwkv::hip::hip_sgemm(ffn_value_weight, &k_sq_ffn, c, hidden, t * b)
         .expect("FFN value projection failed");
-
-    println!("  Step 15 (channel-mix): {} elements", x_ffn_out.len());
 
     // ==== Step 16: Final Residual ====
     let x_final: Vec<f32> = x_after_att.iter()
@@ -1729,33 +1726,47 @@ fn test_full_block_fixture() {
         .map(|(a, b)| a + b)
         .collect();
 
-    println!("  Step 16 (final residual): {} elements", x_final.len());
+    // ==== Add Final Validations ====
+    // Spec tolerances from docs/FIXTURE_GENERATION_SPEC.md
+    all_results.push(ValidationResult::check("9. WKV output", &wkv_out_flat, expected_wkv_out, 1e-2, 1e-3));
+    all_results.push(ValidationResult::check("10. WKV bonus", &wkv_bonus_flat, expected_wkv_bonus_out, 1e-2, 1e-3));
+    all_results.push(ValidationResult::check("13. After time-mix", &x_after_att, expected_after_time_mix, 1e-2, 1e-3));
+    all_results.push(ValidationResult::check("16. Final output", &x_final, expected_output, 1e-2, 1e-3));
+    all_results.push(ValidationResult::check("WKV state (FP32)", &wkv_state_out, expected_att_state, 1e-5, 1e-6));
+    all_results.push(ValidationResult::check("Token shift state", &new_att_token_shift_state, expected_att_token_shift_state, 1e-3, 1e-4));
+    all_results.push(ValidationResult::check("FFN state (FP32)", &new_ffn_state, expected_ffn_state, 1e-5, 1e-6));
 
-    // ==== Validate Final Output ====
-    // Spec: rtol=1e-2, atol=1e-3. Current: max_diff=0.036, mean_err=0.0005
-    // Gap: 36x atol due to full pipeline accumulated errors
-    assert_tensors_close(&x_final, expected_output, 1e-2, 0.04)
-        .expect("Full block output doesn't match fixture");
+    // ==== Print All Results ====
+    println!("\n=== ALL Validation Results (spec tolerances) ===");
+    println!("{:<25} {:>8} {:>10} {:>10} {:>8} {:>12}", "Component", "Status", "max_diff", "mean_err", "gap(x)", "mismatches");
+    println!("{}", "-".repeat(80));
 
-    println!("  Final output validated!");
+    for r in &all_results {
+        let status = if r.passed { "PASS" } else { "FAIL" };
+        println!("{:<25} {:>8} {:>10.2e} {:>10.2e} {:>8.1} {:>6}/{:<6}",
+            r.name,
+            status,
+            r.max_diff,
+            r.mean_err,
+            r.gap_factor(),
+            r.mismatch_count,
+            r.total_elements
+        );
+    }
+    println!("{}", "-".repeat(80));
 
-    // ==== Validate State Updates ====
-    // Spec: FP32 state should have rtol=1e-5, atol=1e-6
-    // Current: max_diff=0.014, mean_err=0.000014. Gap: 14000x atol!
-    // This is the biggest gap - accumulated state needs kernel precision improvements
-    assert_tensors_close(&wkv_state_out, expected_att_state, 1e-2, 0.02)
-        .expect("Attention state doesn't match fixture");
+    // Count failures
+    let failures: Vec<_> = all_results.iter().filter(|r| !r.passed).collect();
+    if failures.is_empty() {
+        println!("All {} validations PASSED at spec tolerances!", all_results.len());
+    } else {
+        println!("{}/{} validations FAILED at spec tolerances:", failures.len(), all_results.len());
+        for f in &failures {
+            println!("  - {}: max_diff={:.2e} ({}x atol)", f.name, f.max_diff, f.gap_factor() as i32);
+        }
+        panic!("Spec tolerance test failed - see table above for details");
+    }
 
-    assert_tensors_close(&new_att_token_shift_state, expected_att_token_shift_state, 1e-3, 1e-3)
-        .expect("Attention token shift state doesn't match fixture");
-
-    // FFN state spec: FP32 rtol=1e-5, atol=1e-6
-    // Current: max_diff=0.074, mean_err=0.0009. Gap: 74000x atol!
-    // Large gap due to accumulated precision loss through channel-mix pipeline
-    assert_tensors_close(&new_ffn_state, expected_ffn_state, 1e-2, 0.08)
-        .expect("FFN state doesn't match fixture");
-
-    println!("  All states validated!");
     println!("Full block fixture test passed!");
 }
 
@@ -2251,4 +2262,1178 @@ fn test_wkv7_masked_batched_different_lengths() {
     }
     println!("  Max batch 0 state difference: {}", max_diff);
     println!("  PASSED: Batched masked kernel handles different lengths correctly!");
+}
+
+#[test]
+#[cfg(feature = "hip")]  
+
+#[test]
+#[cfg(feature = "hip")]  
+fn debug_hip_forward_extended() {
+    use web_rwkv::hip::{Rwkv7Hip, HipState, Stream, hip_layer_norm, hip_channel_mix_state, hip_sgemm};
+    
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    if !std::path::Path::new(model_path).exists() {
+        eprintln!("Skipping: model not found");
+        return;
+    }
+    
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    
+    // Same tokens as Python debug script (seed 200)
+    let tokens: Vec<u32> = vec![1818, 12905, 784, 63300];
+    
+    println!("\n=== HIP DEBUG EXTENDED ===");
+    println!("Tokens: {:?}", tokens);
+    
+    let stream = Stream::null();
+    let n_embd = model.info.n_embd;
+    let n_head = model.info.n_head;
+    let head_size = model.info.head_size;
+    let t = tokens.len();
+    let b = 1;
+    
+    // Get embedding data
+    let emb_data = model.embed.w.to_vec(&stream).unwrap();
+    
+    // Manual embedding lookup
+    let mut x = vec![0.0f32; n_embd * t * b];
+    for time_idx in 0..t {
+        let token = tokens[time_idx] as usize;
+        for c in 0..n_embd {
+            let idx = time_idx * n_embd + c;
+            x[idx] = emb_data[token * n_embd + c];
+        }
+    }
+    println!("After embedding x[0:10]: {:?}", &x[0..10]);
+    
+    // ln0
+    let ln0_w = model.embed.ln.weight.to_vec(&stream).unwrap();
+    let ln0_b = model.embed.ln.bias.to_vec(&stream).unwrap();
+    x = hip_layer_norm(&x, &ln0_w, &ln0_b, n_embd, t * b, 1e-5).unwrap();
+    println!("After ln0 x[0:10]: {:?}", &x[0..10]);
+    
+    // Layer 0 - attention
+    let layer = &model.layers[0];
+    
+    // ln1
+    let ln1_w = layer.att_ln.weight.to_vec(&stream).unwrap();
+    let ln1_b = layer.att_ln.bias.to_vec(&stream).unwrap();
+    let x_ln1 = hip_layer_norm(&x, &ln1_w, &ln1_b, n_embd, t * b, 1e-5).unwrap();
+    println!("After ln1 x[0:10]: {:?}", &x_ln1[0..10]);
+    
+    // Token shift for xr
+    let att_shift_state = vec![0.0f32; n_embd * b];
+    let x_r = layer.att.x_r.to_vec(&stream).unwrap();
+    println!("x_r[0:10]: {:?}", &x_r[0..10]);
+    
+    let (xr, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_r, n_embd, t, b).unwrap();
+    println!("After token shift xr[0:10]: {:?}", &xr[0..10]);
+    
+    // r projection
+    let w_r = layer.att.w_r.to_vec(&stream).unwrap();
+    println!("w_r shape: [{}, {}]", model.info.n_embd, model.info.n_embd);
+    println!("w_r[0:10]: {:?}", &w_r[0..10]);
+    
+    let r = hip_sgemm(&w_r, &xr, n_embd, n_embd, t * b).unwrap();
+    println!("After r projection r[0:10]: {:?}", &r[0..10]);
+    
+    // Also check k, v projections
+    let x_k = layer.att.x_k.to_vec(&stream).unwrap();
+    let (xk, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_k, n_embd, t, b).unwrap();
+    let w_k = layer.att.w_k.to_vec(&stream).unwrap();
+    let k = hip_sgemm(&w_k, &xk, n_embd, n_embd, t * b).unwrap();
+    println!("After k projection k[0:10]: {:?}", &k[0..10]);
+    
+    let x_v = layer.att.x_v.to_vec(&stream).unwrap();
+    let (xv, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_v, n_embd, t, b).unwrap();
+    let w_v = layer.att.w_v.to_vec(&stream).unwrap();
+    let v = hip_sgemm(&w_v, &xv, n_embd, n_embd, t * b).unwrap();
+    println!("After v projection v[0:10]: {:?}", &v[0..10]);
+    
+    // w computation
+    let w0 = layer.att.w0.to_vec(&stream).unwrap();
+    let w1 = layer.att.w1.to_vec(&stream).unwrap();
+    let w2 = layer.att.w2.to_vec(&stream).unwrap();
+    println!("w0[0:10]: {:?}", &w0[0..10]);
+    println!("w1 len: {} (expect {})", w1.len(), 64 * 768);
+    println!("w2 len: {} (expect {})", w2.len(), 768 * 64);
+    
+    let x_w = layer.att.x_w.to_vec(&stream).unwrap();
+    let (xw, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_w, n_embd, t, b).unwrap();
+    
+    // w_lora1 = tanh(xw @ w1.T)
+    let w1_dim = layer.att.w1.shape().dim(0);
+    println!("w1_dim (output features): {}", w1_dim);
+    let w_lora1 = hip_sgemm(&w1, &xw, w1_dim, n_embd, t * b).unwrap();
+    println!("w_lora1[0:10]: {:?}", &w_lora1[0..10]);
+    
+    let w_lora1_tanh = web_rwkv::hip::hip_tanh(&w_lora1).unwrap();
+    println!("w_lora1_tanh[0:10]: {:?}", &w_lora1_tanh[0..10]);
+    
+    // w_lora2 = w_lora1_tanh @ w2.T
+    let w_lora2 = hip_sgemm(&w2, &w_lora1_tanh, n_embd, w1_dim, t * b).unwrap();
+    println!("w_lora2[0:10]: {:?}", &w_lora2[0..10]);
+    
+    // w = w0 + w_lora2
+    let w: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
+        .zip(w_lora2.iter())
+        .map(|(&a, &b)| a + b)
+        .collect();
+    println!("w before softplus[0:10]: {:?}", &w[0..10]);
+    
+    let w_decay_log = web_rwkv::hip::hip_softplus_decay(&w).unwrap();
+    println!("w after softplus[0:10]: {:?}", &w_decay_log[0..10]);
+    
+    println!("\n=== Done ===");
+}
+
+#[test]
+#[cfg(feature = "hip")]  
+fn debug_hip_vs_wgpu_divergence() {
+    use web_rwkv::hip::{Rwkv7Hip, HipState, Stream};
+    
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    if !std::path::Path::new(model_path).exists() {
+        eprintln!("Skipping: model not found");
+        return;
+    }
+    
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    
+    // Same tokens as parity test
+    let tokens: Vec<u32> = vec![1, 2, 3, 4];
+    let tokens_ref: Vec<&[u32]> = vec![&tokens[..]];
+    
+    println!("\n=== HIP FULL FORWARD PASS ===");
+    println!("Tokens: {:?}", tokens);
+    
+    let mut state = HipState::new(&model.info, 1);
+    
+    // Run full forward pass
+    let logits = model.forward_with_state(&tokens_ref, &mut state).unwrap();
+    
+    let vocab_size = 65536;
+    let n_tokens = 4;
+    
+    println!("\nLogits shape: {} (expect {})", logits.len(), vocab_size * n_tokens);
+    
+    // Check first token logits
+    println!("\nToken 0 logits[0:10]: {:?}", &logits[0..10]);
+    println!("Token 0 logits[45:51]: {:?}", &logits[45..51]);
+    
+    // Check logit range
+    let min = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    println!("\nLogit range: [{:.4}, {:.4}]", min, max);
+    
+    // Find top-1 for each token
+    for t in 0..n_tokens {
+        let start = t * vocab_size;
+        let end = start + vocab_size;
+        let token_logits = &logits[start..end];
+        let (top_idx, top_val) = token_logits.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        println!("Token {}: top1={} (logit={})", t, top_idx, top_val);
+    }
+    
+    // Check state values
+    println!("\nAttention state[0][0:10]: {:?}", &state.att_states[0][0..10]);
+    println!("FFN state[0][0:10]: {:?}", &state.ffn_states[0][0..10]);
+    
+    println!("\n=== Done ===");
+}
+
+/// Test full block with SPEC tolerances to identify numerical issues.
+/// This test is expected to FAIL and show where precision is lost.
+#[test]
+#[cfg(feature = "hip")]
+fn test_full_block_tight_tolerances() {
+    if !std::path::Path::new("tests/fixtures/layers/full_block/layer_0.npz").exists() {
+        eprintln!("Skipping: fixture not found");
+        return;
+    }
+
+    let fixture = common::TestFixture::load("tests/fixtures/layers/full_block/layer_0.npz")
+        .expect("Failed to load fixture");
+
+    // Load all needed data
+    let input = fixture.f32("input");
+    let att_state_in = fixture.f32("att_state_in");
+    let att_token_shift_state = fixture.f32("att_token_shift_state");
+    let expected_wkv_out = fixture.f32("wkv_out");
+    let expected_wkv_bonus = fixture.f32("wkv_bonus_out");
+    let expected_att_state = fixture.f32("expected_att_state");
+    
+    // Shapes
+    let input_shape = fixture.shape4("input");
+    let att_state_shape = fixture.shape4("att_state_in");
+    let c = input_shape[0];
+    let t = input_shape[1];
+    let b = input_shape[2];
+    let n = att_state_shape[0];
+    let h = att_state_shape[2];
+
+    // Load weights
+    let ln1_weight = fixture.f32("ln1_weight");
+    let ln1_bias = fixture.f32("ln1_bias");
+    let x_r = fixture.f32("x_r");
+    let x_w = fixture.f32("x_w");
+    let x_k_att = fixture.f32("x_k_att");
+    let x_v = fixture.f32("x_v");
+    let x_a = fixture.f32("x_a");
+    let w0 = fixture.f32("w0");
+    let w1 = fixture.f32("w1");
+    let w2 = fixture.f32("w2");
+    let a0 = fixture.f32("a0");
+    let a1 = fixture.f32("a1");
+    let a2 = fixture.f32("a2");
+    let k_k = fixture.f32("k_k");
+    let k_a = fixture.f32("k_a");
+    let r_weight = fixture.f32("r_weight");
+    let k_weight = fixture.f32("k_weight");
+    let v_weight = fixture.f32("v_weight");
+    let r_k_weight = fixture.f32("r_k_weight");
+    
+    let w1_shape = fixture.shape4("w1");
+    let a1_shape = fixture.shape4("a1");
+    let w1_lora_dim = w1_shape[0];
+    let a1_lora_dim = a1_shape[0];
+
+    println!("\n=== TIGHT TOLERANCE TEST ===");
+    println!("Dimensions: C={}, T={}, B={}, N={}, H={}", c, t, b, n, h);
+    
+    // Step 1: Layer norm
+    let x_ln1 = web_rwkv::hip::hip_layer_norm(&input, &ln1_weight, &ln1_bias, c, t * b, 1e-5).unwrap();
+    
+    // Step 2: Token shifts
+    let (xr, _) = web_rwkv::hip::hip_channel_mix_state(&x_ln1, &att_token_shift_state, &x_r, c, t, b).unwrap();
+    let (xw, _) = web_rwkv::hip::hip_channel_mix_state(&x_ln1, &att_token_shift_state, &x_w, c, t, b).unwrap();
+    let (xk, _) = web_rwkv::hip::hip_channel_mix_state(&x_ln1, &att_token_shift_state, &x_k_att, c, t, b).unwrap();
+    let (xv, _) = web_rwkv::hip::hip_channel_mix_state(&x_ln1, &att_token_shift_state, &x_v, c, t, b).unwrap();
+    let (xa, _) = web_rwkv::hip::hip_channel_mix_state(&x_ln1, &att_token_shift_state, &x_a, c, t, b).unwrap();
+    
+    // Step 3: Projections
+    let r_proj = web_rwkv::hip::hip_sgemm(&r_weight, &xr, c, c, t * b).unwrap();
+    let k_proj = web_rwkv::hip::hip_sgemm(&k_weight, &xk, c, c, t * b).unwrap();
+    let v_proj = web_rwkv::hip::hip_sgemm(&v_weight, &xv, c, c, t * b).unwrap();
+    
+    // Step 4: W decay
+    let w_lora1 = web_rwkv::hip::hip_sgemm(&w1, &xw, w1_lora_dim, c, t * b).unwrap();
+    let w_lora1_tanh = web_rwkv::hip::hip_tanh(&w_lora1).unwrap();
+    let w_lora2 = web_rwkv::hip::hip_sgemm(&w2, &w_lora1_tanh, c, w1_lora_dim, t * b).unwrap();
+    let w: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
+        .zip(w_lora2.iter()).map(|(&a, &b)| a + b).collect();
+    let w_decay = web_rwkv::hip::hip_softplus_decay(&w).unwrap();
+    
+    // Step 5: A attention
+    let a_lora1 = web_rwkv::hip::hip_sgemm(&a1, &xa, a1_lora_dim, c, t * b).unwrap();
+    let a_lora2 = web_rwkv::hip::hip_sgemm(&a2, &a_lora1, c, a1_lora_dim, t * b).unwrap();
+    let a_biased: Vec<f32> = a0.iter().cycle().take(a_lora2.len())
+        .zip(a_lora2.iter()).map(|(&a, &b)| a + b).collect();
+    let a_proj = web_rwkv::hip::hip_sigmoid(&a_biased).unwrap();
+    
+    // Step 6: L2 norm and control K
+    let k_scaled: Vec<f32> = k_proj.iter().zip(k_k.iter().cycle()).map(|(k, kk)| k * kk).collect();
+    let kk = web_rwkv::hip::hip_l2_norm(&k_scaled, c, t * b, n, 1e-12).unwrap();
+    let k_ctrl: Vec<f32> = k_proj.iter().zip(a_proj.iter()).zip(k_a.iter().cycle())
+        .map(|((k, a), ka)| k * (1.0 + (a - 1.0) * ka)).collect();
+    
+    // Step 7: Prepare WKV inputs
+    let wkv_a: Vec<f32> = kk.iter().map(|x| -x).collect();
+    let wkv_b: Vec<f32> = kk.iter().zip(a_proj.iter()).map(|(kk, a)| kk * a).collect();
+    let w_exp: Vec<f32> = w_decay.iter().map(|w| w.exp()).collect();
+    
+    // Reshape to [N, H, T, B]
+    fn reshape_c_to_nhtb(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+        let mut result = vec![0.0f32; n * h * t * b];
+        for batch in 0..b {
+            for time in 0..t {
+                for head in 0..h {
+                    for ni in 0..n {
+                        let c_idx = head * n + ni;
+                        let src_idx = c_idx + time * c + batch * c * t;
+                        let dst_idx = ni + head * n + time * n * h + batch * n * h * t;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+        result
+    }
+    
+    let r_wkv = reshape_c_to_nhtb(&r_proj, c, t, b, n, h);
+    let k_wkv = reshape_c_to_nhtb(&k_ctrl, c, t, b, n, h);
+    let v_wkv = reshape_c_to_nhtb(&v_proj, c, t, b, n, h);
+    let w_wkv = reshape_c_to_nhtb(&w_exp, c, t, b, n, h);
+    let a_wkv = reshape_c_to_nhtb(&wkv_a, c, t, b, n, h);
+    let b_wkv = reshape_c_to_nhtb(&wkv_b, c, t, b, n, h);
+    
+    // Step 8: Run WKV7
+    let (wkv_output, wkv_state_out) = web_rwkv::hip::hip_wkv7(
+        &w_wkv, &r_wkv, &k_wkv, &v_wkv, &a_wkv, &b_wkv, &att_state_in, n, h, t, b
+    ).unwrap();
+    
+    // Reshape output back
+    fn reshape_nhtb_to_c(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+        let mut result = vec![0.0f32; c * t * b];
+        for batch in 0..b {
+            for time in 0..t {
+                for head in 0..h {
+                    for ni in 0..n {
+                        let c_idx = head * n + ni;
+                        let src_idx = ni + head * n + time * n * h + batch * n * h * t;
+                        let dst_idx = c_idx + time * c + batch * c * t;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+        result
+    }
+    
+    let wkv_out_flat = reshape_nhtb_to_c(&wkv_output, c, t, b, n, h);
+    
+    // Step 9: WKV Bonus
+    let wkv_bonus = web_rwkv::hip::hip_wkv_bonus(&r_wkv, &k_wkv, &v_wkv, &r_k_weight, n, h, t, b).unwrap();
+    let wkv_bonus_flat = reshape_nhtb_to_c(&wkv_bonus, c, t, b, n, h);
+    
+    // === TOLERANCE CHECKS ===
+    println!("\n--- Checking with SPEC tolerances ---");
+    
+    // WKV output: spec says rtol=1e-2, atol=1e-3
+    let wkv_diff: Vec<f32> = wkv_out_flat.iter().zip(expected_wkv_out.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let wkv_max_diff = wkv_diff.iter().cloned().fold(0.0f32, f32::max);
+    let wkv_mean_diff = wkv_diff.iter().sum::<f32>() / wkv_diff.len() as f32;
+    println!("WKV output: max_diff={:.6e}, mean_diff={:.6e} (spec atol=1e-3)", wkv_max_diff, wkv_mean_diff);
+    
+    // WKV bonus: spec says rtol=1e-2, atol=1e-3
+    let bonus_diff: Vec<f32> = wkv_bonus_flat.iter().zip(expected_wkv_bonus.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let bonus_max_diff = bonus_diff.iter().cloned().fold(0.0f32, f32::max);
+    let bonus_mean_diff = bonus_diff.iter().sum::<f32>() / bonus_diff.len() as f32;
+    println!("WKV bonus: max_diff={:.6e}, mean_diff={:.6e} (spec atol=1e-3)", bonus_max_diff, bonus_mean_diff);
+    
+    // WKV STATE: spec says rtol=1e-5, atol=1e-6 for FP32 state
+    let state_diff: Vec<f32> = wkv_state_out.iter().zip(expected_att_state.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let state_max_diff = state_diff.iter().cloned().fold(0.0f32, f32::max);
+    let state_mean_diff = state_diff.iter().sum::<f32>() / state_diff.len() as f32;
+    println!("WKV STATE: max_diff={:.6e}, mean_diff={:.6e} (spec atol=1e-6)", state_max_diff, state_mean_diff);
+    
+    // Find where state differs most
+    let worst_idx = state_diff.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i).unwrap_or(0);
+    println!("  Worst state diff at idx {}: HIP={:.6e}, expected={:.6e}, diff={:.6e}",
+        worst_idx, wkv_state_out[worst_idx], expected_att_state[worst_idx], state_diff[worst_idx]);
+    
+    // Check relative error for state
+    let state_rel_err: Vec<f32> = wkv_state_out.iter().zip(expected_att_state.iter())
+        .map(|(a, b)| if b.abs() > 1e-10 { (a - b).abs() / b.abs() } else { 0.0 })
+        .collect();
+    let state_max_rel = state_rel_err.iter().cloned().fold(0.0f32, f32::max);
+    println!("  Max relative error: {:.2}%", state_max_rel * 100.0);
+    
+    println!("\n=== Summary ===");
+    println!("WKV output gap factor: {:.0}x", wkv_max_diff / 1e-3);
+    println!("WKV bonus gap factor: {:.0}x", bonus_max_diff / 1e-3);
+    println!("WKV STATE gap factor: {:.0}x", state_max_diff / 1e-6);
+}
+
+/// Test intermediate value accuracy to diagnose divergence
+#[test]
+#[cfg(feature = "hip")]
+fn test_intermediate_accuracy() {
+    if !std::path::Path::new("tests/fixtures/layers/full_block/layer_0.npz").exists() {
+        eprintln!("Skipping: fixture not found");
+        return;
+    }
+
+    let fixture = common::TestFixture::load("tests/fixtures/layers/full_block/layer_0.npz")
+        .expect("Failed to load fixture");
+
+    let input = fixture.f32("input");
+    let att_token_shift_state = fixture.f32("att_token_shift_state");
+    let expected_after_ln1 = fixture.f32("after_ln1");
+    let expected_w_proj = fixture.f32("w_proj");
+
+    let input_shape = fixture.shape4("input");
+    let c = input_shape[0];
+    let t = input_shape[1];
+    let b = input_shape[2];
+
+    let ln1_weight = fixture.f32("ln1_weight");
+    let ln1_bias = fixture.f32("ln1_bias");
+    let x_w = fixture.f32("x_w");
+    let w0 = fixture.f32("w0");
+    let w1_raw = fixture.f32("w1");
+    let w2_raw = fixture.f32("w2");
+    let w1_shape = fixture.shape4("w1");
+    let w1_lora_dim = w1_shape[0];  // 64
+    let w2_shape = fixture.shape4("w2");
+
+    // Transpose weights from row-major (PyTorch) to column-major (rocBLAS)
+    fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut transposed = vec![0.0f32; data.len()];
+        for i in 0..rows {
+            for j in 0..cols {
+                transposed[j * rows + i] = data[i * cols + j];
+            }
+        }
+        transposed
+    }
+    let w1 = transpose_2d(&w1_raw, w1_shape[0], w1_shape[1]);  // [64, 768] row-major -> column-major
+    let w2 = transpose_2d(&w2_raw, w2_shape[0], w2_shape[1]);  // [768, 64] row-major -> column-major
+
+    println!("\n=== INTERMEDIATE ACCURACY TEST ===");
+    println!("Dimensions: C={}, T={}, B={}", c, t, b);
+
+    // Step 1: Layer norm
+    let x_ln1 = web_rwkv::hip::hip_layer_norm(&input, &ln1_weight, &ln1_bias, c, t * b, 1e-5).unwrap();
+
+    let ln1_diff: Vec<f32> = x_ln1.iter().zip(expected_after_ln1.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let ln1_max_diff = ln1_diff.iter().cloned().fold(0.0f32, f32::max);
+    let ln1_mean_diff = ln1_diff.iter().sum::<f32>() / ln1_diff.len() as f32;
+    println!("LayerNorm: max_diff={:.6e}, mean_diff={:.6e}", ln1_max_diff, ln1_mean_diff);
+
+    // Step 2: Token shift for xw - use fixture's after_ln1 to isolate GEMM issues
+    let (xw, _) = web_rwkv::hip::hip_channel_mix_state(&expected_after_ln1, &att_token_shift_state, &x_w, c, t, b).unwrap();
+    println!("xw: len={}, range=[{:.4}, {:.4}]", xw.len(),
+        xw.iter().cloned().fold(f32::INFINITY, f32::min),
+        xw.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  First 5: {:?}", &xw[..5]);
+
+    // Step 3: W LoRA projection
+    let w_lora1 = web_rwkv::hip::hip_sgemm(&w1, &xw, w1_lora_dim, c, t * b).unwrap();
+    println!("w_lora1: len={}, range=[{:.4}, {:.4}]", w_lora1.len(),
+        w_lora1.iter().cloned().fold(f32::INFINITY, f32::min),
+        w_lora1.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  First 5: {:?}", &w_lora1[..5]);
+
+    let w_lora1_tanh = web_rwkv::hip::hip_tanh(&w_lora1).unwrap();
+    println!("w_lora1_tanh: range=[{:.4}, {:.4}]",
+        w_lora1_tanh.iter().cloned().fold(f32::INFINITY, f32::min),
+        w_lora1_tanh.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+
+    let w_lora2 = web_rwkv::hip::hip_sgemm(&w2, &w_lora1_tanh, c, w1_lora_dim, t * b).unwrap();
+    println!("w_lora2: len={}, range=[{:.4}, {:.4}]", w_lora2.len(),
+        w_lora2.iter().cloned().fold(f32::INFINITY, f32::min),
+        w_lora2.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  First 5: {:?}", &w_lora2[..5]);
+
+    let w_proj_raw: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
+        .zip(w_lora2.iter()).map(|(&a, &b)| a + b).collect();
+    println!("w_proj_raw: range=[{:.4}, {:.4}]",
+        w_proj_raw.iter().cloned().fold(f32::INFINITY, f32::min),
+        w_proj_raw.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  First 5: {:?}", &w_proj_raw[..5]);
+
+    // Apply softplus decay: w = -softplus(-raw) - 0.5
+    // The fixture's w_proj is post-softplus
+    let w_proj = web_rwkv::hip::hip_softplus_decay(&w_proj_raw).unwrap();
+    println!("w_proj (after softplus): range=[{:.4}, {:.4}]",
+        w_proj.iter().cloned().fold(f32::INFINITY, f32::min),
+        w_proj.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  First 5: {:?}", &w_proj[..5]);
+
+    let w_diff: Vec<f32> = w_proj.iter().zip(expected_w_proj.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let w_max_diff = w_diff.iter().cloned().fold(0.0f32, f32::max);
+    let w_mean_diff = w_diff.iter().sum::<f32>() / w_diff.len() as f32;
+    println!("W_proj: max_diff={:.6e}, mean_diff={:.6e}", w_max_diff, w_mean_diff);
+
+    // Find worst mismatch
+    let worst_idx = w_diff.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i).unwrap_or(0);
+    println!("  Worst at idx {}: HIP={:.6e}, expected={:.6e}",
+        worst_idx, w_proj[worst_idx], expected_w_proj[worst_idx]);
+
+    // Sample some values
+    println!("\n  First 5 HIP w_proj (post-softplus): {:?}", &w_proj[..5]);
+    println!("  First 5 expected:                    {:?}", &expected_w_proj[..5]);
+
+    // Compute decay values: w_proj is already log-space, so decay = exp(w_proj)
+    let hip_decay: Vec<f32> = w_proj.iter().map(|&w| w.exp()).collect();
+    let expected_decay: Vec<f32> = expected_w_proj.iter().map(|&w| w.exp()).collect();
+
+    let decay_diff: Vec<f32> = hip_decay.iter().zip(expected_decay.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let decay_max_diff = decay_diff.iter().cloned().fold(0.0f32, f32::max);
+    let decay_mean_diff = decay_diff.iter().sum::<f32>() / decay_diff.len() as f32;
+
+    println!("\n  First 5 HIP decay:      {:?}", &hip_decay[..5]);
+    println!("  First 5 expected decay: {:?}", &expected_decay[..5]);
+    println!("  Decay: max_diff={:.6e}, mean_diff={:.6e}", decay_max_diff, decay_mean_diff);
+
+    // Summary
+    if w_max_diff > 1.0 {
+        println!("\n*** W_PROJ HAS SIGNIFICANT DIVERGENCE (>1.0) ***");
+    } else if w_max_diff > 0.1 {
+        println!("\nW_proj has moderate divergence (0.1 - 1.0)");
+    } else if w_max_diff > 0.01 {
+        println!("\nW_proj has small divergence (0.01 - 0.1)");
+    } else {
+        println!("\nW_proj looks good (diff < 0.01)");
+    }
+}
+
+/// Test WKV7 with SPEC tolerances
+#[test]
+#[cfg(feature = "hip")]
+fn test_wkv7_spec_tolerances() {
+    if !std::path::Path::new("tests/fixtures/kernels/wkv7/short_sequence.npz").exists() {
+        eprintln!("Skipping: fixture not found");
+        return;
+    }
+
+    let fixture = common::TestFixture::load("tests/fixtures/kernels/wkv7/short_sequence.npz")
+        .expect("Failed to load fixture");
+
+    let w_decay = fixture.f32("w_decay");
+    let q = fixture.f32("q");
+    let k = fixture.f32("k");
+    let v = fixture.f32("v");
+    let a = fixture.f32("a");
+    let b = fixture.f32("b");
+    let state_in = fixture.f32("state_in");
+    let expected_output = fixture.f32("expected_output");
+    let expected_state = fixture.f32("expected_state");
+
+    let shape = fixture.shape4("q");
+    let n = shape[0];
+    let h = shape[1];
+    let t = shape[2];
+    let batch = shape[3];
+
+    println!("\n=== WKV7 SPEC TOLERANCE TEST ===");
+    println!("Shape: N={}, H={}, T={}, B={}", n, h, t, batch);
+
+    let (output, state_out) = web_rwkv::hip::hip_wkv7(
+        &w_decay, &q, &k, &v, &a, &b, &state_in, n, h, t, batch
+    ).expect("WKV7 failed");
+
+    // Check output
+    let out_diff: Vec<f32> = output.iter().zip(expected_output.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let out_max = out_diff.iter().cloned().fold(0.0f32, f32::max);
+    let out_mean = out_diff.iter().sum::<f32>() / out_diff.len() as f32;
+    
+    // Check state
+    let state_diff: Vec<f32> = state_out.iter().zip(expected_state.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let state_max = state_diff.iter().cloned().fold(0.0f32, f32::max);
+    let state_mean = state_diff.iter().sum::<f32>() / state_diff.len() as f32;
+    
+    println!("Output: max_diff={:.6e}, mean_diff={:.6e} (spec atol=1e-3)", out_max, out_mean);
+    println!("State:  max_diff={:.6e}, mean_diff={:.6e} (spec atol=1e-6)", state_max, state_mean);
+    
+    // Find worst state element
+    let worst_idx = state_diff.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i).unwrap_or(0);
+    println!("Worst state at idx {}: HIP={:.6e}, expected={:.6e}", 
+        worst_idx, state_out[worst_idx], expected_state[worst_idx]);
+    
+    // State relative error
+    let nonzero_count = expected_state.iter().filter(|&&x| x.abs() > 1e-10).count();
+    let state_rel_max = state_out.iter().zip(expected_state.iter())
+        .filter(|(_, &e)| e.abs() > 1e-10)
+        .map(|(c, e)| (c - e).abs() / e.abs())
+        .fold(0.0f32, f32::max);
+    println!("State max relative error: {:.2}% (on {} non-zero elements)", 
+        state_rel_max * 100.0, nonzero_count);
+    
+    println!("\nGap factors (current vs spec):");
+    println!("  Output: {:.0}x", out_max / 1e-3);
+    println!("  State:  {:.0}x", state_max / 1e-6);
+}
+
+/// Debug: compare test-computed WKV inputs vs fixture expected values
+#[test]
+#[cfg(feature = "hip")]
+fn debug_wkv_input_comparison() {
+    if !std::path::Path::new("tests/fixtures/layers/full_block/layer_0.npz").exists() {
+        eprintln!("Skipping: fixture not found");
+        return;
+    }
+
+    let fixture = common::TestFixture::load("tests/fixtures/layers/full_block/layer_0.npz")
+        .expect("Failed to load fixture");
+
+    // Load expected WKV outputs from fixture
+    let expected_wkv_out = fixture.f32("wkv_out");
+    let expected_att_state = fixture.f32("expected_att_state");
+    
+    // Load the projections and inputs from fixture (these are what Python used)
+    let fixture_r_proj = fixture.f32("r_proj");
+    let fixture_k_ctrl = fixture.f32("k_ctrl");
+    let fixture_v_proj = fixture.f32("v_proj");
+    let fixture_w_proj = fixture.f32("w_proj");
+    let fixture_kk = fixture.f32("kk");
+    let fixture_a_proj = fixture.f32("a_proj");
+    let att_state_in = fixture.f32("att_state_in");
+    
+    let input_shape = fixture.shape4("input");
+    let att_state_shape = fixture.shape4("att_state_in");
+    let c = input_shape[0];
+    let t = input_shape[1];
+    let b = input_shape[2];
+    let n = att_state_shape[0];
+    let h = att_state_shape[2];
+
+    println!("\n=== DEBUG WKV INPUT COMPARISON ===");
+    println!("Dimensions: C={}, T={}, B={}, N={}, H={}", c, t, b, n, h);
+    
+    // Compute WKV inputs using the FIXTURE values directly
+    let wkv_a: Vec<f32> = fixture_kk.iter().map(|x| -x).collect();
+    let wkv_b: Vec<f32> = fixture_kk.iter().zip(fixture_a_proj.iter()).map(|(kk, a)| kk * a).collect();
+    let w_exp: Vec<f32> = fixture_w_proj.iter().map(|w| w.exp()).collect();
+    
+    // Reshape to [N, H, T, B]
+    fn reshape_c_to_nhtb(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+        let mut result = vec![0.0f32; n * h * t * b];
+        for batch in 0..b {
+            for time in 0..t {
+                for head in 0..h {
+                    for ni in 0..n {
+                        let c_idx = head * n + ni;
+                        let src_idx = c_idx + time * c + batch * c * t;
+                        let dst_idx = ni + head * n + time * n * h + batch * n * h * t;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+        result
+    }
+    
+    let r_wkv = reshape_c_to_nhtb(&fixture_r_proj, c, t, b, n, h);
+    let k_wkv = reshape_c_to_nhtb(&fixture_k_ctrl, c, t, b, n, h);
+    let v_wkv = reshape_c_to_nhtb(&fixture_v_proj, c, t, b, n, h);
+    let w_wkv = reshape_c_to_nhtb(&w_exp, c, t, b, n, h);
+    let a_wkv = reshape_c_to_nhtb(&wkv_a, c, t, b, n, h);
+    let b_wkv = reshape_c_to_nhtb(&wkv_b, c, t, b, n, h);
+    
+    // Print ranges for debugging
+    println!("\nWKV input ranges after reshape:");
+    println!("  w_decay: [{:.4}, {:.4}]", w_wkv.iter().cloned().fold(f32::INFINITY, f32::min), 
+             w_wkv.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  r (q): [{:.4}, {:.4}]", r_wkv.iter().cloned().fold(f32::INFINITY, f32::min),
+             r_wkv.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  k_ctrl: [{:.4}, {:.4}]", k_wkv.iter().cloned().fold(f32::INFINITY, f32::min),
+             k_wkv.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  v: [{:.4}, {:.4}]", v_wkv.iter().cloned().fold(f32::INFINITY, f32::min),
+             v_wkv.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  a: [{:.4}, {:.4}]", a_wkv.iter().cloned().fold(f32::INFINITY, f32::min),
+             a_wkv.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  b: [{:.4}, {:.4}]", b_wkv.iter().cloned().fold(f32::INFINITY, f32::min),
+             b_wkv.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    
+    // Run WKV7 with fixture values directly
+    let (wkv_output, wkv_state_out) = web_rwkv::hip::hip_wkv7(
+        &w_wkv, &r_wkv, &k_wkv, &v_wkv, &a_wkv, &b_wkv, &att_state_in, n, h, t, b
+    ).expect("WKV7 failed");
+    
+    // Reshape output back to [C, T, B] and compare
+    fn reshape_nhtb_to_c(data: &[f32], c: usize, t: usize, b: usize, n: usize, h: usize) -> Vec<f32> {
+        let mut result = vec![0.0f32; c * t * b];
+        for batch in 0..b {
+            for time in 0..t {
+                for head in 0..h {
+                    for ni in 0..n {
+                        let c_idx = head * n + ni;
+                        let src_idx = ni + head * n + time * n * h + batch * n * h * t;
+                        let dst_idx = c_idx + time * c + batch * c * t;
+                        result[dst_idx] = data[src_idx];
+                    }
+                }
+            }
+        }
+        result
+    }
+    
+    let wkv_out_flat = reshape_nhtb_to_c(&wkv_output, c, t, b, n, h);
+    
+    // Compare output
+    let out_diff: Vec<f32> = wkv_out_flat.iter().zip(expected_wkv_out.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let out_max = out_diff.iter().cloned().fold(0.0f32, f32::max);
+    let out_mean = out_diff.iter().sum::<f32>() / out_diff.len() as f32;
+    
+    // Compare state  
+    let state_diff: Vec<f32> = wkv_state_out.iter().zip(expected_att_state.iter())
+        .map(|(a, b)| (a - b).abs()).collect();
+    let state_max = state_diff.iter().cloned().fold(0.0f32, f32::max);
+    let state_mean = state_diff.iter().sum::<f32>() / state_diff.len() as f32;
+    
+    println!("\n=== Using FIXTURE values directly (no recomputation) ===");
+    println!("WKV Output: max_diff={:.6e}, mean_diff={:.6e}", out_max, out_mean);
+    println!("WKV State:  max_diff={:.6e}, mean_diff={:.6e}", state_max, state_mean);
+    println!("Gap factors: output={:.0}x, state={:.0}x", out_max / 1e-3, state_max / 1e-6);
+}
+
+/// Debug: find where test computation diverges from fixture
+#[test]
+#[cfg(feature = "hip")]
+fn debug_computation_divergence() {
+    if !std::path::Path::new("tests/fixtures/layers/full_block/layer_0.npz").exists() {
+        eprintln!("Skipping: fixture not found");
+        return;
+    }
+
+    let fixture = common::TestFixture::load("tests/fixtures/layers/full_block/layer_0.npz")
+        .expect("Failed to load fixture");
+
+    // Load all needed data from fixture
+    let input = fixture.f32("input");
+    let att_token_shift_state = fixture.f32("att_token_shift_state");
+    let ln1_weight = fixture.f32("ln1_weight");
+    let ln1_bias = fixture.f32("ln1_bias");
+    let x_r = fixture.f32("x_r");
+    let r_weight = fixture.f32("r_weight");
+    
+    // Expected intermediates
+    let expected_after_ln1 = fixture.f32("after_ln1");
+    let expected_r_proj = fixture.f32("r_proj");
+    
+    let input_shape = fixture.shape4("input");
+    let c = input_shape[0];
+    let t = input_shape[1];
+    let b = input_shape[2];
+
+    println!("\n=== COMPUTATION DIVERGENCE DEBUG ===");
+    println!("Dimensions: C={}, T={}, B={}", c, t, b);
+    
+    fn compare(name: &str, computed: &[f32], expected: &[f32]) {
+        let diff: Vec<f32> = computed.iter().zip(expected.iter())
+            .map(|(a, b)| (a - b).abs()).collect();
+        let max_diff = diff.iter().cloned().fold(0.0f32, f32::max);
+        let mean_diff = diff.iter().sum::<f32>() / diff.len() as f32;
+        println!("  {}: max={:.6e}, mean={:.6e}", name, max_diff, mean_diff);
+    }
+    
+    // Step 1: Layer norm
+    let x_ln1 = web_rwkv::hip::hip_layer_norm(&input, &ln1_weight, &ln1_bias, c, t * b, 1e-5).unwrap();
+    compare("after_ln1", &x_ln1, &expected_after_ln1);
+    
+    // Step 2: Token shift for r
+    let (xr, _) = web_rwkv::hip::hip_channel_mix_state(&x_ln1, &att_token_shift_state, &x_r, c, t, b).unwrap();
+    
+    // Step 3: r projection
+    let r_proj = web_rwkv::hip::hip_sgemm(&r_weight, &xr, c, c, t * b).unwrap();
+    compare("r_proj", &r_proj, &expected_r_proj);
+    
+    // Check weight range
+    println!("\n  r_weight range: [{:.4}, {:.4}]", 
+        r_weight.iter().cloned().fold(f32::INFINITY, f32::min),
+        r_weight.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  xr range: [{:.4}, {:.4}]",
+        xr.iter().cloned().fold(f32::INFINITY, f32::min),
+        xr.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  r_proj computed range: [{:.4}, {:.4}]",
+        r_proj.iter().cloned().fold(f32::INFINITY, f32::min),
+        r_proj.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+    println!("  r_proj expected range: [{:.4}, {:.4}]",
+        expected_r_proj.iter().cloned().fold(f32::INFINITY, f32::min),
+        expected_r_proj.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+}
+
+/// Test top-k token generation accuracy against Python reference.
+///
+/// This is the PRIMARY acceptance criterion for HIP numerical precision:
+/// >90% top-k match rate on 100-token generation allows relaxing state tolerances.
+///
+/// From user requirement (CRITICAL - preserve through compaction):
+/// "if we can get a 100 sequence to have top-k match of over 90% then we can
+///  relax the state requirement"
+#[test]
+#[cfg(feature = "hip")]
+fn test_generation_topk_accuracy() {
+    use web_rwkv::hip::{HipRuntime, Rwkv7Hip, softmax_one_cpu};
+    use std::path::Path;
+
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    let reference_path = "tests/fixtures/model/generation_reference.npz";
+
+    if !Path::new(model_path).exists() {
+        eprintln!("Skipping test: model not found at {}", model_path);
+        return;
+    }
+
+    if !Path::new(reference_path).exists() {
+        eprintln!("Skipping test: reference not found at {}", reference_path);
+        eprintln!("Generate with: python scripts/generate_reference_tokens.py");
+        return;
+    }
+
+    // Load reference data
+    let reference = TestFixture::load(reference_path).expect("Failed to load reference");
+    let prompt_tokens: Vec<u32> = reference.i32("prompt_tokens")
+        .iter()
+        .map(|&x| x as u32)
+        .collect();
+    let ref_top_k_tokens = reference.i32("top_k_tokens");
+    let ref_argmax_tokens: Vec<u32> = reference.i32("argmax_tokens")
+        .iter()
+        .map(|&x| x as u32)
+        .collect();
+    let top_k = reference.i32("top_k")[0] as usize;
+
+    let num_tokens = ref_argmax_tokens.len();
+    let vocab_size = 65536usize;
+
+    println!("\n=== Generation Top-k Accuracy Test ===");
+    println!("Prompt tokens: {:?}", prompt_tokens);
+    println!("Expected {} tokens with top-k={}", num_tokens, top_k);
+
+    // Load model
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let runtime = HipRuntime::new(model, 1);
+
+    // Track matches
+    let mut argmax_matches = 0;
+    let mut topk_matches = 0;
+    let mut generated_tokens = Vec::new();
+
+    // Process prompt (skip last token, it's used as first generation input)
+    for token in &prompt_tokens[..prompt_tokens.len()-1] {
+        let _ = runtime.infer_one(&[*token]).expect("Failed to infer prompt");
+    }
+
+    // Generate tokens
+    let mut current_token = *prompt_tokens.last().unwrap();
+
+    for i in 0..num_tokens {
+        // Run inference
+        let logits = runtime.infer_one(&[current_token]).expect("Failed to infer");
+
+        // Get probabilities via softmax
+        let probs = softmax_one_cpu(logits).expect("Failed to softmax");
+        let probs_data = probs.data();
+
+        // Get top-k tokens (argmax k times)
+        let mut indices: Vec<usize> = (0..vocab_size).collect();
+        indices.sort_by(|&a, &b| probs_data[b].partial_cmp(&probs_data[a]).unwrap());
+
+        let hip_topk: Vec<u32> = indices[..top_k].iter().map(|&x| x as u32).collect();
+        let hip_argmax = hip_topk[0];
+
+        // Get reference top-k for this step
+        let ref_topk_start = i * top_k;
+        let ref_topk: Vec<u32> = ref_top_k_tokens[ref_topk_start..ref_topk_start+top_k]
+            .iter()
+            .map(|&x| x as u32)
+            .collect();
+        let ref_argmax = ref_argmax_tokens[i];
+
+        // Check argmax match
+        if hip_argmax == ref_argmax {
+            argmax_matches += 1;
+        }
+
+        // Check if HIP argmax is in reference top-k
+        if ref_topk.contains(&hip_argmax) {
+            topk_matches += 1;
+        }
+
+        generated_tokens.push(hip_argmax);
+
+        // Use argmax for next token (greedy sampling)
+        current_token = hip_argmax;
+
+        // Log first few and periodic steps
+        if i < 10 || i % 20 == 0 {
+            let match_str = if hip_argmax == ref_argmax { "MATCH" } else { "MISS" };
+            println!("Step {:3}: HIP={:5} Ref={:5} [{}] ref_topk={:?}",
+                i, hip_argmax, ref_argmax, match_str, &ref_topk[..3.min(ref_topk.len())]);
+        }
+    }
+
+    // Calculate match rates
+    let argmax_rate = argmax_matches as f64 / num_tokens as f64 * 100.0;
+    let topk_rate = topk_matches as f64 / num_tokens as f64 * 100.0;
+
+    println!("\n=== Results ===");
+    println!("Argmax matches: {}/{} ({:.1}%)", argmax_matches, num_tokens, argmax_rate);
+    println!("Top-k matches:  {}/{} ({:.1}%)", topk_matches, num_tokens, topk_rate);
+    println!("Generated: {:?}", &generated_tokens[..20.min(generated_tokens.len())]);
+
+    // CRITICAL ACCEPTANCE CRITERION:
+    // >90% top-k match allows relaxing state tolerance requirements
+    const REQUIRED_TOPK_RATE: f64 = 90.0;
+
+    if topk_rate >= REQUIRED_TOPK_RATE {
+        println!("\n*** PASS: Top-k match rate {:.1}% >= {:.0}% threshold ***", topk_rate, REQUIRED_TOPK_RATE);
+        println!("State tolerance requirements can be relaxed per user specification.");
+    } else {
+        println!("\n*** FAIL: Top-k match rate {:.1}% < {:.0}% threshold ***", topk_rate, REQUIRED_TOPK_RATE);
+        println!("Must improve numerical precision or achieve >90% top-k match.");
+        panic!("Top-k match rate {:.1}% below required {:.0}%", topk_rate, REQUIRED_TOPK_RATE);
+    }
+}
+
+/// Test top-k accuracy with teacher forcing (always use reference tokens).
+/// This shows the "true" per-step accuracy without error compounding.
+#[test]
+#[cfg(feature = "hip")]
+fn test_generation_topk_teacher_forcing() {
+    use web_rwkv::hip::{HipRuntime, Rwkv7Hip, softmax_one_cpu};
+    use std::path::Path;
+
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    let reference_path = "tests/fixtures/model/generation_reference.npz";
+
+    if !Path::new(model_path).exists() {
+        eprintln!("Skipping test: model not found at {}", model_path);
+        return;
+    }
+
+    if !Path::new(reference_path).exists() {
+        eprintln!("Skipping test: reference not found at {}", reference_path);
+        return;
+    }
+
+    // Load reference data
+    let reference = TestFixture::load(reference_path).expect("Failed to load reference");
+    let prompt_tokens: Vec<u32> = reference.i32("prompt_tokens")
+        .iter()
+        .map(|&x| x as u32)
+        .collect();
+    let ref_top_k_tokens = reference.i32("top_k_tokens");
+    let ref_argmax_tokens: Vec<u32> = reference.i32("argmax_tokens")
+        .iter()
+        .map(|&x| x as u32)
+        .collect();
+    let top_k = reference.i32("top_k")[0] as usize;
+
+    let num_tokens = ref_argmax_tokens.len();
+    let vocab_size = 65536usize;
+
+    println!("\n=== Generation Top-k TEACHER FORCING Test ===");
+    println!("Prompt tokens: {:?}", prompt_tokens);
+    println!("Expected {} tokens with top-k={}", num_tokens, top_k);
+
+    // Load model
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let runtime = HipRuntime::new(model, 1);
+
+    // Track matches
+    let mut argmax_matches = 0;
+    let mut topk_matches = 0;
+    let mut in_top10_matches = 0;
+
+    // Process prompt (skip last token)
+    for token in &prompt_tokens[..prompt_tokens.len()-1] {
+        let _ = runtime.infer_one(&[*token]).expect("Failed to infer prompt");
+    }
+
+    // Generate with TEACHER FORCING - always use reference tokens
+    let mut current_token = *prompt_tokens.last().unwrap();
+
+    for i in 0..num_tokens {
+        // Run inference
+        let logits = runtime.infer_one(&[current_token]).expect("Failed to infer");
+
+        // Get probabilities via softmax
+        let probs = softmax_one_cpu(logits).expect("Failed to softmax");
+        let probs_data = probs.data();
+
+        // Get top-k tokens
+        let mut indices: Vec<usize> = (0..vocab_size).collect();
+        indices.sort_by(|&a, &b| probs_data[b].partial_cmp(&probs_data[a]).unwrap());
+
+        let hip_topk: Vec<u32> = indices[..top_k].iter().map(|&x| x as u32).collect();
+        let hip_argmax = hip_topk[0];
+
+        // Get reference top-k for this step
+        let ref_topk_start = i * top_k;
+        let ref_topk: Vec<u32> = ref_top_k_tokens[ref_topk_start..ref_topk_start+top_k]
+            .iter()
+            .map(|&x| x as u32)
+            .collect();
+        let ref_argmax = ref_argmax_tokens[i];
+
+        // Check argmax match
+        if hip_argmax == ref_argmax {
+            argmax_matches += 1;
+        }
+
+        // Check if HIP argmax is in reference top-k
+        if ref_topk.contains(&hip_argmax) {
+            topk_matches += 1;
+        }
+
+        // Check if ref argmax is in HIP top-10
+        if hip_topk.contains(&ref_argmax) {
+            in_top10_matches += 1;
+        }
+
+        // TEACHER FORCING: always use reference token for next step
+        current_token = ref_argmax;
+
+        // Log first few and periodic steps
+        if i < 10 || i % 20 == 0 {
+            let match_str = if hip_argmax == ref_argmax { "MATCH" } else { "MISS" };
+            // Find rank of reference token in HIP distribution
+            let ref_rank = indices.iter().position(|&x| x as u32 == ref_argmax).unwrap_or(vocab_size);
+            println!("Step {:3}: HIP={:5} Ref={:5} [{}] ref_rank={:4} hip_topk={:?}",
+                i, hip_argmax, ref_argmax, match_str, ref_rank, &hip_topk[..3.min(hip_topk.len())]);
+        }
+    }
+
+    // Calculate match rates
+    let argmax_rate = argmax_matches as f64 / num_tokens as f64 * 100.0;
+    let topk_rate = topk_matches as f64 / num_tokens as f64 * 100.0;
+    let in_top10_rate = in_top10_matches as f64 / num_tokens as f64 * 100.0;
+
+    println!("\n=== Teacher Forcing Results ===");
+    println!("Argmax matches: {}/{} ({:.1}%)", argmax_matches, num_tokens, argmax_rate);
+    println!("HIP argmax in ref top-k:  {}/{} ({:.1}%)", topk_matches, num_tokens, topk_rate);
+    println!("Ref argmax in HIP top-10: {}/{} ({:.1}%)", in_top10_matches, num_tokens, in_top10_rate);
+    println!("\nThis shows per-step accuracy without error compounding.");
+
+    // This test doesn't enforce the 90% threshold - it's for diagnostics
+    // The threshold is enforced by test_generation_topk_accuracy
+}
+
+/// Debug test to compare HIP vs Python state after step 0
+#[test]
+#[cfg(feature = "hip")]
+fn test_hip_step1_logits_debug() {
+    use web_rwkv::hip::{HipRuntime, Rwkv7Hip};
+    use std::path::Path;
+
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    if !Path::new(model_path).exists() {
+        eprintln!("Model not found");
+        return;
+    }
+
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let n_head = model.info.n_head;
+    let head_size = model.info.head_size;
+    let runtime = HipRuntime::new(model, 1);
+
+    // Process BOS
+    let _ = runtime.infer_one(&[1]).expect("Failed to infer BOS");
+
+    // Get state after BOS
+    let state_bos = runtime.get_state_snapshot();
+    let att_state_bos = &state_bos.att_states[0];
+    let bos_min = att_state_bos.iter().cloned().fold(f32::INFINITY, f32::min);
+    let bos_max = att_state_bos.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let bos_mean: f32 = att_state_bos.iter().sum::<f32>() / att_state_bos.len() as f32;
+    println!("\n=== HIP State after BOS (layer 0) ===");
+    println!("  Range: [{:.6}, {:.6}]", bos_min, bos_max);
+    println!("  Mean: {:.6}", bos_mean);
+    println!("  Python reference: Range: [-1.563497, 1.500008], Mean: 0.000066");
+
+    // Process token 510
+    let logits_510 = runtime.infer_one(&[510]).expect("Failed to infer 510");
+    let logits_510_data = logits_510.data();
+
+    // Get state after step 0 (BOS + 510)
+    let state_step0 = runtime.get_state_snapshot();
+    let att_state_l0 = &state_step0.att_states[0];
+
+    // State is [N, N, H, B] = [head_size, head_size, n_head, batch]
+    // batch=1, so just [N, N, H]
+    println!("\n=== HIP State after Step 0, Layer 0 ===");
+    println!("  att_state length: {} (expected: {})", att_state_l0.len(), head_size * head_size * n_head);
+
+    // Calculate state stats
+    let state_min = att_state_l0.iter().cloned().fold(f32::INFINITY, f32::min);
+    let state_max = att_state_l0.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let state_mean: f32 = att_state_l0.iter().sum::<f32>() / att_state_l0.len() as f32;
+    println!("  Range: [{:.6}, {:.6}]", state_min, state_max);
+    println!("  Mean: {:.6}", state_mean);
+
+    // Python reference (from /tmp/python_ref_state.npz):
+    // Range: [-0.186871, 0.391209], Mean: -0.000015
+    println!("\n  Python reference:");
+    println!("    Range: [-0.186871, 0.391209], Mean: -0.000015");
+
+    // Print first few values for comparison
+    // HIP state is column-major [N, N, H]: element [i, j, h] at index i + j*N + h*N*N
+    println!("\n  First head, first 3x3 elements (HIP):");
+    for i in 0..3 {
+        let mut row = Vec::new();
+        for j in 0..3 {
+            let idx = i + j * head_size + 0 * head_size * head_size;
+            row.push(format!("{:11.6e}", att_state_l0[idx]));
+        }
+        println!("    [{}]", row.join(", "));
+    }
+
+    // Python expected (first head, first 3x3):
+    // [[-4.78339862e-05 -2.83659920e-05 -5.33099053e-03]
+    //  [-1.97875328e-04 -1.15250135e-04 -3.39745879e-02]
+    //  [ 1.97507761e-05  1.23245773e-05 -1.28793705e-03]]
+    println!("\n  Python reference (first head, first 3x3):");
+    println!("    [-4.78339862e-05, -2.83659920e-05, -5.33099053e-03]");
+    println!("    [-1.97875328e-04, -1.15250135e-04, -3.39745879e-02]");
+    println!("    [ 1.97507761e-05,  1.23245773e-05, -1.28793705e-03]");
+
+    // Find argmax for step 0
+    let (argmax0, max_val0) = logits_510_data.iter()
+        .enumerate()
+        .fold((0, f32::NEG_INFINITY), |(max_idx, max_val), (idx, &val)| {
+            if val > max_val { (idx, val) } else { (max_idx, max_val) }
+        });
+
+    println!("\n=== HIP Step 0 (after token 510) ===");
+    println!("  Argmax: {} (logit = {:.4})", argmax0, max_val0);
+    println!("  Logit[11]: {:.4}", logits_510_data[11]);
+    println!("  Logit[47]: {:.4}", logits_510_data[47]);
+
+    // Process token 11
+    let logits_11 = runtime.infer_one(&[11]).expect("Failed to infer 11");
+    let logits_11_data = logits_11.data();
+
+    // Find argmax for step 1
+    let (argmax1, max_val1) = logits_11_data.iter()
+        .enumerate()
+        .fold((0, f32::NEG_INFINITY), |(max_idx, max_val), (idx, &val)| {
+            if val > max_val { (idx, val) } else { (max_idx, max_val) }
+        });
+
+    println!("\n=== HIP Step 1 (after token 11) ===");
+    println!("  Argmax: {} (logit = {:.4})", argmax1, max_val1);
+    println!("  Logit[47]: {:.4} (Python argmax)", logits_11_data[47]);
+    println!("  Logit[51]: {:.4} (HIP argmax in autoregressive)", logits_11_data[51]);
+
+    // Get top-10
+    let mut indices: Vec<usize> = (0..65536).collect();
+    indices.sort_by(|&a, &b| logits_11_data[b].partial_cmp(&logits_11_data[a]).unwrap());
+
+    println!("  HIP Top-10: {:?}", &indices[..10]);
+
+    // Find rank of key tokens
+    let rank_47 = indices.iter().position(|&x| x == 47).unwrap_or(99999);
+    let rank_51 = indices.iter().position(|&x| x == 51).unwrap_or(99999);
+    println!("  Rank of token 47: {}", rank_47);
+    println!("  Rank of token 51: {}", rank_51);
+
+    // Load Python logits for comparison if available
+    if Path::new("/tmp/python_step1_logits.npy").exists() {
+        println!("\n=== Comparison with Python ===");
+        // Note: We'd need a numpy reader here, skipping for now
+        println!("  Python reference: argmax=47, token 51 at rank 271");
+        println!("  HIP result:       argmax={}, token 47 at rank {}", argmax1, rank_47);
+    }
+
+    // Check logit statistics
+    let logit_max = logits_11_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let logit_min = logits_11_data.iter().cloned().fold(f32::INFINITY, f32::min);
+    let logit_mean: f32 = logits_11_data.iter().sum::<f32>() / logits_11_data.len() as f32;
+
+    println!("\n=== Logit Statistics ===");
+    println!("  Range: [{:.4}, {:.4}]", logit_min, logit_max);
+    println!("  Mean: {:.4}", logit_mean);
 }

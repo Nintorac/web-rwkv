@@ -49,7 +49,7 @@ __global__ void kernel_decay_exp_f32(const float* __restrict__ input,
         } else if (x < -80.0f) {
             output[idx] = 1.0f;
         } else {
-            output[idx] = __expf(-__expf(x));
+            output[idx] = expf(-expf(x));
         }
     }
 }
@@ -117,8 +117,8 @@ __global__ void kernel_sigmoid_f32(const float* __restrict__ input,
         // Numerically stable sigmoid:
         // For large positive x: 1 / (1 + exp(-x)) ≈ 1
         // For large negative x: 1 / (1 + exp(-x)) ≈ 0
-        // Using __expf for fast math on GPU
-        output[idx] = 1.0f / (1.0f + __expf(-x));
+        // Using expf (not __expf) for full FP32 precision
+        output[idx] = 1.0f / (1.0f + expf(-x));
     }
 }
 
@@ -188,7 +188,7 @@ __global__ void kernel_softplus_decay_f32(const float* __restrict__ input,
             // For large negative x, log(sigmoid(x)) ≈ x
             log_sigmoid = x;
         } else {
-            log_sigmoid = -__logf(1.0f + __expf(-x));
+            log_sigmoid = -logf(1.0f + expf(-x));
         }
         output[idx] = log_sigmoid - 0.5f;
     }
@@ -663,7 +663,9 @@ __global__ void kernel_channel_mix_state_f32(
         int offset = b * T * C + t * C + c;
         float curr = x[offset];
 
-        // Token shift: blend current with previous
+        // Token shift: blend current with previous (RWKV convention)
+        // lerp(curr, prev, mix) = curr + mix * (prev - curr)
+        // mix=0 -> curr (use current), mix=1 -> prev (use previous)
         output[offset] = curr + mix_val * (prev - curr);
 
         prev = curr;
@@ -916,12 +918,13 @@ __global__ void kernel_wkv7_f32(
 
     if (i >= N) return;
 
-    // Each thread maintains its own state row
+    // Each thread maintains its own state row (query position i)
     float state[WKV7_HEAD_SIZE];
 
-    // Load initial state: state_in has shape [N, N, H, B]
-    // For row i of head hh, batch bb:
-    // state_in[j, i, hh, bb] is at: j + N*(i + N*(hh + H*bb))
+    // Load initial state: state_in has shape [N, N, H, B] (column-major)
+    // In web-rwkv convention: [key/col, query/row, head, batch]
+    // For query position i, key position j, head hh, batch bb:
+    // state_in[j, i, hh, bb] is at: j + N*i + N*N*hh + N*N*H*bb
     int state_base = i*N + hh*N*N + bb*N*N*H;
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
@@ -982,7 +985,8 @@ __global__ void kernel_wkv7_f32(
         output[ind] = y;
     }
 
-    // Save final state
+    // Save final state: same layout as input
+    // state_out[j, i, hh, bb] at: j + N*i + N*N*hh + N*N*H*bb
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
         state_out[j + state_base] = state[j];
@@ -1053,12 +1057,13 @@ __global__ void kernel_wkv7_f32_masked(
 
     int real_len = lengths[bb];
 
-    // Each thread maintains its own state row
+    // Each thread maintains its own state row (query position i)
     float state[WKV7_HEAD_SIZE];
 
-    // Load initial state: state_in has shape [N, N, H, B]
-    // For row i of head hh, batch bb:
-    // state_in[j, i, hh, bb] is at: j + N*(i + N*(hh + H*bb))
+    // Load initial state: state_in has shape [N, N, H, B] (column-major)
+    // In web-rwkv convention: [key/col, query/row, head, batch]
+    // For query position i, key position j, head hh, batch bb:
+    // state_in[j, i, hh, bb] is at: j + N*i + N*N*hh + N*N*H*bb
     int state_base = i*N + hh*N*N + bb*N*N*H;
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
@@ -1122,7 +1127,8 @@ __global__ void kernel_wkv7_f32_masked(
         // For padding positions: state unchanged, output undefined
     }
 
-    // Save final state
+    // Save final state: same layout as input
+    // state_out[j, i, hh, bb] at: j + N*i + N*N*hh + N*N*H*bb
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
         state_out[j + state_base] = state[j];
