@@ -3,6 +3,10 @@
 //! This module provides a HIP-based backend for running RWKV inference on AMD GPUs.
 //! It requires a ROCm/TheRock installation with support for your GPU architecture.
 
+mod runtime;
+
+pub use runtime::HipRuntime;
+
 use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 
