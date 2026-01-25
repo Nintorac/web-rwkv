@@ -3075,6 +3075,8 @@ pub struct HipState {
     pub att_shift_states: Vec<Vec<f32>>,
     /// FFN token shift state per layer: [n_embd * batch] per layer
     pub ffn_states: Vec<Vec<f32>>,
+    /// Value residual from first layer for RWKV7, persisted across chunks: [n_embd * batch]
+    pub v_first: Option<Vec<f32>>,
 }
 
 impl HipState {
@@ -3100,6 +3102,7 @@ impl HipState {
             ffn_states: (0..n_layer)
                 .map(|_| vec![0.0f32; n_embd * batch_size])
                 .collect(),
+            v_first: None,
         }
     }
 
@@ -3114,6 +3117,7 @@ impl HipState {
         for state in &mut self.ffn_states {
             state.fill(0.0);
         }
+        self.v_first = None;
     }
 }
 
@@ -5097,7 +5101,36 @@ mod tests {
         assert!(state.att_states.iter().all(|s| s.iter().all(|&x| x == 0.0)));
         assert!(state.att_shift_states.iter().all(|s| s.iter().all(|&x| x == 0.0)));
         assert!(state.ffn_states.iter().all(|s| s.iter().all(|&x| x == 0.0)));
+        assert!(state.v_first.is_none());
 
         println!("HipState reset test PASSED");
+    }
+
+    /// Test HipState v_first persistence across operations.
+    #[test]
+    fn test_hip_state_v_first_persistence() {
+        let info = Rwkv7ModelInfo {
+            n_layer: 2,
+            n_embd: 64,
+            n_head: 2,
+            head_size: 32,
+            n_vocab: 100,
+            n_hidden: 128,
+        };
+
+        // Fresh state should have v_first = None
+        let mut state = HipState::new(&info, 1);
+        assert!(state.v_first.is_none(), "New state should have v_first = None");
+
+        // Set v_first and verify it persists
+        state.v_first = Some(vec![1.0f32; 64]);
+        assert!(state.v_first.is_some(), "v_first should persist after assignment");
+        assert_eq!(state.v_first.as_ref().unwrap().len(), 64);
+
+        // Reset should clear v_first
+        state.reset();
+        assert!(state.v_first.is_none(), "Reset should clear v_first to None");
+
+        println!("HipState v_first persistence test PASSED");
     }
 }
