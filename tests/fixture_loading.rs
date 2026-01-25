@@ -2027,3 +2027,228 @@ fn test_rwkv7_hip_model_forward_pass() {
         }
     }
 }
+
+// ============================================================================
+// WKV7 Masked Kernel Tests
+// ============================================================================
+
+/// Test that masked WKV7 preserves state when padding is present.
+/// Verifies: state(seq) == state(seq + padding) when length mask is applied.
+#[test]
+#[cfg(feature = "hip")]
+fn test_wkv7_masked_state_preservation() {
+    let n = 64;   // head_size (must be 64)
+    let h = 4;    // n_heads
+    let t_short = 3;  // real sequence length
+    let t_padded = 5; // padded length
+    let batch = 1;
+
+    // Use deterministic RNG for reproducibility
+    let mut rng = fastrand::Rng::with_seed(42);
+
+    // Generate random input data for the short (unpadded) sequence
+    let input_len_short = n * h * t_short * batch;
+    let state_len = n * n * h * batch;
+
+    let mut gen_vec = |len: usize| -> Vec<f32> {
+        (0..len).map(|_| rng.f32() * 2.0 - 1.0).collect()
+    };
+
+    let w_decay_short = gen_vec(input_len_short);
+    let q_short = gen_vec(input_len_short);
+    let k_short = gen_vec(input_len_short);
+    let v_short = gen_vec(input_len_short);
+    let a_short = gen_vec(input_len_short);
+    let b_short = gen_vec(input_len_short);
+    let state_in = gen_vec(state_len);
+
+    // Run non-masked kernel on short sequence (T=3)
+    let (output_short, state_short) = web_rwkv::hip::hip_wkv7(
+        &w_decay_short, &q_short, &k_short, &v_short, &a_short, &b_short,
+        &state_in, n, h, t_short, batch
+    ).expect("wkv7 short sequence failed");
+
+    // Create padded inputs (T=5) by extending with zeros for padding positions
+    let input_len_padded = n * h * t_padded * batch;
+    let mut w_decay_padded = vec![0.0f32; input_len_padded];
+    let mut q_padded = vec![0.0f32; input_len_padded];
+    let mut k_padded = vec![0.0f32; input_len_padded];
+    let mut v_padded = vec![0.0f32; input_len_padded];
+    let mut a_padded = vec![0.0f32; input_len_padded];
+    let mut b_padded = vec![0.0f32; input_len_padded];
+
+    // Copy real data into padded arrays
+    // Layout is [N, H, T, B], so we need to interleave correctly
+    for bb in 0..batch {
+        for t in 0..t_short {
+            for hh in 0..h {
+                for nn in 0..n {
+                    let short_idx = nn + n * (hh + h * (t + t_short * bb));
+                    let padded_idx = nn + n * (hh + h * (t + t_padded * bb));
+                    w_decay_padded[padded_idx] = w_decay_short[short_idx];
+                    q_padded[padded_idx] = q_short[short_idx];
+                    k_padded[padded_idx] = k_short[short_idx];
+                    v_padded[padded_idx] = v_short[short_idx];
+                    a_padded[padded_idx] = a_short[short_idx];
+                    b_padded[padded_idx] = b_short[short_idx];
+                }
+            }
+        }
+    }
+
+    // Run masked kernel on padded sequence with length=3
+    let lengths = vec![t_short as i32];
+    let (output_padded, state_padded) = web_rwkv::hip::hip_wkv7_masked(
+        &w_decay_padded, &q_padded, &k_padded, &v_padded, &a_padded, &b_padded,
+        &state_in, &lengths, n, h, t_padded, batch
+    ).expect("wkv7_masked padded sequence failed");
+
+    // States must match!
+    println!("test_wkv7_masked_state_preservation:");
+    println!("  Short sequence: T={}, state elements={}", t_short, state_short.len());
+    println!("  Padded sequence: T={} (real_len={}), state elements={}", t_padded, t_short, state_padded.len());
+
+    // Verify states are equal within tolerance
+    let mut max_diff = 0.0f32;
+    for (i, (&s1, &s2)) in state_short.iter().zip(state_padded.iter()).enumerate() {
+        let diff = (s1 - s2).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        assert!(
+            diff < 1e-5,
+            "State mismatch at index {}: short={}, padded={}, diff={}",
+            i, s1, s2, diff
+        );
+    }
+    println!("  Max state difference: {}", max_diff);
+
+    // Also verify outputs match for real positions
+    for bb in 0..batch {
+        for t in 0..t_short {
+            for hh in 0..h {
+                for nn in 0..n {
+                    let short_idx = nn + n * (hh + h * (t + t_short * bb));
+                    let padded_idx = nn + n * (hh + h * (t + t_padded * bb));
+                    let diff = (output_short[short_idx] - output_padded[padded_idx]).abs();
+                    assert!(
+                        diff < 1e-5,
+                        "Output mismatch at t={}, h={}, n={}: short={}, padded={}, diff={}",
+                        t, hh, nn, output_short[short_idx], output_padded[padded_idx], diff
+                    );
+                }
+            }
+        }
+    }
+
+    println!("  PASSED: Masked kernel preserves state correctly!");
+}
+
+/// Test masked WKV7 with batched sequences of different lengths.
+#[test]
+#[cfg(feature = "hip")]
+fn test_wkv7_masked_batched_different_lengths() {
+    let n = 64;   // head_size
+    let h = 2;    // n_heads (smaller for faster test)
+    let t_max = 5; // max/padded length
+    let batch = 2;
+    let lengths = vec![3i32, 5i32];  // batch 0: len=3, batch 1: len=5
+
+    let mut rng = fastrand::Rng::with_seed(123);
+
+    let input_len = n * h * t_max * batch;
+    let state_len = n * n * h * batch;
+
+    let mut gen_vec = |len: usize| -> Vec<f32> {
+        (0..len).map(|_| rng.f32() * 2.0 - 1.0).collect()
+    };
+
+    let w_decay = gen_vec(input_len);
+    let q = gen_vec(input_len);
+    let k = gen_vec(input_len);
+    let v = gen_vec(input_len);
+    let a = gen_vec(input_len);
+    let b = gen_vec(input_len);
+    let state_in = gen_vec(state_len);
+
+    // Run masked kernel on batched sequences
+    let (_output, state_batched) = web_rwkv::hip::hip_wkv7_masked(
+        &w_decay, &q, &k, &v, &a, &b,
+        &state_in, &lengths, n, h, t_max, batch
+    ).expect("wkv7_masked batched failed");
+
+    // For batch 0 (len=3): run unbatched with T=3 to verify state matches
+    let input_len_b0 = n * h * 3 * 1;
+    let state_len_single = n * n * h * 1;
+
+    // Extract batch 0 inputs (first 3 timesteps)
+    let mut w_decay_b0 = vec![0.0f32; input_len_b0];
+    let mut q_b0 = vec![0.0f32; input_len_b0];
+    let mut k_b0 = vec![0.0f32; input_len_b0];
+    let mut v_b0 = vec![0.0f32; input_len_b0];
+    let mut a_b0 = vec![0.0f32; input_len_b0];
+    let mut b_b0 = vec![0.0f32; input_len_b0];
+    let mut state_in_b0 = vec![0.0f32; state_len_single];
+
+    for t in 0..3 {
+        for hh in 0..h {
+            for nn in 0..n {
+                let src_idx = nn + n * (hh + h * (t + t_max * 0));  // batch 0
+                let dst_idx = nn + n * (hh + h * (t + 3 * 0));
+                w_decay_b0[dst_idx] = w_decay[src_idx];
+                q_b0[dst_idx] = q[src_idx];
+                k_b0[dst_idx] = k[src_idx];
+                v_b0[dst_idx] = v[src_idx];
+                a_b0[dst_idx] = a[src_idx];
+                b_b0[dst_idx] = b[src_idx];
+            }
+        }
+    }
+
+    // Extract batch 0 initial state
+    for hh in 0..h {
+        for ni in 0..n {
+            for nj in 0..n {
+                let src_idx = nj + n * (ni + n * (hh + h * 0));  // batch 0
+                let dst_idx = nj + n * (ni + n * (hh + h * 0));
+                state_in_b0[dst_idx] = state_in[src_idx];
+            }
+        }
+    }
+
+    let (_output_b0, state_b0) = web_rwkv::hip::hip_wkv7(
+        &w_decay_b0, &q_b0, &k_b0, &v_b0, &a_b0, &b_b0,
+        &state_in_b0, n, h, 3, 1
+    ).expect("wkv7 unbatched batch0 failed");
+
+    // Extract batch 0 state from batched result
+    let mut state_batched_b0 = vec![0.0f32; state_len_single];
+    for hh in 0..h {
+        for ni in 0..n {
+            for nj in 0..n {
+                let src_idx = nj + n * (ni + n * (hh + h * 0));  // batch 0
+                state_batched_b0[src_idx] = state_batched[src_idx];
+            }
+        }
+    }
+
+    println!("test_wkv7_masked_batched_different_lengths:");
+    println!("  Batch 0: len=3 (padded to 5)");
+    println!("  Batch 1: len=5 (no padding)");
+
+    // Verify batch 0 state matches unbatched result
+    let mut max_diff = 0.0f32;
+    for (i, (&s1, &s2)) in state_b0.iter().zip(state_batched_b0.iter()).enumerate() {
+        let diff = (s1 - s2).abs();
+        if diff > max_diff {
+            max_diff = diff;
+        }
+        assert!(
+            diff < 1e-5,
+            "Batch 0 state mismatch at index {}: unbatched={}, batched={}, diff={}",
+            i, s1, s2, diff
+        );
+    }
+    println!("  Max batch 0 state difference: {}", max_diff);
+    println!("  PASSED: Batched masked kernel handles different lengths correctly!");
+}

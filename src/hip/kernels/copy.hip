@@ -1026,6 +1026,147 @@ hipError_t launch_wkv7_f32(
     return hipGetLastError();
 }
 
+// Length-masked WKV7 kernel: skips state updates for padding positions
+// Preserves invariant: state(seq + padding) == state(seq)
+__global__ void kernel_wkv7_f32_masked(
+    const float* __restrict__ w_decay,    // [N, H, T, B] - decay values
+    const float* __restrict__ q,          // [N, H, T, B]
+    const float* __restrict__ k,          // [N, H, T, B]
+    const float* __restrict__ v,          // [N, H, T, B]
+    const float* __restrict__ a,          // [N, H, T, B]
+    const float* __restrict__ b,          // [N, H, T, B]
+    const float* __restrict__ state_in,   // [N, N, H, B]
+    float* __restrict__ output,           // [N, H, T, B]
+    float* __restrict__ state_out,        // [N, N, H, B]
+    const int* __restrict__ lengths,      // [B] - real sequence length per batch
+    int N,    // head_size (64)
+    int H,    // n_heads
+    int T,    // tokens (padded length)
+    int B     // batch
+) {
+    // Thread i handles row i of the state matrix for a specific (head, batch)
+    int i = threadIdx.x;  // position within head (0..N-1)
+    int hh = blockIdx.x;  // head index
+    int bb = blockIdx.y;  // batch index
+
+    if (i >= N) return;
+
+    int real_len = lengths[bb];
+
+    // Each thread maintains its own state row
+    float state[WKV7_HEAD_SIZE];
+
+    // Load initial state: state_in has shape [N, N, H, B]
+    // For row i of head hh, batch bb:
+    // state_in[j, i, hh, bb] is at: j + N*(i + N*(hh + H*bb))
+    int state_base = i*N + hh*N*N + bb*N*N*H;
+    #pragma unroll
+    for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+        state[j] = state_in[j + state_base];
+    }
+
+    // Shared memory for per-token vectors
+    __shared__ float sh_q[WKV7_HEAD_SIZE];
+    __shared__ float sh_k[WKV7_HEAD_SIZE];
+    __shared__ float sh_w[WKV7_HEAD_SIZE];
+    __shared__ float sh_a[WKV7_HEAD_SIZE];
+    __shared__ float sh_b[WKV7_HEAD_SIZE];
+
+    // Temporary array for pairwise summation (per-thread)
+    float tmp[WKV7_HEAD_SIZE];
+
+    // Process each timestep
+    for (int t = 0; t < T; t++) {
+        // Input index for this (n, h, t, b) element
+        // Shape [N, H, T, B]: ind = n + N*(h + H*(t + T*b))
+        int ind = i + N*(hh + H*(t + T*bb));
+
+        // Load vectors into shared memory (all threads must participate)
+        __syncthreads();
+        sh_q[i] = q[ind];
+        sh_w[i] = w_decay[ind];
+        sh_k[i] = k[ind];
+        sh_a[i] = a[ind];
+        sh_b[i] = b[ind];
+        __syncthreads();
+
+        // Only process real tokens, skip padding
+        if (t < real_len) {
+            // Load this thread's v value
+            float v_val = v[ind];
+
+            // Step 1: Compute sa = sum(a[j] * state[j]) using pairwise summation
+            #pragma unroll
+            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+                tmp[j] = sh_a[j] * state[j];
+            }
+            float sa = pairwise_sum_64(tmp);
+
+            // Step 2: Update state (element-wise)
+            // state[j] = state[j] * w[j] + sa * b[j] + k[j] * v
+            #pragma unroll
+            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+                state[j] = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
+            }
+
+            // Step 3: Compute output y = sum(state[j] * q[j]) using pairwise summation
+            #pragma unroll
+            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+                tmp[j] = state[j] * sh_q[j];
+            }
+            float y = pairwise_sum_64(tmp);
+
+            // Write output
+            output[ind] = y;
+        }
+        // For padding positions: state unchanged, output undefined
+    }
+
+    // Save final state
+    #pragma unroll
+    for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+        state_out[j + state_base] = state[j];
+    }
+}
+
+hipError_t launch_wkv7_f32_masked(
+    const float* w_decay,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* a,
+    const float* b,
+    const float* state_in,
+    float* output,
+    float* state_out,
+    const int* lengths,  // [B] real sequence length per batch
+    int N,    // head_size
+    int H,    // n_heads
+    int T,    // tokens (padded)
+    int B,    // batch
+    hipStream_t stream
+) {
+    if (N <= 0 || H <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+
+    // Only support N=64 for now (matches reference)
+    if (N != WKV7_HEAD_SIZE) {
+        return hipErrorInvalidValue;
+    }
+
+    // Launch grid: one block per (head, batch) pair
+    // Block: N threads (one per state row)
+    dim3 grid(H, B);
+    dim3 block(N);
+
+    hipLaunchKernelGGL(kernel_wkv7_f32_masked, grid, block, 0, stream,
+                       w_decay, q, k, v, a, b, state_in, output, state_out,
+                       lengths, N, H, T, B);
+
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

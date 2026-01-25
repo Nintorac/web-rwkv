@@ -203,6 +203,23 @@ extern "C" {
         b: c_int,    // batch
         stream: HipStream
     ) -> HipError;
+    fn launch_wkv7_f32_masked(
+        w_decay: *const f32,   // [N, H, T, B] - pre-computed decay
+        q: *const f32,         // [N, H, T, B]
+        k: *const f32,         // [N, H, T, B]
+        v: *const f32,         // [N, H, T, B]
+        a: *const f32,         // [N, H, T, B]
+        b: *const f32,         // [N, H, T, B]
+        state_in: *const f32,  // [N, N, H, B]
+        output: *mut f32,      // [N, H, T, B]
+        state_out: *mut f32,   // [N, N, H, B]
+        lengths: *const c_int, // [B] - real sequence length per batch
+        n: c_int,    // head_size
+        h: c_int,    // n_heads
+        t: c_int,    // tokens (padded)
+        b: c_int,    // batch
+        stream: HipStream
+    ) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -2483,6 +2500,209 @@ pub fn hip_wkv7(
     wkv7_f32(
         &d_w_decay, &d_q, &d_k, &d_v, &d_a, &d_b,
         &d_state_in, &mut d_output, &mut d_state_out, &stream
+    )?;
+
+    let output = d_output.to_vec(&stream)?;
+    let state_out = d_state_out.to_vec(&stream)?;
+
+    Ok((output, state_out))
+}
+
+/// WKV7 kernel with length masking for variable-length batched sequences.
+/// Skips state updates for padding positions, preserving: state(seq + padding) == state(seq).
+///
+/// # Arguments
+/// * `w_decay` - Pre-computed decay tensor [N, H, T, B]
+/// * `q`, `k`, `v`, `a`, `b` - Input tensors [N, H, T, B]
+/// * `state_in` - Input state tensor [N, N, H, B]
+/// * `output` - Output tensor [N, H, T, B]
+/// * `state_out` - Output state tensor [N, N, H, B]
+/// * `lengths` - Real sequence length per batch [B] (as i32)
+/// * `stream` - HIP stream
+pub fn wkv7_f32_masked(
+    w_decay: &TensorHip<f32>,
+    q: &TensorHip<f32>,
+    k: &TensorHip<f32>,
+    v: &TensorHip<f32>,
+    a: &TensorHip<f32>,
+    b: &TensorHip<f32>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    state_out: &mut TensorHip<f32>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    // Input shape: [N, H, T, B]
+    let n = w_decay.shape()[0];  // head_size
+    let h = w_decay.shape()[1];  // n_heads
+    let t = w_decay.shape()[2];  // tokens (padded)
+    let b_size = w_decay.shape()[3];  // batch
+
+    // Validate input shapes
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape || k.shape() != input_shape || v.shape() != input_shape
+        || a.shape() != input_shape || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
+                w_decay.shape(), q.shape(), k.shape(), v.shape(), a.shape(), b.shape()
+            ),
+        });
+    }
+
+    // Validate output shape
+    if output.shape() != input_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                input_shape, output.shape()
+            ),
+        });
+    }
+
+    // Validate state shapes: [N, N, H, B]
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_in shape mismatch: expected {}, got {}",
+                state_shape, state_in.shape()
+            ),
+        });
+    }
+    if state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_out shape mismatch: expected {}, got {}",
+                state_shape, state_out.shape()
+            ),
+        });
+    }
+
+    // Validate lengths shape: should have b_size elements
+    let lengths_len = lengths.shape().len();
+    if lengths_len != b_size {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "lengths size mismatch: expected {}, got {}",
+                b_size, lengths_len
+            ),
+        });
+    }
+
+    // Check contiguity
+    if !w_decay.is_contiguous() || !q.is_contiguous() || !k.is_contiguous()
+        || !v.is_contiguous() || !a.is_contiguous() || !b.is_contiguous()
+        || !state_in.is_contiguous() || !output.is_contiguous() || !state_out.is_contiguous()
+        || !lengths.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_f32_masked requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_f32_masked(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            lengths.as_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute WKV7 with length masking on host data, returning (output, state_out).
+/// This is a convenience function for testing.
+///
+/// # Arguments
+/// * `w_decay` - Pre-computed decay data [N, H, T, B] flattened
+/// * `q`, `k`, `v`, `a`, `b` - Input data [N, H, T, B] flattened
+/// * `state_in` - Input state [N, N, H, B] flattened
+/// * `lengths` - Real sequence length per batch [B]
+/// * `n` - head_size
+/// * `h` - n_heads
+/// * `t` - tokens (padded)
+/// * `batch` - batch size
+pub fn hip_wkv7_masked(
+    w_decay: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    a: &[f32],
+    b: &[f32],
+    state_in: &[f32],
+    lengths: &[i32],
+    n: usize,
+    h: usize,
+    t: usize,
+    batch: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let input_len = n * h * t * batch;
+    let state_len = n * n * h * batch;
+
+    if w_decay.len() != input_len || q.len() != input_len || k.len() != input_len
+        || v.len() != input_len || a.len() != input_len || b.len() != input_len
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}, got w={}, q={}, k={}, v={}, a={}, b={}",
+                input_len, w_decay.len(), q.len(), k.len(), v.len(), a.len(), b.len()
+            ),
+        });
+    }
+    if state_in.len() != state_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("state_in size mismatch: expected {}, got {}", state_len, state_in.len()),
+        });
+    }
+    if lengths.len() != batch {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!("lengths size mismatch: expected {}, got {}", batch, lengths.len()),
+        });
+    }
+
+    let stream = Stream::null();
+
+    let input_shape = TensorShape::new(n, h, t, batch);
+    let state_shape = TensorShape::new(n, n, h, batch);
+    let lengths_shape = TensorShape::new(batch, 1, 1, 1);
+
+    let d_w_decay = TensorHip::from_slice(w_decay, input_shape, &stream)?;
+    let d_q = TensorHip::from_slice(q, input_shape, &stream)?;
+    let d_k = TensorHip::from_slice(k, input_shape, &stream)?;
+    let d_v = TensorHip::from_slice(v, input_shape, &stream)?;
+    let d_a = TensorHip::from_slice(a, input_shape, &stream)?;
+    let d_b = TensorHip::from_slice(b, input_shape, &stream)?;
+    let d_state_in = TensorHip::from_slice(state_in, state_shape, &stream)?;
+    let d_lengths = TensorHip::from_slice(lengths, lengths_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(input_shape)?;
+    let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
+
+    wkv7_f32_masked(
+        &d_w_decay, &d_q, &d_k, &d_v, &d_a, &d_b,
+        &d_state_in, &mut d_output, &mut d_state_out,
+        &d_lengths, &stream
     )?;
 
     let output = d_output.to_vec(&stream)?;
