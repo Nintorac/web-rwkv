@@ -3437,3 +3437,195 @@ fn test_hip_step1_logits_debug() {
     println!("  Range: [{:.4}, {:.4}]", logit_min, logit_max);
     println!("  Mean: {:.4}", logit_mean);
 }
+
+/// Test forward_with_state_masked with a single batch (length equals padded length).
+/// Verifies that forward_with_state_masked produces the same result as forward_with_state
+/// when the real length equals the padded length.
+#[test]
+#[cfg(feature = "hip")]
+fn test_forward_masked_single_batch() {
+    use web_rwkv::hip::{Rwkv7Hip, HipState};
+
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    if !std::path::Path::new(model_path).exists() {
+        eprintln!("Skipping test_forward_masked_single_batch: model not found");
+        return;
+    }
+
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+
+    // Test with a sequence of 5 tokens
+    let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let tokens_ref: Vec<&[u32]> = vec![&tokens[..]];
+    let lengths: Vec<usize> = vec![5]; // Real length equals padded length
+
+    // Run regular forward pass
+    let mut state1 = HipState::new(&model.info, 1);
+    let logits1 = model.forward_with_state(&tokens_ref, &mut state1).unwrap();
+
+    // Run masked forward pass with length == T
+    let mut state2 = HipState::new(&model.info, 1);
+    let logits2 = model.forward_with_state_masked(&tokens_ref, &lengths, &mut state2).unwrap();
+
+    // States should match exactly
+    let max_state_diff = state1.att_states[0].iter()
+        .zip(state2.att_states[0].iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    println!("test_forward_masked_single_batch:");
+    println!("  Max state diff: {:.6e}", max_state_diff);
+    assert!(max_state_diff < 1e-6, "States should match exactly when length == T");
+
+    // Logits should match exactly
+    let max_logit_diff = logits1.iter()
+        .zip(logits2.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    println!("  Max logit diff: {:.6e}", max_logit_diff);
+    assert!(max_logit_diff < 1e-6, "Logits should match exactly when length == T");
+
+    println!("  PASSED: forward_with_state_masked matches forward_with_state");
+}
+
+/// Test forward_with_state_masked with padded sequence.
+/// Verifies that state(seq + padding) == state(seq).
+#[test]
+#[cfg(feature = "hip")]
+fn test_forward_masked_state_preservation() {
+    use web_rwkv::hip::{Rwkv7Hip, HipState};
+
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    if !std::path::Path::new(model_path).exists() {
+        eprintln!("Skipping test_forward_masked_state_preservation: model not found");
+        return;
+    }
+
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+
+    // Process [1, 2, 3] without padding
+    let tokens_no_pad: Vec<u32> = vec![1, 2, 3];
+    let tokens_no_pad_ref: Vec<&[u32]> = vec![&tokens_no_pad[..]];
+    let mut state_no_pad = HipState::new(&model.info, 1);
+    let _logits_no_pad = model.forward_with_state(&tokens_no_pad_ref, &mut state_no_pad).unwrap();
+
+    // Process [1, 2, 3, 0, 0] with padding (real length = 3)
+    let tokens_padded: Vec<u32> = vec![1, 2, 3, 0, 0];
+    let tokens_padded_ref: Vec<&[u32]> = vec![&tokens_padded[..]];
+    let lengths: Vec<usize> = vec![3];
+    let mut state_padded = HipState::new(&model.info, 1);
+    let _logits_padded = model.forward_with_state_masked(&tokens_padded_ref, &lengths, &mut state_padded).unwrap();
+
+    // States should match
+    let max_att_state_diff = state_no_pad.att_states.iter()
+        .zip(state_padded.att_states.iter())
+        .map(|(a, b)| {
+            a.iter().zip(b.iter())
+                .map(|(&x, &y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        })
+        .fold(0.0f32, f32::max);
+
+    let max_ffn_state_diff = state_no_pad.ffn_states.iter()
+        .zip(state_padded.ffn_states.iter())
+        .map(|(a, b)| {
+            a.iter().zip(b.iter())
+                .map(|(&x, &y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        })
+        .fold(0.0f32, f32::max);
+
+    println!("test_forward_masked_state_preservation:");
+    println!("  Tokens without padding: [1, 2, 3]");
+    println!("  Tokens with padding:    [1, 2, 3, 0, 0] (real length=3)");
+    println!("  Max att state diff:     {:.6e}", max_att_state_diff);
+    println!("  Max ffn state diff:     {:.6e}", max_ffn_state_diff);
+
+    assert!(max_att_state_diff < 1e-5, "Attention states should match (padded vs unpadded)");
+    assert!(max_ffn_state_diff < 1e-5, "FFN states should match (padded vs unpadded)");
+
+    println!("  PASSED: state(seq + padding) == state(seq)");
+}
+
+/// Test forward_with_state_masked with variable-length batch.
+/// Verifies that each batch element's state matches unbatched processing.
+#[test]
+#[cfg(feature = "hip")]
+fn test_forward_masked_variable_batch() {
+    use web_rwkv::hip::{Rwkv7Hip, HipState};
+
+    let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+    if !std::path::Path::new(model_path).exists() {
+        eprintln!("Skipping test_forward_masked_variable_batch: model not found");
+        return;
+    }
+
+    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+
+    // Reference: process each sequence individually
+    let seq1: Vec<u32> = vec![1, 2, 3];
+    let seq2: Vec<u32> = vec![10, 20, 30, 40, 50];
+
+    let seq1_ref: Vec<&[u32]> = vec![&seq1[..]];
+    let mut state1_ref = HipState::new(&model.info, 1);
+    let _logits1 = model.forward_with_state(&seq1_ref, &mut state1_ref).unwrap();
+
+    let seq2_ref: Vec<&[u32]> = vec![&seq2[..]];
+    let mut state2_ref = HipState::new(&model.info, 1);
+    let _logits2 = model.forward_with_state(&seq2_ref, &mut state2_ref).unwrap();
+
+    // Batched with variable lengths
+    let seq1_padded: Vec<u32> = vec![1, 2, 3, 0, 0];     // len=3, padded to 5
+    let seq2_padded: Vec<u32> = vec![10, 20, 30, 40, 50]; // len=5
+    let tokens_batched: Vec<&[u32]> = vec![&seq1_padded[..], &seq2_padded[..]];
+    let lengths: Vec<usize> = vec![3, 5];
+
+    let mut state_batched = HipState::new(&model.info, 2);
+    let _logits_batched = model.forward_with_state_masked(&tokens_batched, &lengths, &mut state_batched).unwrap();
+
+    // Extract per-batch states and compare
+    let state_size_per_layer = model.info.head_size * model.info.head_size * model.info.n_head;
+
+    println!("test_forward_masked_variable_batch:");
+    println!("  Batch 0: [1, 2, 3] padded to [1, 2, 3, 0, 0]");
+    println!("  Batch 1: [10, 20, 30, 40, 50]");
+
+    // Compare batch 0 state with unbatched seq1
+    let mut max_diff_batch0: f32 = 0.0;
+    for layer in 0..model.info.n_layer {
+        let batch0_start = 0;
+        let batch0_end = state_size_per_layer;
+        let batch0_state = &state_batched.att_states[layer][batch0_start..batch0_end];
+        let ref_state = &state1_ref.att_states[layer][..];
+
+        let layer_diff = batch0_state.iter()
+            .zip(ref_state.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        max_diff_batch0 = max_diff_batch0.max(layer_diff);
+    }
+
+    // Compare batch 1 state with unbatched seq2
+    let mut max_diff_batch1: f32 = 0.0;
+    for layer in 0..model.info.n_layer {
+        let batch1_start = state_size_per_layer;
+        let batch1_end = 2 * state_size_per_layer;
+        let batch1_state = &state_batched.att_states[layer][batch1_start..batch1_end];
+        let ref_state = &state2_ref.att_states[layer][..];
+
+        let layer_diff = batch1_state.iter()
+            .zip(ref_state.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        max_diff_batch1 = max_diff_batch1.max(layer_diff);
+    }
+
+    println!("  Max state diff batch 0: {:.6e}", max_diff_batch0);
+    println!("  Max state diff batch 1: {:.6e}", max_diff_batch1);
+
+    assert!(max_diff_batch0 < 1e-5, "Batch 0 state should match unbatched [1,2,3]");
+    assert!(max_diff_batch1 < 1e-5, "Batch 1 state should match unbatched [10,20,30,40,50]");
+
+    println!("  PASSED: batched variable-length states match unbatched processing");
+}

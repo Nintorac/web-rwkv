@@ -2629,6 +2629,41 @@ pub fn wkv7_f32_masked(
     }
 }
 
+/// Extract shift states at the correct positions based on per-batch lengths.
+///
+/// For each batch element b, extracts x[:, length[b]-1, b] instead of x[:, T-1, b].
+/// This is used to correctly handle padded sequences where we want the state
+/// at the last valid position, not the last padded position.
+///
+/// # Arguments
+/// * `x` - Input tensor [C, T, B] flattened
+/// * `lengths` - Real sequence length per batch [B]
+/// * `c` - Embedding dimension
+/// * `t` - Padded sequence length
+/// * `b` - Batch size
+///
+/// # Returns
+/// State tensor [C, B] containing x[:, length[i]-1, i] for each batch i
+fn extract_shift_state_at_lengths(
+    x: &[f32],
+    lengths: &[usize],
+    c: usize,
+    t: usize,
+    b: usize,
+) -> Vec<f32> {
+    let mut state_out = vec![0.0f32; c * b];
+    for batch_idx in 0..b {
+        let time_idx = lengths[batch_idx] - 1; // Last valid position
+        for channel in 0..c {
+            // x layout: [C, T, B] = x[batch_idx * T * C + time_idx * C + channel]
+            let x_idx = batch_idx * t * c + time_idx * c + channel;
+            let state_idx = batch_idx * c + channel;
+            state_out[state_idx] = x[x_idx];
+        }
+    }
+    state_out
+}
+
 /// Compute WKV7 with length masking on host data, returning (output, state_out).
 /// This is a convenience function for testing.
 ///
@@ -3978,6 +4013,317 @@ impl Rwkv7Hip {
             let ffn_x_k = layer.ffn.x_k.to_vec(&stream)?;
             let (xk_ffn, new_ffn_state) = hip_channel_mix_state(&x_ln2, &state.ffn_states[layer_idx], &ffn_x_k, n_embd, t, b)?;
             state.ffn_states[layer_idx] = new_ffn_state;
+
+            // Key projection + squared ReLU
+            let ffn_w_k = layer.ffn.w_k.to_vec(&stream)?;
+            let k_ffn = hip_sgemm(&ffn_w_k, &xk_ffn, n_hidden, n_embd, t * b)?;
+            let k_sq = hip_squared_relu(&k_ffn)?;
+
+            // Value projection
+            let ffn_w_v = layer.ffn.w_v.to_vec(&stream)?;
+            let x_ffn_out = hip_sgemm(&ffn_w_v, &k_sq, n_embd, n_hidden, t * b)?;
+
+            // Residual
+            x = x.iter().zip(x_ffn_out.iter()).map(|(&a, &b)| a + b).collect();
+        }
+
+        // ==== Output Head ====
+        let ln_out_w = self.head.ln.weight.to_vec(&stream)?;
+        let ln_out_b = self.head.ln.bias.to_vec(&stream)?;
+        let x_ln_out = hip_layer_norm(&x, &ln_out_w, &ln_out_b, n_embd, t * b, 1e-5)?;
+
+        // Head projection
+        let head_w = self.head.w.to_vec(&stream)?;
+        let logits = hip_sgemm(&head_w, &x_ln_out, n_vocab, n_embd, t * b)?;
+
+        Ok(logits)
+    }
+
+    /// Forward pass with length masking for variable-length batched sequences.
+    ///
+    /// This method allows processing batches where sequences have different real lengths,
+    /// with padding to a common max length. The masked WKV7 kernel skips state updates
+    /// for padding positions, preserving the invariant: state(seq + padding) == state(seq).
+    ///
+    /// # Arguments
+    /// * `tokens` - Padded token sequences, all same length T
+    /// * `lengths` - Real sequence length per batch (lengths[b] <= T)
+    /// * `state` - Mutable state, updated in place
+    ///
+    /// # Returns
+    /// Logits tensor [vocab_size, T, B] - only positions < lengths[b] are valid for each batch
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let model = Rwkv7Hip::load("model.safetensors")?;
+    /// let mut state = HipState::new(&model.info, 2);
+    ///
+    /// // Batch with different lengths (padded with 0)
+    /// let seq1 = vec![1, 2, 3, 0, 0];     // real length = 3
+    /// let seq2 = vec![10, 20, 30, 40, 50]; // real length = 5
+    /// let tokens: Vec<&[u32]> = vec![&seq1, &seq2];
+    /// let lengths = vec![3, 5];
+    ///
+    /// let logits = model.forward_with_state_masked(&tokens, &lengths, &mut state)?;
+    /// // State for batch 0 matches unbatched processing of [1, 2, 3]
+    /// // State for batch 1 matches unbatched processing of [10, 20, 30, 40, 50]
+    /// ```
+    pub fn forward_with_state_masked(
+        &self,
+        tokens: &[&[u32]],
+        lengths: &[usize],
+        state: &mut HipState,
+    ) -> Result<Vec<f32>> {
+        let b = tokens.len();
+        if b == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Empty batch".to_string(),
+            });
+        }
+        if b != state.batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Batch size mismatch: tokens has {} sequences but state has batch_size={}",
+                    b, state.batch_size
+                ),
+            });
+        }
+        if lengths.len() != b {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Lengths size mismatch: expected {} (batch size), got {}",
+                    b, lengths.len()
+                ),
+            });
+        }
+
+        let t = tokens[0].len();
+        if t == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Empty sequence".to_string(),
+            });
+        }
+        // Verify all sequences have the same length (padded to max)
+        for (i, seq) in tokens.iter().enumerate() {
+            if seq.len() != t {
+                return Err(HipErrorKind {
+                    code: -1,
+                    message: format!(
+                        "Sequence length mismatch: sequence 0 has {} tokens but sequence {} has {}",
+                        t, i, seq.len()
+                    ),
+                });
+            }
+        }
+        // Verify lengths[b] <= T for all batches
+        for (i, &len) in lengths.iter().enumerate() {
+            if len > t {
+                return Err(HipErrorKind {
+                    code: -1,
+                    message: format!(
+                        "Length {} for batch {} exceeds padded sequence length {}",
+                        len, i, t
+                    ),
+                });
+            }
+            if len == 0 {
+                return Err(HipErrorKind {
+                    code: -1,
+                    message: format!("Length for batch {} is 0 (empty sequence)", i),
+                });
+            }
+        }
+
+        // Convert lengths to i32 for the kernel
+        let lengths_i32: Vec<i32> = lengths.iter().map(|&l| l as i32).collect();
+
+        let stream = Stream::null();
+        let n_embd = self.info.n_embd;
+        let n_head = self.info.n_head;
+        let head_size = self.info.head_size;
+        let n_vocab = self.info.n_vocab;
+        let n_layer = self.info.n_layer;
+        let n_hidden = self.info.n_hidden;
+
+        // Embedding lookup: tokens[b][t] -> x[c, t, b]
+        let emb_data = self.embed.w.to_vec(&stream)?;
+        let mut x = vec![0.0f32; n_embd * t * b];
+        for batch_idx in 0..b {
+            for time_idx in 0..t {
+                let token = tokens[batch_idx][time_idx] as usize;
+                for c in 0..n_embd {
+                    let idx = batch_idx * t * n_embd + time_idx * n_embd + c;
+                    x[idx] = emb_data[token * n_embd + c];
+                }
+            }
+        }
+
+        // v_first is computed fresh each forward call (not part of persistent state)
+        let mut v_first: Option<Vec<f32>> = None;
+
+        // Process each layer
+        for layer_idx in 0..n_layer {
+            let layer = &self.layers[layer_idx];
+
+            // Apply ln0 for layer 0
+            if layer_idx == 0 {
+                let ln0_w = self.embed.ln.weight.to_vec(&stream)?;
+                let ln0_b = self.embed.ln.bias.to_vec(&stream)?;
+                x = hip_layer_norm(&x, &ln0_w, &ln0_b, n_embd, t * b, 1e-5)?;
+            }
+
+            // ==== Time-Mix (Attention) ====
+            let ln1_w = layer.att_ln.weight.to_vec(&stream)?;
+            let ln1_b = layer.att_ln.bias.to_vec(&stream)?;
+            let x_ln1 = hip_layer_norm(&x, &ln1_w, &ln1_b, n_embd, t * b, 1e-5)?;
+
+            // Token shift for attention - all shifts use the same old state
+            let att_shift_state = &state.att_shift_states[layer_idx];
+            let x_r = layer.att.x_r.to_vec(&stream)?;
+            let x_w = layer.att.x_w.to_vec(&stream)?;
+            let x_k = layer.att.x_k.to_vec(&stream)?;
+            let x_v = layer.att.x_v.to_vec(&stream)?;
+            let x_a = layer.att.x_a.to_vec(&stream)?;
+            let x_g = layer.att.x_g.to_vec(&stream)?;
+
+            let (xr, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_r, n_embd, t, b)?;
+            let (xw, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_w, n_embd, t, b)?;
+            let (xk, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_k, n_embd, t, b)?;
+            let (xv, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_v, n_embd, t, b)?;
+            let (xa, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_a, n_embd, t, b)?;
+            let (xg, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_g, n_embd, t, b)?;
+
+            // Update shift state: use last valid position for each batch (not padding)
+            state.att_shift_states[layer_idx] = extract_shift_state_at_lengths(&x_ln1, lengths, n_embd, t, b);
+
+            // Linear projections: r, k, v
+            let w_r = layer.att.w_r.to_vec(&stream)?;
+            let w_k = layer.att.w_k.to_vec(&stream)?;
+            let w_v = layer.att.w_v.to_vec(&stream)?;
+            let r = hip_sgemm(&w_r, &xr, n_embd, n_embd, t * b)?;
+            let k = hip_sgemm(&w_k, &xk, n_embd, n_embd, t * b)?;
+            let mut v = hip_sgemm(&w_v, &xv, n_embd, n_embd, t * b)?;
+
+            // w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
+            let w0 = layer.att.w0.to_vec(&stream)?;
+            let w1 = layer.att.w1.to_vec(&stream)?;
+            let w2 = layer.att.w2.to_vec(&stream)?;
+            let w1_dim = layer.att.w1.shape().dim(0);
+            let w_lora1 = hip_sgemm(&w1, &xw, w1_dim, n_embd, t * b)?;
+            let w_lora1_tanh = hip_tanh(&w_lora1)?;
+            let w_lora2 = hip_sgemm(&w2, &w_lora1_tanh, n_embd, w1_dim, t * b)?;
+            let mut w: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
+                .zip(w_lora2.iter())
+                .map(|(&a, &b)| a + b)
+                .collect();
+            w = hip_softplus_decay(&w)?;
+
+            // a = sigmoid(a0 + (xa @ a1) @ a2)
+            let a0 = layer.att.a0.to_vec(&stream)?;
+            let a1 = layer.att.a1.to_vec(&stream)?;
+            let a2 = layer.att.a2.to_vec(&stream)?;
+            let a1_dim = layer.att.a1.shape().dim(0);
+            let a_lora1 = hip_sgemm(&a1, &xa, a1_dim, n_embd, t * b)?;
+            let a_lora2 = hip_sgemm(&a2, &a_lora1, n_embd, a1_dim, t * b)?;
+            let a_biased: Vec<f32> = a0.iter().cycle().take(a_lora2.len())
+                .zip(a_lora2.iter())
+                .map(|(&a, &b)| a + b)
+                .collect();
+            let a = hip_sigmoid(&a_biased)?;
+
+            // g = sigmoid(xg @ g1) @ g2
+            let g1 = layer.att.g1.to_vec(&stream)?;
+            let g2 = layer.att.g2.to_vec(&stream)?;
+            let g1_dim = layer.att.g1.shape().dim(0);
+            let g_lora1 = hip_sgemm(&g1, &xg, g1_dim, n_embd, t * b)?;
+            let g_lora1_sigmoid = hip_sigmoid(&g_lora1)?;
+            let g = hip_sgemm(&g2, &g_lora1_sigmoid, n_embd, g1_dim, t * b)?;
+
+            // Value residual (layers > 0)
+            if layer_idx > 0 {
+                if let (Some(v0), Some(v1), Some(v2), Some(ref vf)) =
+                    (&layer.att.v0, &layer.att.v1, &layer.att.v2, &v_first) {
+                    let v0_data = v0.to_vec(&stream)?;
+                    let v1_data = v1.to_vec(&stream)?;
+                    let v2_data = v2.to_vec(&stream)?;
+                    let v1_dim = v1.shape().dim(0);
+                    let v_lora1 = hip_sgemm(&v1_data, &v, v1_dim, n_embd, t * b)?;
+                    let v_lora2 = hip_sgemm(&v2_data, &v_lora1, n_embd, v1_dim, t * b)?;
+                    let v_biased: Vec<f32> = v0_data.iter().cycle().take(v_lora2.len())
+                        .zip(v_lora2.iter())
+                        .map(|(&a, &b)| a + b)
+                        .collect();
+                    let v_residual = hip_sigmoid(&v_biased)?;
+                    // v = v + (v_first - v) * v_residual
+                    v = v.iter().zip(vf.iter()).zip(v_residual.iter())
+                        .map(|((&vi, &vfi), &vri)| vi + (vfi - vi) * vri)
+                        .collect();
+                }
+            } else {
+                v_first = Some(v.clone());
+            }
+
+            // L2 normalize k
+            let k_k = layer.att.k_k.to_vec(&stream)?;
+            let k_scaled: Vec<f32> = k.iter().zip(k_k.iter().cycle())
+                .map(|(&ki, &kki)| ki * kki)
+                .collect();
+            let kk = hip_l2_norm(&k_scaled, n_embd, t * b, head_size, 1e-12)?;
+
+            // Control K: k = k * (1 + (a - 1) * k_a)
+            let k_a = layer.att.k_a.to_vec(&stream)?;
+            let k_ctrl = hip_control_k(&k_a, &a, &k, n_embd, t, b)?;
+
+            // WKV inputs
+            let wkv_a: Vec<f32> = kk.iter().map(|&x| -x).collect();
+            let wkv_b: Vec<f32> = kk.iter().zip(a.iter()).map(|(&kki, &ai)| kki * ai).collect();
+            let w_decay: Vec<f32> = w.iter().map(|&wi| wi.exp()).collect();
+
+            // Run WKV7 with length masking
+            let (wkv_output, new_att_state) = hip_wkv7_masked(
+                &w_decay, &r, &k_ctrl, &v, &wkv_a, &wkv_b,
+                &state.att_states[layer_idx], &lengths_i32, head_size, n_head, t, b
+            )?;
+            state.att_states[layer_idx] = new_att_state;
+
+            // WKV bonus
+            let r_k = layer.att.r_k.to_vec(&stream)?;
+            let wkv_bonus = hip_wkv_bonus(&r, &k_ctrl, &v, &r_k, head_size, n_head, t, b)?;
+
+            // Combine WKV output and bonus
+            let x_att: Vec<f32> = wkv_output.iter().zip(wkv_bonus.iter())
+                .map(|(&a, &b)| a + b)
+                .collect();
+
+            // Group norm
+            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
+            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
+            let x_att_gn = hip_group_norm(&x_att, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
+
+            // Gate and output projection
+            let x_att_gated: Vec<f32> = x_att_gn.iter().zip(g.iter())
+                .map(|(&xi, &gi)| xi * gi)
+                .collect();
+            let w_o = layer.att.w_o.to_vec(&stream)?;
+            let x_att_out = hip_sgemm(&w_o, &x_att_gated, n_embd, n_embd, t * b)?;
+
+            // Residual
+            x = x.iter().zip(x_att_out.iter()).map(|(&a, &b)| a + b).collect();
+
+            // ==== Channel-Mix (FFN) ====
+            let ln2_w = layer.ffn_ln.weight.to_vec(&stream)?;
+            let ln2_b = layer.ffn_ln.bias.to_vec(&stream)?;
+            let x_ln2 = hip_layer_norm(&x, &ln2_w, &ln2_b, n_embd, t * b, 1e-5)?;
+
+            // Token shift for FFN
+            let ffn_x_k = layer.ffn.x_k.to_vec(&stream)?;
+            let (xk_ffn, _) = hip_channel_mix_state(&x_ln2, &state.ffn_states[layer_idx], &ffn_x_k, n_embd, t, b)?;
+            // Update FFN state: use last valid position for each batch (not padding)
+            state.ffn_states[layer_idx] = extract_shift_state_at_lengths(&x_ln2, lengths, n_embd, t, b);
 
             // Key projection + squared ReLU
             let ffn_w_k = layer.ffn.w_k.to_vec(&stream)?;
