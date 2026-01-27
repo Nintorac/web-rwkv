@@ -211,6 +211,13 @@ extern "C" {
         stream: HipStream
     ) -> HipError;
 
+    // Elementwise operations for GPU-native forward pass
+    pub fn launch_add_f32(a: *const f32, b: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_mul_f32(a: *const f32, b: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_negate_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_broadcast_add_f32(input: *const f32, bias: *const f32, output: *mut f32, n: c_int, bias_len: c_int, stream: HipStream) -> HipError;
+
     // Safe property accessors (avoid struct layout issues)
     pub fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
     pub fn hip_get_device_gcn_arch_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;

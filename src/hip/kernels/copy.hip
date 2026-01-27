@@ -1173,6 +1173,105 @@ hipError_t launch_wkv7_f32_masked(
     return hipGetLastError();
 }
 
+// ============================================================================
+// Elementwise operations for GPU-native forward pass
+// ============================================================================
+
+// Elementwise add: output = a + b
+__global__ void kernel_add_f32(const float* __restrict__ a,
+                               const float* __restrict__ b,
+                               float* __restrict__ output,
+                               int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = a[idx] + b[idx];
+    }
+}
+
+hipError_t launch_add_f32(const float* a, const float* b, float* output, int n, hipStream_t stream) {
+    const int BLOCK_SIZE = 256;
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_add_f32, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       a, b, output, n);
+    return hipGetLastError();
+}
+
+// Elementwise multiply: output = a * b
+__global__ void kernel_mul_f32(const float* __restrict__ a,
+                               const float* __restrict__ b,
+                               float* __restrict__ output,
+                               int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = a[idx] * b[idx];
+    }
+}
+
+hipError_t launch_mul_f32(const float* a, const float* b, float* output, int n, hipStream_t stream) {
+    const int BLOCK_SIZE = 256;
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_mul_f32, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       a, b, output, n);
+    return hipGetLastError();
+}
+
+// Negate: output = -input
+__global__ void kernel_negate_f32(const float* __restrict__ input,
+                                  float* __restrict__ output,
+                                  int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = -input[idx];
+    }
+}
+
+hipError_t launch_negate_f32(const float* input, float* output, int n, hipStream_t stream) {
+    const int BLOCK_SIZE = 256;
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_negate_f32, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+// Exp: output = exp(input)
+__global__ void kernel_exp_f32(const float* __restrict__ input,
+                               float* __restrict__ output,
+                               int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = expf(input[idx]);
+    }
+}
+
+hipError_t launch_exp_f32(const float* input, float* output, int n, hipStream_t stream) {
+    const int BLOCK_SIZE = 256;
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_exp_f32, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+// Broadcast add: output[i] = input[i] + bias[i % bias_len]
+// Used for adding per-channel biases to batched data
+__global__ void kernel_broadcast_add_f32(const float* __restrict__ input,
+                                         const float* __restrict__ bias,
+                                         float* __restrict__ output,
+                                         int n, int bias_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = input[idx] + bias[idx % bias_len];
+    }
+}
+
+hipError_t launch_broadcast_add_f32(const float* input, const float* bias, float* output,
+                                    int n, int bias_len, hipStream_t stream) {
+    const int BLOCK_SIZE = 256;
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_broadcast_add_f32, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       input, bias, output, n, bias_len);
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

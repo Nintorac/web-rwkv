@@ -9,6 +9,8 @@ use super::ffi::{
     launch_layer_norm_f32, launch_group_norm_f32, launch_l2_norm_f32,
     launch_tanh_f32, launch_token_shift_f32, launch_channel_mix_state_f32,
     launch_wkv_bonus_f32, launch_control_k_f32, launch_wkv7_f32, launch_wkv7_f32_masked,
+    // Elementwise operations
+    launch_add_f32, launch_mul_f32, launch_negate_f32, launch_exp_f32, launch_broadcast_add_f32,
 };
 use super::device::Stream;
 use super::buffer::DeviceBuffer;
@@ -1569,5 +1571,187 @@ pub fn hip_wkv7_masked(
     let state_out = d_state_out.to_vec(&stream)?;
 
     Ok((output, state_out))
+}
+
+// ============================================================================
+// Elementwise operations for GPU-native forward pass
+// ============================================================================
+
+/// Elementwise add: output = a + b
+///
+/// Both inputs must have the same shape and be contiguous.
+pub fn add_f32(
+    a: &TensorHip<f32>,
+    b: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if a.len() != b.len() || a.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: a={}, b={}, output={}",
+                a.len(), b.len(), output.len()
+            ),
+        });
+    }
+    if !a.is_contiguous() || !b.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "add_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_add_f32(
+            a.as_ptr(),
+            b.as_ptr(),
+            output.as_mut_ptr(),
+            a.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Elementwise multiply: output = a * b
+///
+/// Both inputs must have the same shape and be contiguous.
+pub fn mul_f32(
+    a: &TensorHip<f32>,
+    b: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if a.len() != b.len() || a.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: a={}, b={}, output={}",
+                a.len(), b.len(), output.len()
+            ),
+        });
+    }
+    if !a.is_contiguous() || !b.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "mul_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_mul_f32(
+            a.as_ptr(),
+            b.as_ptr(),
+            output.as_mut_ptr(),
+            a.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Negate: output = -input
+pub fn negate_f32(
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "negate_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_negate_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Exponential: output = exp(input)
+pub fn exp_f32(
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "exp_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_exp_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Broadcast add: output[i] = input[i] + bias[i % bias_len]
+///
+/// Used for adding per-channel biases to batched data.
+/// Input shape: [C, T, B], bias shape: [C], output shape: [C, T, B]
+pub fn broadcast_add_f32(
+    input: &TensorHip<f32>,
+    bias: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if input.len() % bias.len() != 0 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Broadcast incompatible: input len {} not divisible by bias len {}",
+                input.len(), bias.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !bias.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "broadcast_add_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_broadcast_add_f32(
+            input.as_ptr(),
+            bias.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            bias.len() as c_int,
+            stream.handle(),
+        ))
+    }
 }
 

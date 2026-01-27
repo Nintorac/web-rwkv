@@ -64,6 +64,8 @@ pub use kernels::{
     control_k_f32, hip_control_k,
     wkv7_f32, hip_wkv7,
     wkv7_f32_masked, hip_wkv7_masked,
+    // Elementwise operations for GPU-native forward
+    add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32,
 };
 
 // Re-export BLAS functions and context
