@@ -6,6 +6,7 @@ use std::path::Path;
 use super::ffi::{HipErrorKind, Result};
 use super::device::Stream;
 use super::tensor::{TensorShape, TensorHip};
+use super::scratch::LoraDims;
 use super::kernels::{
     hip_layer_norm, hip_wkv7, hip_channel_mix_state, hip_tanh,
     hip_softplus_decay, hip_sigmoid, hip_squared_relu,
@@ -669,6 +670,32 @@ impl Rwkv7Hip {
         let all_data = tensor.to_vec(&stream)?;
         let n = n.min(all_data.len());
         Ok(all_data[..n].to_vec())
+    }
+
+    /// Extract LoRA dimensions from the model weights.
+    ///
+    /// These dimensions are needed to allocate scratch buffers for the forward pass.
+    /// LoRA dimensions are consistent across layers, so we read them from layer 0.
+    ///
+    /// # Returns
+    /// `LoraDims` struct containing:
+    /// - `w_dim`: Decay LoRA rank
+    /// - `a_dim`: Adaptation LoRA rank
+    /// - `g_dim`: Gate LoRA rank
+    /// - `v_dim`: Value residual LoRA rank (Some for layers > 0, None if absent)
+    pub fn lora_dims(&self) -> LoraDims {
+        let layer = &self.layers[0];
+        LoraDims {
+            w_dim: layer.att.w1.shape().dim(0),
+            a_dim: layer.att.a1.shape().dim(0),
+            g_dim: layer.att.g1.shape().dim(0),
+            // v1/v2 are only present on layers > 0, check layer 1 if it exists
+            v_dim: if self.layers.len() > 1 {
+                self.layers[1].att.v1.as_ref().map(|v| v.shape().dim(0))
+            } else {
+                None
+            },
+        }
     }
 
     /// Run a full forward pass on input tokens (single sequence, fresh state).

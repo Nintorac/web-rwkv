@@ -10,6 +10,7 @@ mod ffi;
 mod kernels;
 mod model;
 mod runtime;
+mod scratch;
 mod tensor;
 
 #[cfg(feature = "hip-probes")]
@@ -41,6 +42,9 @@ pub use buffer::{DeviceBuffer, MemoryType};
 
 // Re-export tensor types
 pub use tensor::{TensorShape, TensorView, TensorHip};
+
+// Re-export scratch buffer types
+pub use scratch::{HipRuntimeConfig, HipScratch, LoraDims};
 
 // Re-export kernel functions
 pub use kernels::{
