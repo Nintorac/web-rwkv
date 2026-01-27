@@ -1,25 +1,22 @@
 //! RWKV7 HIP model loading and forward pass implementation.
 
 use half::f16;
+use std::cell::RefCell;
 use std::path::Path;
 
 use super::ffi::{HipErrorKind, Result};
 use super::device::Stream;
 use super::tensor::{TensorShape, TensorHip};
-use super::scratch::LoraDims;
+use super::scratch::{LoraDims, HipRuntimeConfig};
 use super::kernels::{
-    hip_layer_norm, hip_wkv7, hip_channel_mix_state, hip_tanh,
-    hip_softplus_decay, hip_sigmoid, hip_squared_relu,
-    hip_l2_norm, hip_group_norm, hip_wkv_bonus, hip_control_k,
-    hip_wkv7_masked, extract_shift_state_at_lengths,
-    // GPU-native kernels for forward_with_scratch
+    // GPU-native kernels used in forward
     layer_norm_f32, group_norm_f32, l2_norm_f32,
     sigmoid_f32, tanh_f32, softplus_decay_f32, squared_relu_f32,
-    channel_mix_state_f32, control_k_f32, wkv7_f32, wkv_bonus_f32,
+    channel_mix_state_f32, control_k_f32, wkv7_f32_masked, wkv_bonus_f32,
     add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32, broadcast_mul_f32,
     lerp_f32, copy_tensor_f32,
 };
-use super::blas::{hip_sgemm, HipBlasContext};
+use super::blas::HipBlasContext;
 use super::scratch::HipScratch;
 
 #[cfg(feature = "hip-probes")]
@@ -146,6 +143,9 @@ pub struct Rwkv7Hip {
     pub head: HeadHip,
     pub layers: Vec<LayerHip>,
 
+    /// Lazily initialized scratch buffers for GPU-native forward pass.
+    scratch: RefCell<Option<HipScratch>>,
+
     #[cfg(feature = "hip-probes")]
     pub(crate) probes: Option<HipProbeMapRef>,
 }
@@ -156,7 +156,8 @@ impl std::fmt::Debug for Rwkv7Hip {
         s.field("info", &self.info)
             .field("embed", &self.embed)
             .field("head", &self.head)
-            .field("layers", &self.layers);
+            .field("layers", &self.layers)
+            .field("scratch", &self.scratch.borrow().as_ref().map(|_| "initialized"));
         #[cfg(feature = "hip-probes")]
         s.field("probes", &self.probes.as_ref().map(|p| format!("{} hooks", p.len())));
         s.finish()
@@ -575,6 +576,7 @@ impl Rwkv7Hip {
             embed,
             head,
             layers,
+            scratch: RefCell::new(None),
             #[cfg(feature = "hip-probes")]
             probes: None,
         })
@@ -705,467 +707,71 @@ impl Rwkv7Hip {
         }
     }
 
-    /// Run a full forward pass on input tokens (single sequence, fresh state).
+    /// Run a forward pass on input tokens with optional state and length masking.
     ///
-    /// Convenience wrapper for `forward_with_state` with batch_size=1 and fresh state.
-    ///
-    /// # Arguments
-    /// * `tokens` - Input token IDs for a single sequence
-    ///
-    /// # Returns
-    /// Logits tensor of shape [vocab_size * T] for each input token.
-    pub fn forward(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let mut state = HipState::new(&self.info, 1);
-        self.forward_with_state(&[tokens], &mut state)
-    }
-
-    /// Run a batched forward pass with explicit state management.
-    ///
-    /// This is the core inference API supporting:
+    /// This is the unified forward API supporting:
     /// - **Batched inference**: Process multiple sequences in parallel (B > 1)
-    /// - **Streaming**: Token-by-token generation with state carryover
-    /// - **Chunked processing**: Long context in pieces with state carryover
+    /// - **Variable-length sequences**: Use `lens` to specify actual lengths for masking
+    /// - **Stateful inference**: Pass state to continue from previous forward calls
+    /// - **Stateless inference**: Pass `None` for state to start fresh
     ///
     /// # Arguments
-    /// * `tokens` - Batch of sequences. Each `&[u32]` is one sequence.
-    ///              All sequences must have the same length T.
-    /// * `state` - Mutable reference to inference state. Must have `batch_size == tokens.len()`.
+    /// * `x` - Batch of token sequences (padded to same length T)
+    /// * `state` - Optional state; if `None`, creates fresh zero state
+    /// * `lens` - Actual lengths per batch element (for masking padding)
     ///
     /// # Returns
-    /// Logits tensor of shape [vocab_size * T * B] in column-major layout [V, T, B].
+    /// Tuple of (logits, state):
+    /// - `logits`: Tensor of shape [vocab_size * T * B] in column-major layout [V, T, B]
+    /// - `state`: Updated state for subsequent forward calls
     ///
     /// # Example
     /// ```ignore
-    /// // Batched prefill: 4 sequences of 128 tokens each
-    /// let mut state = HipState::new(&model.info, 4);
-    /// let sequences: Vec<&[u32]> = vec![&seq1, &seq2, &seq3, &seq4];
-    /// let logits = model.forward_with_state(&sequences, &mut state)?;
+    /// // Stateless single-sequence inference
+    /// let (logits, _) = model.forward(&[&tokens], None, &[tokens.len()])?;
     ///
-    /// // Batched decode: generate next token for all 4 sequences
-    /// let next_tokens: Vec<&[u32]> = vec![&[t1], &[t2], &[t3], &[t4]];
-    /// let logits = model.forward_with_state(&next_tokens, &mut state)?;
+    /// // Stateful streaming inference
+    /// let (logits1, state) = model.forward(&[&[tok1]], None, &[1])?;
+    /// let (logits2, state) = model.forward(&[&[tok2]], Some(state), &[1])?;
+    ///
+    /// // Batched variable-length inference
+    /// let seq1 = vec![1, 2, 3, 0, 0];  // padded, real length = 3
+    /// let seq2 = vec![4, 5, 6, 7, 8];  // real length = 5
+    /// let (logits, state) = model.forward(&[&seq1, &seq2], None, &[3, 5])?;
     /// ```
-    pub fn forward_with_state(&self, tokens: &[&[u32]], state: &mut HipState) -> Result<Vec<f32>> {
-        let b = tokens.len();
-        if b == 0 {
-            return Err(HipErrorKind {
-                code: -1,
-                message: "Empty batch".to_string(),
-            });
-        }
-        if b != state.batch_size {
-            return Err(HipErrorKind {
-                code: -1,
-                message: format!(
-                    "Batch size mismatch: tokens has {} sequences but state has batch_size={}",
-                    b, state.batch_size
-                ),
-            });
-        }
-
-        let t = tokens[0].len();
-        if t == 0 {
-            return Err(HipErrorKind {
-                code: -1,
-                message: "Empty sequence".to_string(),
-            });
-        }
-        // Verify all sequences have the same length
-        for (i, seq) in tokens.iter().enumerate() {
-            if seq.len() != t {
-                return Err(HipErrorKind {
-                    code: -1,
-                    message: format!(
-                        "Sequence length mismatch: sequence 0 has {} tokens but sequence {} has {}",
-                        t, i, seq.len()
-                    ),
-                });
-            }
-        }
-
-        let stream = Stream::null();
-        let n_embd = self.info.n_embd;
-        let n_head = self.info.n_head;
-        let head_size = self.info.head_size;
-        let n_vocab = self.info.n_vocab;
-        let n_layer = self.info.n_layer;
-        let n_hidden = self.info.n_hidden;
-
-        // Initialize probe context (compiles out without feature)
-        #[cfg(feature = "hip-probes")]
-        let mut probe_ctx = probe::ProbeContext {
-            layer: None,
-            batch_size: b,
-            seq_len: t,
-            n_embd,
-            n_head,
-            head_size,
-            n_layer,
-            shape_storage: [0; probe::MAX_SHAPE_DIMS],
-            shape_len: 0,
-        };
-
-        // Embedding lookup: tokens[b][t] -> x[c, t, b]
-        // Layout: x[c, t, b] = x[b * T * C + t * C + c]
-        // embed.w is row-major [n_vocab, n_embd], so embed[token, c] = emb_data[token * n_embd + c]
-        let emb_data = self.embed.w.to_vec(&stream)?;
-        let mut x = vec![0.0f32; n_embd * t * b];
-        for batch_idx in 0..b {
-            for time_idx in 0..t {
-                let token = tokens[batch_idx][time_idx] as usize;
-                for c in 0..n_embd {
-                    let idx = batch_idx * t * n_embd + time_idx * n_embd + c;
-                    x[idx] = emb_data[token * n_embd + c];
-                }
-            }
-        }
-        #[cfg(feature = "hip-probes")]
-        hip_probe!(self, probe_ctx, probe::HipHook::PostEmbed, &x, [n_embd, t, b]);
-
-        // v_first is computed fresh each forward call (not part of persistent state)
-        let mut v_first: Option<Vec<f32>> = None;
-
-        // Process each layer
-        for layer_idx in 0..n_layer {
-            #[cfg(feature = "hip-probes")]
-            { probe_ctx.layer = Some(layer_idx); }
-            let layer = &self.layers[layer_idx];
-
-            // Apply ln0 for layer 0
-            if layer_idx == 0 {
-                let ln0_w = self.embed.ln.weight.to_vec(&stream)?;
-                let ln0_b = self.embed.ln.bias.to_vec(&stream)?;
-                x = hip_layer_norm(&x, &ln0_w, &ln0_b, n_embd, t * b, 1e-5)?;
-                #[cfg(feature = "hip-probes")]
-                hip_probe!(self, probe_ctx, probe::HipHook::PostEmbedLayerNorm, &x, [n_embd, t, b]);
-            }
-
-            // ==== Time-Mix (Attention) ====
-            let ln1_w = layer.att_ln.weight.to_vec(&stream)?;
-            let ln1_b = layer.att_ln.bias.to_vec(&stream)?;
-            let x_ln1 = hip_layer_norm(&x, &ln1_w, &ln1_b, n_embd, t * b, 1e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttLayerNorm, &x_ln1, [n_embd, t, b]);
-
-            // Token shift for attention - all shifts use the same old state
-            let att_shift_state = &state.att_shift_states[layer_idx];
-            let x_r = layer.att.x_r.to_vec(&stream)?;
-            let x_w = layer.att.x_w.to_vec(&stream)?;
-            let x_k = layer.att.x_k.to_vec(&stream)?;
-            let x_v = layer.att.x_v.to_vec(&stream)?;
-            let x_a = layer.att.x_a.to_vec(&stream)?;
-            let x_g = layer.att.x_g.to_vec(&stream)?;
-
-            let (xr, new_att_shift) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_r, n_embd, t, b)?;
-            let (xw, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_w, n_embd, t, b)?;
-            let (xk, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_k, n_embd, t, b)?;
-            let (xv, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_v, n_embd, t, b)?;
-            let (xa, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_a, n_embd, t, b)?;
-            let (xg, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_g, n_embd, t, b)?;
-            #[cfg(feature = "hip-probes")]
-            {
-                // Stack all token shifts: xr, xw, xk, xv, xa, xg
-                let stacked: Vec<f32> = [&xr, &xw, &xk, &xv, &xa, &xg]
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .collect();
-                hip_probe!(self, probe_ctx, probe::HipHook::PostAttTokenShift, &stacked, [n_embd, t, b, 6]);
-            }
-
-            // Update shift state after all shifts are computed
-            state.att_shift_states[layer_idx] = new_att_shift;
-
-            // Linear projections: r, k, v
-            let w_r = layer.att.w_r.to_vec(&stream)?;
-            let w_k = layer.att.w_k.to_vec(&stream)?;
-            let w_v = layer.att.w_v.to_vec(&stream)?;
-            let r = hip_sgemm(&w_r, &xr, n_embd, n_embd, t * b)?;
-            let k = hip_sgemm(&w_k, &xk, n_embd, n_embd, t * b)?;
-            let mut v = hip_sgemm(&w_v, &xv, n_embd, n_embd, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            {
-                // Stack r, k, v for linear projection probe
-                let stacked: Vec<f32> = [&r, &k, &v]
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .collect();
-                hip_probe!(self, probe_ctx, probe::HipHook::PostAttLinear, &stacked, [n_embd, t, b, 3]);
-            }
-
-            // w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
-            let w0 = layer.att.w0.to_vec(&stream)?;
-            let w1 = layer.att.w1.to_vec(&stream)?;
-            let w2 = layer.att.w2.to_vec(&stream)?;
-            // Column-major weights: dim(0) is output features (LoRA dim for w1)
-            let w1_dim = layer.att.w1.shape().dim(0);
-            let w_lora1 = hip_sgemm(&w1, &xw, w1_dim, n_embd, t * b)?;
-            let w_lora1_tanh = hip_tanh(&w_lora1)?;
-            let w_lora2 = hip_sgemm(&w2, &w_lora1_tanh, n_embd, w1_dim, t * b)?;
-            let mut w: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
-                .zip(w_lora2.iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-            w = hip_softplus_decay(&w)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttDecay, &w, [n_embd, t, b]);
-
-            // a = sigmoid(a0 + (xa @ a1) @ a2)
-            let a0 = layer.att.a0.to_vec(&stream)?;
-            let a1 = layer.att.a1.to_vec(&stream)?;
-            let a2 = layer.att.a2.to_vec(&stream)?;
-            let a1_dim = layer.att.a1.shape().dim(0);
-            let a_lora1 = hip_sgemm(&a1, &xa, a1_dim, n_embd, t * b)?;
-            let a_lora2 = hip_sgemm(&a2, &a_lora1, n_embd, a1_dim, t * b)?;
-            let a_biased: Vec<f32> = a0.iter().cycle().take(a_lora2.len())
-                .zip(a_lora2.iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-            let a = hip_sigmoid(&a_biased)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttAdapt, &a, [n_embd, t, b]);
-
-            // g = sigmoid(xg @ g1) @ g2
-            let g1 = layer.att.g1.to_vec(&stream)?;
-            let g2 = layer.att.g2.to_vec(&stream)?;
-            let g1_dim = layer.att.g1.shape().dim(0);
-            let g_lora1 = hip_sgemm(&g1, &xg, g1_dim, n_embd, t * b)?;
-            let g_lora1_sigmoid = hip_sigmoid(&g_lora1)?;
-            let g = hip_sgemm(&g2, &g_lora1_sigmoid, n_embd, g1_dim, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGate, &g, [n_embd, t, b]);
-
-            // Value residual (layers > 0)
-            if layer_idx > 0 {
-                if let (Some(v0), Some(v1), Some(v2), Some(ref vf)) =
-                    (&layer.att.v0, &layer.att.v1, &layer.att.v2, &v_first) {
-                    let v0_data = v0.to_vec(&stream)?;
-                    let v1_data = v1.to_vec(&stream)?;
-                    let v2_data = v2.to_vec(&stream)?;
-                    let v1_dim = v1.shape().dim(0);
-                    // Note: Use xv (token-shifted input), not v (projected value)
-                    let v_lora1 = hip_sgemm(&v1_data, &xv, v1_dim, n_embd, t * b)?;
-                    let v_lora2 = hip_sgemm(&v2_data, &v_lora1, n_embd, v1_dim, t * b)?;
-                    let v_biased: Vec<f32> = v0_data.iter().cycle().take(v_lora2.len())
-                        .zip(v_lora2.iter())
-                        .map(|(&a, &b)| a + b)
-                        .collect();
-                    let v_residual = hip_sigmoid(&v_biased)?;
-                    // v = v + (v_first - v) * v_residual
-                    v = v.iter().zip(vf.iter()).zip(v_residual.iter())
-                        .map(|((&vi, &vfi), &vri)| vi + (vfi - vi) * vri)
-                        .collect();
-                    #[cfg(feature = "hip-probes")]
-                    hip_probe!(self, probe_ctx, probe::HipHook::PostAttValueResidual, &v, [n_embd, t, b]);
-                }
-            } else {
-                v_first = Some(v.clone());
-            }
-
-            // L2 normalize k
-            let k_k = layer.att.k_k.to_vec(&stream)?;
-            let k_scaled: Vec<f32> = k.iter().zip(k_k.iter().cycle())
-                .map(|(&ki, &kki)| ki * kki)
-                .collect();
-            let kk = hip_l2_norm(&k_scaled, n_embd, t * b, head_size, 1e-12)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttL2Norm, &kk, [n_embd, t, b]);
-
-            // Control K: k = k * (1 + (a - 1) * k_a)
-            let k_a = layer.att.k_a.to_vec(&stream)?;
-            let k_ctrl = hip_control_k(&k_a, &a, &k, n_embd, t, b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttControlK, &k_ctrl, [n_embd, t, b]);
-
-            // WKV inputs
-            let wkv_a: Vec<f32> = kk.iter().map(|&x| -x).collect();
-            let wkv_b: Vec<f32> = kk.iter().zip(a.iter()).map(|(&kki, &ai)| kki * ai).collect();
-            let w_decay: Vec<f32> = w.iter().map(|&wi| wi.exp()).collect();
-
-            #[cfg(feature = "hip-probes")]
-            {
-                // Stack WKV inputs: w_decay, r, k_ctrl, v, wkv_a, wkv_b
-                let stacked: Vec<f32> = [&w_decay, &r, &k_ctrl, &v, &wkv_a, &wkv_b]
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .collect();
-                hip_probe!(self, probe_ctx, probe::HipHook::PreWkv, &stacked, [n_embd, t, b, 6]);
-                hip_probe!(self, probe_ctx, probe::HipHook::PreWkvState, &state.att_states[layer_idx], [head_size, head_size, n_head, b]);
-            }
-
-            // Run WKV7
-            let (wkv_output, new_att_state) = hip_wkv7(
-                &w_decay, &r, &k_ctrl, &v, &wkv_a, &wkv_b,
-                &state.att_states[layer_idx], head_size, n_head, t, b
-            )?;
-            state.att_states[layer_idx] = new_att_state;
-            #[cfg(feature = "hip-probes")]
-            {
-                hip_probe!(self, probe_ctx, probe::HipHook::PostWkv, &wkv_output, [n_embd, t, b]);
-                hip_probe!(self, probe_ctx, probe::HipHook::PostWkvState, &state.att_states[layer_idx], [head_size, head_size, n_head, b]);
-            }
-
-            // Group norm on WKV output (BEFORE adding bonus, per RWKV7 spec)
-            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
-            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
-            let wkv_normed = hip_group_norm(&wkv_output, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGroupNorm, &wkv_normed, [n_embd, t, b]);
-
-            // WKV bonus (time_first) - added AFTER group norm
-            let r_k = layer.att.r_k.to_vec(&stream)?;
-            let wkv_bonus = hip_wkv_bonus(&r, &k_ctrl, &v, &r_k, head_size, n_head, t, b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostWkvBonus, &wkv_bonus, [n_embd, t, b]);
-
-            // Combine normalized output and bonus: p_t = LayerNorm(wkv) + u_t
-            let x_att_combined: Vec<f32> = wkv_normed.iter().zip(wkv_bonus.iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-
-            // Gate and output projection
-            let x_att_gated: Vec<f32> = x_att_combined.iter().zip(g.iter())
-                .map(|(&xi, &gi)| xi * gi)
-                .collect();
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGated, &x_att_gated, [n_embd, t, b]);
-            let w_o = layer.att.w_o.to_vec(&stream)?;
-            let x_att_out = hip_sgemm(&w_o, &x_att_gated, n_embd, n_embd, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttOut, &x_att_out, [n_embd, t, b]);
-
-            // Residual
-            x = x.iter().zip(x_att_out.iter()).map(|(&a, &b)| a + b).collect();
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAtt, &x, [n_embd, t, b]);
-
-            // ==== Channel-Mix (FFN) ====
-            let ln2_w = layer.ffn_ln.weight.to_vec(&stream)?;
-            let ln2_b = layer.ffn_ln.bias.to_vec(&stream)?;
-            let x_ln2 = hip_layer_norm(&x, &ln2_w, &ln2_b, n_embd, t * b, 1e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnLayerNorm, &x_ln2, [n_embd, t, b]);
-
-            // Token shift for FFN
-            let ffn_x_k = layer.ffn.x_k.to_vec(&stream)?;
-            let (xk_ffn, new_ffn_state) = hip_channel_mix_state(&x_ln2, &state.ffn_states[layer_idx], &ffn_x_k, n_embd, t, b)?;
-            state.ffn_states[layer_idx] = new_ffn_state;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnTokenShift, &xk_ffn, [n_embd, t, b]);
-
-            // Key projection + squared ReLU
-            let ffn_w_k = layer.ffn.w_k.to_vec(&stream)?;
-            let k_ffn = hip_sgemm(&ffn_w_k, &xk_ffn, n_hidden, n_embd, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnLinear, &k_ffn, [n_hidden, t, b]);
-            let k_sq = hip_squared_relu(&k_ffn)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnActivate, &k_sq, [n_hidden, t, b]);
-
-            // Value projection
-            let ffn_w_v = layer.ffn.w_v.to_vec(&stream)?;
-            let x_ffn_out = hip_sgemm(&ffn_w_v, &k_sq, n_embd, n_hidden, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnOut, &x_ffn_out, [n_embd, t, b]);
-
-            // Residual
-            x = x.iter().zip(x_ffn_out.iter()).map(|(&a, &b)| a + b).collect();
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfn, &x, [n_embd, t, b]);
-        }
-
-        // Reset layer context for head probes
-        #[cfg(feature = "hip-probes")]
-        { probe_ctx.layer = None; }
-
-        // ==== Output Head ====
-        let ln_out_w = self.head.ln.weight.to_vec(&stream)?;
-        let ln_out_b = self.head.ln.bias.to_vec(&stream)?;
-        let x_ln_out = hip_layer_norm(&x, &ln_out_w, &ln_out_b, n_embd, t * b, 1e-5)?;
-        #[cfg(feature = "hip-probes")]
-        hip_probe!(self, probe_ctx, probe::HipHook::PostHeadLayerNorm, &x_ln_out, [n_embd, t, b]);
-
-        // Head projection
-        let head_w = self.head.w.to_vec(&stream)?;
-        let logits = hip_sgemm(&head_w, &x_ln_out, n_vocab, n_embd, t * b)?;
-        #[cfg(feature = "hip-probes")]
-        hip_probe!(self, probe_ctx, probe::HipHook::PostHead, &logits, [n_vocab, t, b]);
-
-        Ok(logits)
-    }
-
-    /// Forward pass with length masking for variable-length batched sequences.
-    ///
-    /// This method allows processing batches where sequences have different real lengths,
-    /// with padding to a common max length. The masked WKV7 kernel skips state updates
-    /// for padding positions, preserving the invariant: state(seq + padding) == state(seq).
-    ///
-    /// # Arguments
-    /// * `tokens` - Padded token sequences, all same length T
-    /// * `lengths` - Real sequence length per batch (lengths[b] <= T)
-    /// * `state` - Mutable state, updated in place
-    ///
-    /// # Returns
-    /// Logits tensor [vocab_size, T, B] - only positions < lengths[b] are valid for each batch
-    ///
-    /// # Example
-    /// ```rust,ignore
-    /// let model = Rwkv7Hip::load("model.safetensors")?;
-    /// let mut state = HipState::new(&model.info, 2);
-    ///
-    /// // Batch with different lengths (padded with 0)
-    /// let seq1 = vec![1, 2, 3, 0, 0];     // real length = 3
-    /// let seq2 = vec![10, 20, 30, 40, 50]; // real length = 5
-    /// let tokens: Vec<&[u32]> = vec![&seq1, &seq2];
-    /// let lengths = vec![3, 5];
-    ///
-    /// let logits = model.forward_with_state_masked(&tokens, &lengths, &mut state)?;
-    /// // State for batch 0 matches unbatched processing of [1, 2, 3]
-    /// // State for batch 1 matches unbatched processing of [10, 20, 30, 40, 50]
-    /// ```
-    pub fn forward_with_state_masked(
+    pub fn forward(
         &self,
-        tokens: &[&[u32]],
-        lengths: &[usize],
-        state: &mut HipState,
-    ) -> Result<Vec<f32>> {
-        let b = tokens.len();
+        x: &[&[u32]],
+        state: Option<HipState>,
+        lens: &[usize],
+    ) -> Result<(Vec<f32>, HipState)> {
+        let b = x.len();
         if b == 0 {
             return Err(HipErrorKind {
                 code: -1,
                 message: "Empty batch".to_string(),
             });
         }
-        if b != state.batch_size {
+        if lens.len() != b {
             return Err(HipErrorKind {
                 code: -1,
                 message: format!(
-                    "Batch size mismatch: tokens has {} sequences but state has batch_size={}",
-                    b, state.batch_size
-                ),
-            });
-        }
-        if lengths.len() != b {
-            return Err(HipErrorKind {
-                code: -1,
-                message: format!(
-                    "Lengths size mismatch: expected {} (batch size), got {}",
-                    b, lengths.len()
+                    "Lens size mismatch: expected {} (batch size), got {}",
+                    b, lens.len()
                 ),
             });
         }
 
-        let t = tokens[0].len();
+        let t = x[0].len();
         if t == 0 {
             return Err(HipErrorKind {
                 code: -1,
                 message: "Empty sequence".to_string(),
             });
         }
-        // Verify all sequences have the same length (padded to max)
-        for (i, seq) in tokens.iter().enumerate() {
+
+        // Verify all sequences have the same (padded) length
+        for (i, seq) in x.iter().enumerate() {
             if seq.len() != t {
                 return Err(HipErrorKind {
                     code: -1,
@@ -1176,8 +782,9 @@ impl Rwkv7Hip {
                 });
             }
         }
-        // Verify lengths[b] <= T for all batches
-        for (i, &len) in lengths.iter().enumerate() {
+
+        // Verify lens[b] <= t for all batches
+        for (i, &len) in lens.iter().enumerate() {
             if len > t {
                 return Err(HipErrorKind {
                     code: -1,
@@ -1195,400 +802,67 @@ impl Rwkv7Hip {
             }
         }
 
-        // Convert lengths to i32 for the kernel
-        let lengths_i32: Vec<i32> = lengths.iter().map(|&l| l as i32).collect();
-
-        let stream = Stream::null();
-        let n_embd = self.info.n_embd;
-        let n_head = self.info.n_head;
-        let head_size = self.info.head_size;
-        let n_vocab = self.info.n_vocab;
-        let n_layer = self.info.n_layer;
-        let n_hidden = self.info.n_hidden;
-
-        // Initialize probe context (compiles out without feature)
-        #[cfg(feature = "hip-probes")]
-        let mut probe_ctx = probe::ProbeContext {
-            layer: None,
-            batch_size: b,
-            seq_len: t,
-            n_embd,
-            n_head,
-            head_size,
-            n_layer,
-            shape_storage: [0; probe::MAX_SHAPE_DIMS],
-            shape_len: 0,
+        // Create or use provided state
+        let mut state = match state {
+            Some(s) => {
+                if s.batch_size != b {
+                    return Err(HipErrorKind {
+                        code: -1,
+                        message: format!(
+                            "State batch_size mismatch: state has {} but input has {} sequences",
+                            s.batch_size, b
+                        ),
+                    });
+                }
+                s
+            }
+            None => HipState::new(&self.info, b),
         };
 
-        // Embedding lookup: tokens[b][t] -> x[c, t, b]
-        let emb_data = self.embed.w.to_vec(&stream)?;
-        let mut x = vec![0.0f32; n_embd * t * b];
-        for batch_idx in 0..b {
-            for time_idx in 0..t {
-                let token = tokens[batch_idx][time_idx] as usize;
-                for c in 0..n_embd {
-                    let idx = batch_idx * t * n_embd + time_idx * n_embd + c;
-                    x[idx] = emb_data[token * n_embd + c];
-                }
-            }
-        }
-        #[cfg(feature = "hip-probes")]
-        hip_probe!(self, probe_ctx, probe::HipHook::PostEmbed, &x, [n_embd, t, b]);
+        // Ensure scratch buffers are initialized and large enough
+        self.ensure_scratch(t, b)?;
 
-        // v_first is computed fresh each forward call (not part of persistent state)
-        let mut v_first: Option<Vec<f32>> = None;
+        // Get mutable access to scratch
+        let mut scratch_ref = self.scratch.borrow_mut();
+        let scratch = scratch_ref.as_mut().unwrap();
 
-        // Process each layer
-        for layer_idx in 0..n_layer {
-            #[cfg(feature = "hip-probes")]
-            { probe_ctx.layer = Some(layer_idx); }
-            let layer = &self.layers[layer_idx];
+        // Run forward pass with scratch buffers
+        let logits = self.forward_inner(x, &mut state, scratch, lens)?;
 
-            // Apply ln0 for layer 0
-            if layer_idx == 0 {
-                let ln0_w = self.embed.ln.weight.to_vec(&stream)?;
-                let ln0_b = self.embed.ln.bias.to_vec(&stream)?;
-                x = hip_layer_norm(&x, &ln0_w, &ln0_b, n_embd, t * b, 1e-5)?;
-                #[cfg(feature = "hip-probes")]
-                hip_probe!(self, probe_ctx, probe::HipHook::PostEmbedLayerNorm, &x, [n_embd, t, b]);
-            }
-
-            // ==== Time-Mix (Attention) ====
-            let ln1_w = layer.att_ln.weight.to_vec(&stream)?;
-            let ln1_b = layer.att_ln.bias.to_vec(&stream)?;
-            let x_ln1 = hip_layer_norm(&x, &ln1_w, &ln1_b, n_embd, t * b, 1e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttLayerNorm, &x_ln1, [n_embd, t, b]);
-
-            // Token shift for attention - all shifts use the same old state
-            let att_shift_state = &state.att_shift_states[layer_idx];
-            let x_r = layer.att.x_r.to_vec(&stream)?;
-            let x_w = layer.att.x_w.to_vec(&stream)?;
-            let x_k = layer.att.x_k.to_vec(&stream)?;
-            let x_v = layer.att.x_v.to_vec(&stream)?;
-            let x_a = layer.att.x_a.to_vec(&stream)?;
-            let x_g = layer.att.x_g.to_vec(&stream)?;
-
-            let (xr, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_r, n_embd, t, b)?;
-            let (xw, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_w, n_embd, t, b)?;
-            let (xk, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_k, n_embd, t, b)?;
-            let (xv, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_v, n_embd, t, b)?;
-            let (xa, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_a, n_embd, t, b)?;
-            let (xg, _) = hip_channel_mix_state(&x_ln1, att_shift_state, &x_g, n_embd, t, b)?;
-            #[cfg(feature = "hip-probes")]
-            {
-                // Stack all token shifts: xr, xw, xk, xv, xa, xg
-                let stacked: Vec<f32> = [&xr, &xw, &xk, &xv, &xa, &xg]
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .collect();
-                hip_probe!(self, probe_ctx, probe::HipHook::PostAttTokenShift, &stacked, [n_embd, t, b, 6]);
-            }
-
-            // Update shift state: use last valid position for each batch (not padding)
-            state.att_shift_states[layer_idx] = extract_shift_state_at_lengths(&x_ln1, lengths, n_embd, t, b);
-
-            // Linear projections: r, k, v
-            let w_r = layer.att.w_r.to_vec(&stream)?;
-            let w_k = layer.att.w_k.to_vec(&stream)?;
-            let w_v = layer.att.w_v.to_vec(&stream)?;
-            let r = hip_sgemm(&w_r, &xr, n_embd, n_embd, t * b)?;
-            let k = hip_sgemm(&w_k, &xk, n_embd, n_embd, t * b)?;
-            let mut v = hip_sgemm(&w_v, &xv, n_embd, n_embd, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            {
-                // Stack r, k, v for linear projection probe
-                let stacked: Vec<f32> = [&r, &k, &v]
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .collect();
-                hip_probe!(self, probe_ctx, probe::HipHook::PostAttLinear, &stacked, [n_embd, t, b, 3]);
-            }
-
-            // w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
-            let w0 = layer.att.w0.to_vec(&stream)?;
-            let w1 = layer.att.w1.to_vec(&stream)?;
-            let w2 = layer.att.w2.to_vec(&stream)?;
-            let w1_dim = layer.att.w1.shape().dim(0);
-            let w_lora1 = hip_sgemm(&w1, &xw, w1_dim, n_embd, t * b)?;
-            let w_lora1_tanh = hip_tanh(&w_lora1)?;
-            let w_lora2 = hip_sgemm(&w2, &w_lora1_tanh, n_embd, w1_dim, t * b)?;
-            let mut w: Vec<f32> = w0.iter().cycle().take(w_lora2.len())
-                .zip(w_lora2.iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-            w = hip_softplus_decay(&w)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttDecay, &w, [n_embd, t, b]);
-
-            // a = sigmoid(a0 + (xa @ a1) @ a2)
-            let a0 = layer.att.a0.to_vec(&stream)?;
-            let a1 = layer.att.a1.to_vec(&stream)?;
-            let a2 = layer.att.a2.to_vec(&stream)?;
-            let a1_dim = layer.att.a1.shape().dim(0);
-            let a_lora1 = hip_sgemm(&a1, &xa, a1_dim, n_embd, t * b)?;
-            let a_lora2 = hip_sgemm(&a2, &a_lora1, n_embd, a1_dim, t * b)?;
-            let a_biased: Vec<f32> = a0.iter().cycle().take(a_lora2.len())
-                .zip(a_lora2.iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-            let a = hip_sigmoid(&a_biased)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttAdapt, &a, [n_embd, t, b]);
-
-            // g = sigmoid(xg @ g1) @ g2
-            let g1 = layer.att.g1.to_vec(&stream)?;
-            let g2 = layer.att.g2.to_vec(&stream)?;
-            let g1_dim = layer.att.g1.shape().dim(0);
-            let g_lora1 = hip_sgemm(&g1, &xg, g1_dim, n_embd, t * b)?;
-            let g_lora1_sigmoid = hip_sigmoid(&g_lora1)?;
-            let g = hip_sgemm(&g2, &g_lora1_sigmoid, n_embd, g1_dim, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGate, &g, [n_embd, t, b]);
-
-            // Value residual (layers > 0)
-            if layer_idx > 0 {
-                if let (Some(v0), Some(v1), Some(v2), Some(ref vf)) =
-                    (&layer.att.v0, &layer.att.v1, &layer.att.v2, &v_first) {
-                    let v0_data = v0.to_vec(&stream)?;
-                    let v1_data = v1.to_vec(&stream)?;
-                    let v2_data = v2.to_vec(&stream)?;
-                    let v1_dim = v1.shape().dim(0);
-                    // Note: Use xv (token-shifted input), not v (projected value)
-                    let v_lora1 = hip_sgemm(&v1_data, &xv, v1_dim, n_embd, t * b)?;
-                    let v_lora2 = hip_sgemm(&v2_data, &v_lora1, n_embd, v1_dim, t * b)?;
-                    let v_biased: Vec<f32> = v0_data.iter().cycle().take(v_lora2.len())
-                        .zip(v_lora2.iter())
-                        .map(|(&a, &b)| a + b)
-                        .collect();
-                    let v_residual = hip_sigmoid(&v_biased)?;
-                    // v = v + (v_first - v) * v_residual
-                    v = v.iter().zip(vf.iter()).zip(v_residual.iter())
-                        .map(|((&vi, &vfi), &vri)| vi + (vfi - vi) * vri)
-                        .collect();
-                    #[cfg(feature = "hip-probes")]
-                    hip_probe!(self, probe_ctx, probe::HipHook::PostAttValueResidual, &v, [n_embd, t, b]);
-                }
-            } else {
-                v_first = Some(v.clone());
-            }
-
-            // L2 normalize k
-            let k_k = layer.att.k_k.to_vec(&stream)?;
-            let k_scaled: Vec<f32> = k.iter().zip(k_k.iter().cycle())
-                .map(|(&ki, &kki)| ki * kki)
-                .collect();
-            let kk = hip_l2_norm(&k_scaled, n_embd, t * b, head_size, 1e-12)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttL2Norm, &kk, [n_embd, t, b]);
-
-            // Control K: k = k * (1 + (a - 1) * k_a)
-            let k_a = layer.att.k_a.to_vec(&stream)?;
-            let k_ctrl = hip_control_k(&k_a, &a, &k, n_embd, t, b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttControlK, &k_ctrl, [n_embd, t, b]);
-
-            // WKV inputs
-            let wkv_a: Vec<f32> = kk.iter().map(|&x| -x).collect();
-            let wkv_b: Vec<f32> = kk.iter().zip(a.iter()).map(|(&kki, &ai)| kki * ai).collect();
-            let w_decay: Vec<f32> = w.iter().map(|&wi| wi.exp()).collect();
-
-            #[cfg(feature = "hip-probes")]
-            {
-                // Stack WKV inputs: w_decay, r, k_ctrl, v, wkv_a, wkv_b
-                let stacked: Vec<f32> = [&w_decay, &r, &k_ctrl, &v, &wkv_a, &wkv_b]
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .collect();
-                hip_probe!(self, probe_ctx, probe::HipHook::PreWkv, &stacked, [n_embd, t, b, 6]);
-                hip_probe!(self, probe_ctx, probe::HipHook::PreWkvState, &state.att_states[layer_idx], [head_size, head_size, n_head, b]);
-            }
-
-            // Run WKV7 with length masking
-            let (wkv_output, new_att_state) = hip_wkv7_masked(
-                &w_decay, &r, &k_ctrl, &v, &wkv_a, &wkv_b,
-                &state.att_states[layer_idx], &lengths_i32, head_size, n_head, t, b
-            )?;
-            state.att_states[layer_idx] = new_att_state;
-            #[cfg(feature = "hip-probes")]
-            {
-                hip_probe!(self, probe_ctx, probe::HipHook::PostWkv, &wkv_output, [n_embd, t, b]);
-                hip_probe!(self, probe_ctx, probe::HipHook::PostWkvState, &state.att_states[layer_idx], [head_size, head_size, n_head, b]);
-            }
-
-            // Group norm on WKV output (BEFORE adding bonus, per RWKV7 spec)
-            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
-            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
-            let wkv_normed = hip_group_norm(&wkv_output, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGroupNorm, &wkv_normed, [n_embd, t, b]);
-
-            // WKV bonus (time_first) - added AFTER group norm
-            let r_k = layer.att.r_k.to_vec(&stream)?;
-            let wkv_bonus = hip_wkv_bonus(&r, &k_ctrl, &v, &r_k, head_size, n_head, t, b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostWkvBonus, &wkv_bonus, [n_embd, t, b]);
-
-            // Combine normalized output and bonus: p_t = LayerNorm(wkv) + u_t
-            let x_att_combined: Vec<f32> = wkv_normed.iter().zip(wkv_bonus.iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-
-            // Gate and output projection
-            let x_att_gated: Vec<f32> = x_att_combined.iter().zip(g.iter())
-                .map(|(&xi, &gi)| xi * gi)
-                .collect();
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGated, &x_att_gated, [n_embd, t, b]);
-            let w_o = layer.att.w_o.to_vec(&stream)?;
-            let x_att_out = hip_sgemm(&w_o, &x_att_gated, n_embd, n_embd, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttOut, &x_att_out, [n_embd, t, b]);
-
-            // Residual
-            x = x.iter().zip(x_att_out.iter()).map(|(&a, &b)| a + b).collect();
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAtt, &x, [n_embd, t, b]);
-
-            // ==== Channel-Mix (FFN) ====
-            let ln2_w = layer.ffn_ln.weight.to_vec(&stream)?;
-            let ln2_b = layer.ffn_ln.bias.to_vec(&stream)?;
-            let x_ln2 = hip_layer_norm(&x, &ln2_w, &ln2_b, n_embd, t * b, 1e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnLayerNorm, &x_ln2, [n_embd, t, b]);
-
-            // Token shift for FFN
-            let ffn_x_k = layer.ffn.x_k.to_vec(&stream)?;
-            let (xk_ffn, _) = hip_channel_mix_state(&x_ln2, &state.ffn_states[layer_idx], &ffn_x_k, n_embd, t, b)?;
-            // Update FFN state: use last valid position for each batch (not padding)
-            state.ffn_states[layer_idx] = extract_shift_state_at_lengths(&x_ln2, lengths, n_embd, t, b);
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnTokenShift, &xk_ffn, [n_embd, t, b]);
-
-            // Key projection + squared ReLU
-            let ffn_w_k = layer.ffn.w_k.to_vec(&stream)?;
-            let k_ffn = hip_sgemm(&ffn_w_k, &xk_ffn, n_hidden, n_embd, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnLinear, &k_ffn, [n_hidden, t, b]);
-            let k_sq = hip_squared_relu(&k_ffn)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnActivate, &k_sq, [n_hidden, t, b]);
-
-            // Value projection
-            let ffn_w_v = layer.ffn.w_v.to_vec(&stream)?;
-            let x_ffn_out = hip_sgemm(&ffn_w_v, &k_sq, n_embd, n_hidden, t * b)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnOut, &x_ffn_out, [n_embd, t, b]);
-
-            // Residual
-            x = x.iter().zip(x_ffn_out.iter()).map(|(&a, &b)| a + b).collect();
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostFfn, &x, [n_embd, t, b]);
-        }
-
-        // Reset layer context for head probes
-        #[cfg(feature = "hip-probes")]
-        { probe_ctx.layer = None; }
-
-        // ==== Output Head ====
-        let ln_out_w = self.head.ln.weight.to_vec(&stream)?;
-        let ln_out_b = self.head.ln.bias.to_vec(&stream)?;
-        let x_ln_out = hip_layer_norm(&x, &ln_out_w, &ln_out_b, n_embd, t * b, 1e-5)?;
-        #[cfg(feature = "hip-probes")]
-        hip_probe!(self, probe_ctx, probe::HipHook::PostHeadLayerNorm, &x_ln_out, [n_embd, t, b]);
-
-        // Head projection
-        let head_w = self.head.w.to_vec(&stream)?;
-        let logits = hip_sgemm(&head_w, &x_ln_out, n_vocab, n_embd, t * b)?;
-        #[cfg(feature = "hip-probes")]
-        hip_probe!(self, probe_ctx, probe::HipHook::PostHead, &logits, [n_vocab, t, b]);
-
-        Ok(logits)
+        Ok((logits, state))
     }
 
-    /// GPU-native forward pass using pre-allocated scratch buffers.
-    ///
-    /// This method keeps all computation on the GPU, only copying logits to host
-    /// at the end. It provides better performance than `forward_with_state` by:
-    /// - Reusing a `HipBlasContext` for all GEMM operations
-    /// - Using pre-allocated GPU buffers from `HipScratch`
-    /// - Using GPU-native kernel functions instead of host-side copies
-    ///
-    /// # Arguments
-    /// * `tokens` - Batch of sequences. Each `&[u32]` is one sequence.
-    ///              All sequences must have the same length T.
-    /// * `state` - Mutable reference to inference state. Must have `batch_size == tokens.len()`.
-    /// * `scratch` - Pre-allocated scratch buffers. Must support the sequence length and batch size.
-    ///
-    /// # Returns
-    /// Logits tensor of shape [vocab_size * T * B] in column-major layout [V, T, B].
-    ///
-    /// # Example
-    /// ```ignore
-    /// let config = HipRuntimeConfig::new(128, 4);
-    /// let scratch = HipScratch::new(&model.info, model.lora_dims(), config)?;
-    /// let mut state = HipState::new(&model.info, 4);
-    ///
-    /// let sequences: Vec<&[u32]> = vec![&seq1, &seq2, &seq3, &seq4];
-    /// let logits = model.forward_with_scratch(&sequences, &mut state, &scratch)?;
-    /// ```
-    pub fn forward_with_scratch(
+    /// Ensure scratch buffers are initialized and support the given dimensions.
+    fn ensure_scratch(&self, seq_len: usize, batch_size: usize) -> Result<()> {
+        let mut scratch_ref = self.scratch.borrow_mut();
+
+        let needs_realloc = match scratch_ref.as_ref() {
+            None => true,
+            Some(s) => !s.supports(seq_len, batch_size),
+        };
+
+        if needs_realloc {
+            // Create scratch with generous capacity
+            let max_seq = seq_len.max(128);  // At least 128 for typical decode
+            let config = HipRuntimeConfig::new(max_seq, batch_size);
+            let lora_dims = self.lora_dims();
+            let new_scratch = HipScratch::new(&self.info, lora_dims, config)?;
+            *scratch_ref = Some(new_scratch);
+        }
+
+        Ok(())
+    }
+
+    /// Internal forward pass using scratch buffers and masked WKV.
+    fn forward_inner(
         &self,
         tokens: &[&[u32]],
         state: &mut HipState,
         scratch: &mut HipScratch,
+        lens: &[usize],
     ) -> Result<Vec<f32>> {
         let b = tokens.len();
-        if b == 0 {
-            return Err(HipErrorKind {
-                code: -1,
-                message: "Empty batch".to_string(),
-            });
-        }
-        if b != state.batch_size {
-            return Err(HipErrorKind {
-                code: -1,
-                message: format!(
-                    "Batch size mismatch: tokens has {} sequences but state has batch_size={}",
-                    b, state.batch_size
-                ),
-            });
-        }
-
         let t = tokens[0].len();
-        if t == 0 {
-            return Err(HipErrorKind {
-                code: -1,
-                message: "Empty sequence".to_string(),
-            });
-        }
-
-        // Verify scratch supports this configuration
-        if !scratch.supports(t, b) {
-            return Err(HipErrorKind {
-                code: -1,
-                message: format!(
-                    "Scratch doesn't support seq_len={}, batch_size={} (max: {}, {})",
-                    t, b, scratch.config.max_prefill_chunk, scratch.config.batch_size
-                ),
-            });
-        }
-
-        // Verify all sequences have the same length
-        for (i, seq) in tokens.iter().enumerate() {
-            if seq.len() != t {
-                return Err(HipErrorKind {
-                    code: -1,
-                    message: format!(
-                        "Sequence length mismatch: sequence 0 has {} tokens but sequence {} has {}",
-                        t, i, seq.len()
-                    ),
-                });
-            }
-        }
 
         // Create BLAS context for all GEMM operations
         let ctx = HipBlasContext::with_null_stream()?;
@@ -1602,7 +876,12 @@ impl Rwkv7Hip {
         let n_vocab = self.info.n_vocab;
         let lora_dims = &scratch.lora_dims;
 
-        // Shapes for this forward pass - use actual sequence length
+        // Convert lens to i32 tensor for masked kernel
+        let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
+        let lens_shape = TensorShape::new(b, 1, 1, 1);
+        let lens_gpu = TensorHip::from_slice(&lens_i32, lens_shape, stream)?;
+
+        // Shapes for this forward pass
         let std_shape = TensorShape::new(n_embd, t, b, 1);
         let ffn_shape = TensorShape::new(n_hidden, t, b, 1);
         let out_shape = TensorShape::new(n_vocab, t, b, 1);
@@ -1614,8 +893,7 @@ impl Rwkv7Hip {
         let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, b, 1);
         let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
 
-        // Create resized views of scratch buffers for the actual sequence length
-        // Standard buffers [n_embd, t, b]
+        // Create resized views of scratch buffers
         let mut x = scratch.x.resized_view_mut(std_shape)?;
         let mut x_ln = scratch.x_ln.resized_view_mut(std_shape)?;
         let mut att_xr = scratch.att_xr.resized_view_mut(std_shape)?;
@@ -1643,7 +921,7 @@ impl Rwkv7Hip {
         let mut ffn_out = scratch.ffn_out.resized_view_mut(std_shape)?;
         let mut v_first = scratch.v_first.resized_view_mut(std_shape)?;
 
-        // FFN hidden buffers [n_hidden, t, b]
+        // FFN hidden buffers
         let mut ffn_k = scratch.ffn_k.resized_view_mut(ffn_shape)?;
         let mut ffn_k_sq = scratch.ffn_k_sq.resized_view_mut(ffn_shape)?;
 
@@ -1653,7 +931,7 @@ impl Rwkv7Hip {
         let mut lora_g = scratch.lora_g.resized_view_mut(lora_g_shape)?;
         let mut lora_v = scratch.lora_v.resized_view_mut(lora_v_shape)?;
 
-        // Output buffer [n_vocab, t, b]
+        // Output buffer
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
 
         // Embedding lookup: tokens[b][t] -> x[c, t, b]
@@ -1670,7 +948,7 @@ impl Rwkv7Hip {
         }
         x.copy_from_slice(&x_host, stream)?;
 
-        // Create temporary GPU buffers for state (upload at start, download at end)
+        // Upload state to GPU
         let mut att_shift_gpu: Vec<TensorHip<f32>> = state.att_shift_states
             .iter()
             .map(|s| TensorHip::from_slice(s, state_shape, stream))
@@ -1686,12 +964,10 @@ impl Rwkv7Hip {
             .map(|s| TensorHip::from_slice(s, wkv_state_shape, stream))
             .collect::<Result<Vec<_>>>()?;
 
-        // Temporary buffers for new shift states
+        // Temporary buffers
         let mut new_att_shift = TensorHip::<f32>::new(state_shape)?;
         let mut new_ffn_shift = TensorHip::<f32>::new(state_shape)?;
         let mut new_wkv_state = TensorHip::<f32>::new(wkv_state_shape)?;
-
-        // Temporary buffers for operations requiring distinct input/output
         let mut temp1 = TensorHip::<f32>::new(std_shape)?;
         let mut temp2 = TensorHip::<f32>::new(std_shape)?;
 
@@ -1705,12 +981,10 @@ impl Rwkv7Hip {
                     &x, &self.embed.ln.weight, &self.embed.ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
-                // Copy x_ln to x for subsequent operations (GPU-to-GPU)
                 copy_tensor_f32(&x_ln, &mut x, stream)?;
             }
 
             // ==== Time-Mix (Attention) ====
-            // Layer norm
             layer_norm_f32(
                 &x, &layer.att_ln.weight, &layer.att_ln.bias,
                 &mut x_ln, 1e-5, stream
@@ -1780,20 +1054,18 @@ impl Rwkv7Hip {
                     ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
                     broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
                     sigmoid_f32(&temp1, &mut temp2, stream)?;
-                    // v = v + (v_first - v) * v_residual = lerp(v, v_first, v_residual)
                     lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
                     copy_tensor_f32(&temp1, &mut att_v, stream)?;
                 }
             } else {
-                // Store v_first from layer 0 (GPU-to-GPU copy)
                 copy_tensor_f32(&att_v, &mut v_first, stream)?;
             }
 
-            // L2 normalize k: k_scaled = k * k_k, then L2 norm
+            // L2 normalize k
             broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
             l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
 
-            // Control K: k_ctrl = k * (1 + (a - 1) * k_a)
+            // Control K
             control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
 
             // WKV inputs
@@ -1801,7 +1073,7 @@ impl Rwkv7Hip {
             mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
             exp_f32(&att_w, &mut w_decay, stream)?;
 
-            // Reshape for WKV: [n_embd, t, b] -> [head_size, n_head, t, b] (zero-copy)
+            // Reshape for WKV
             let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;
             let r_wkv = att_r.reshape_view(wkv_data_shape)?;
             let k_ctrl_wkv = att_k_ctrl.reshape_view(wkv_data_shape)?;
@@ -1810,13 +1082,13 @@ impl Rwkv7Hip {
             let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
             let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
-            // Run WKV7
-            wkv7_f32(
+            // Run masked WKV7 (skips state updates for padding positions)
+            wkv7_f32_masked(
                 &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
-                &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state, stream
+                &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
+                &lens_gpu, stream
             )?;
             std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
-            // wkv_out already has the output via reshape_view_mut (same memory)
 
             // Group norm on WKV output
             group_norm_f32(
@@ -1824,28 +1096,24 @@ impl Rwkv7Hip {
                 &mut wkv_normed, n_head, 64e-5, stream
             )?;
 
-            // WKV bonus (zero-copy reshape)
+            // WKV bonus
             let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
             let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
             let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
             wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
-            // wkv_bonus already has the output via reshape_view_mut
 
-            // Combine: wkv_normed + wkv_bonus
+            // Combine and gate
             add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
-
-            // Gate: combined * g
             mul_f32(&temp1, &att_g, &mut temp2, stream)?;
 
             // Output projection
             ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
 
-            // Residual: x = x + att_out (GPU-to-GPU)
+            // Residual
             add_f32(&x, &att_out, &mut temp1, stream)?;
             copy_tensor_f32(&temp1, &mut x, stream)?;
 
             // ==== Channel-Mix (FFN) ====
-            // Layer norm
             layer_norm_f32(
                 &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
                 &mut x_ln, 1e-5, stream
@@ -1867,19 +1135,17 @@ impl Rwkv7Hip {
             // Value projection
             ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
 
-            // Residual: x = x + ffn_out (GPU-to-GPU)
+            // Residual
             add_f32(&x, &ffn_out, &mut temp1, stream)?;
             copy_tensor_f32(&temp1, &mut x, stream)?;
         }
 
         // ==== Output Head ====
-        // Layer norm
         layer_norm_f32(
             &x, &self.head.ln.weight, &self.head.ln.bias,
             &mut x_ln, 1e-5, stream
         )?;
 
-        // Head projection -> logits
         ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
 
         // Download state back to host
@@ -1898,3 +1164,5 @@ impl Rwkv7Hip {
     }
 }
 
+// Old forward_with_state, forward_with_state_masked, forward_with_scratch deleted.
+// See forward() for the unified API.

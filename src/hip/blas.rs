@@ -223,10 +223,12 @@ pub fn hgemm_f16(
     let input_shape = input.shape();
 
     // weight: [N, K, 1, 1] where N is out_features, K is in_features
-    // input: [K, A, 1, 1] where K is in_features, A is tokens
+    // input: [K, T, B, 1] where K is in_features, T*B is total columns
+    // For batched inputs, we flatten all non-first dimensions into columns
     let m = weight_shape[0] as c_int;  // N (output features) - rows of weight
     let k = weight_shape[1] as c_int;  // K (input features) - cols of weight, rows of input
-    let n = input_shape[1] as c_int;   // A (tokens) - cols of input
+    // Compute n as product of all dimensions except the first (handles batching)
+    let n = (input_shape[1] * input_shape[2] * input_shape[3]) as c_int;
 
     // Verify dimensions
     if input_shape[0] as c_int != k {
@@ -287,10 +289,12 @@ pub fn sgemm_f32(
     let input_shape = input.shape();
 
     // weight: [N, K, 1, 1] where N is out_features, K is in_features
-    // input: [K, A, 1, 1] where K is in_features, A is tokens
+    // input: [K, T, B, 1] where K is in_features, T*B is total columns
+    // For batched inputs, we flatten all non-first dimensions into columns
     let m = weight_shape[0] as c_int;  // N (output features) - rows of weight
     let k = weight_shape[1] as c_int;  // K (input features) - cols of weight, rows of input
-    let n = input_shape[1] as c_int;   // A (tokens) - cols of input
+    // Compute n as product of all dimensions except the first (handles batching)
+    let n = (input_shape[1] * input_shape[2] * input_shape[3]) as c_int;
 
     // Verify dimensions
     if input_shape[0] as c_int != k {

@@ -379,17 +379,19 @@ pub fn layer_norm_f32(
     eps: f32,
     stream: &Stream,
 ) -> Result<()> {
-    // Input shape: [C, N, 1, 1]
+    // Input shape: [C, T, B, 1] - treat T*B as total vectors
     let c = input.shape()[0];  // Channel dimension (normalize over this)
-    let n = input.shape()[1];  // Number of vectors
+    // Compute n as product of all dimensions except the first (handles batching)
+    let n = input.shape()[1] * input.shape()[2] * input.shape()[3];
 
-    // Validate shapes
-    if output.shape()[0] != c || output.shape()[1] != n {
+    // Validate shapes - output should have same total size
+    let out_n = output.shape()[1] * output.shape()[2] * output.shape()[3];
+    if output.shape()[0] != c || out_n != n {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
-                "Output shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, n, output.shape()
+                "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
+                c, n, output.shape(), out_n
             ),
         });
     }
@@ -500,7 +502,8 @@ pub fn group_norm_f32(
     stream: &Stream,
 ) -> Result<()> {
     let c = input.shape()[0];
-    let n = input.shape()[1];
+    // Compute n as product of all dimensions except the first (handles batching)
+    let n = input.shape()[1] * input.shape()[2] * input.shape()[3];
 
     if c % num_groups != 0 {
         return Err(HipErrorKind {
@@ -511,12 +514,14 @@ pub fn group_norm_f32(
             ),
         });
     }
-    if output.shape()[0] != c || output.shape()[1] != n {
+    // Validate shapes - output should have same total size
+    let out_n = output.shape()[1] * output.shape()[2] * output.shape()[3];
+    if output.shape()[0] != c || out_n != n {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
-                "Output shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, n, output.shape()
+                "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
+                c, n, output.shape(), out_n
             ),
         });
     }
@@ -598,7 +603,8 @@ pub fn l2_norm_f32(
     stream: &Stream,
 ) -> Result<()> {
     let c = input.shape()[0];
-    let n = input.shape()[1];
+    // Compute n as product of all dimensions except the first (handles batching)
+    let n = input.shape()[1] * input.shape()[2] * input.shape()[3];
 
     if c % head_size != 0 {
         return Err(HipErrorKind {
@@ -609,12 +615,14 @@ pub fn l2_norm_f32(
             ),
         });
     }
-    if output.shape()[0] != c || output.shape()[1] != n {
+    // Validate shapes - output should have same total size
+    let out_n = output.shape()[1] * output.shape()[2] * output.shape()[3];
+    if output.shape()[0] != c || out_n != n {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
-                "Output shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, n, output.shape()
+                "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
+                c, n, output.shape(), out_n
             ),
         });
     }

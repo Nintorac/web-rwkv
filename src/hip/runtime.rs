@@ -97,22 +97,42 @@ impl HipRuntime {
 
     /// Run inference on a batch of token sequences.
     ///
-    /// This is a simple inference method for proof-of-life testing.
-    /// All sequences must have equal length.
+    /// Supports variable-length sequences through padding and masking.
+    /// State is preserved across calls for streaming inference.
     ///
     /// # Arguments
-    /// * `tokens` - Batch of token sequences, all same length
+    /// * `sequences` - Batch of token sequences (can be variable length)
     ///
     /// # Returns
-    /// Logits tensor with shape [vocab_size, num_tokens * batch_size, 1, 1]
-    pub fn infer(&self, tokens: &[&[u32]]) -> Result<TensorCpu<f32>, super::HipErrorKind> {
-        let mut state = self.state.lock().unwrap();
-        let logits = self.model.forward_with_state(tokens, &mut state)?;
+    /// Logits tensor with shape [vocab_size, max_len * batch_size, 1, 1]
+    pub fn infer(&self, sequences: &[&[u32]]) -> Result<TensorCpu<f32>, super::HipErrorKind> {
+        if sequences.is_empty() {
+            return Err(super::HipErrorKind {
+                code: -1,
+                message: "Empty batch".to_string(),
+            });
+        }
+
+        // Pad sequences and get original lengths
+        let (padded, lengths) = self.pad_sequences(sequences);
+        let padded_refs: Vec<&[u32]> = padded.iter().map(|v| v.as_slice()).collect();
+
+        // Take state from mutex, run forward, put new state back
+        let mut state_guard = self.state.lock().unwrap();
+        let old_state = std::mem::replace(&mut *state_guard, HipState::new(&self.model.info, self.num_batch));
+        drop(state_guard);
+
+        let (logits, new_state) = self.model.forward(&padded_refs, Some(old_state), &lengths)?;
+
+        // Store the updated state
+        let mut state_guard = self.state.lock().unwrap();
+        *state_guard = new_state;
 
         // Convert to TensorCpu
         let vocab_size = self.model.info.n_vocab;
-        let total_tokens = tokens.iter().map(|t| t.len()).sum::<usize>();
-        let shape = crate::tensor::shape::Shape::new(vocab_size, total_tokens, 1, 1);
+        let max_len = padded[0].len();
+        let batch_size = sequences.len();
+        let shape = crate::tensor::shape::Shape::new(vocab_size, max_len * batch_size, 1, 1);
 
         TensorInit::from_data(shape, logits).map_err(|e| super::HipErrorKind {
             code: -1,
@@ -153,54 +173,6 @@ impl HipRuntime {
         }
 
         (padded, lengths)
-    }
-
-    /// Run inference on variable-length sequences with masking.
-    ///
-    /// This method handles sequences of different lengths by:
-    /// 1. Padding all sequences to the maximum length
-    /// 2. Using the masked forward pass to ignore padding
-    /// 3. Returning logits for all positions (caller extracts valid ones)
-    ///
-    /// # Arguments
-    /// * `sequences` - Variable-length token sequences
-    ///
-    /// # Returns
-    /// Logits tensor with shape [vocab_size, max_len * batch_size, 1, 1]
-    /// along with the original sequence lengths for output extraction.
-    pub fn infer_variable_length(
-        &self,
-        sequences: &[&[u32]],
-    ) -> Result<(TensorCpu<f32>, Vec<usize>), super::HipErrorKind> {
-        if sequences.is_empty() {
-            return Err(super::HipErrorKind {
-                code: -1,
-                message: "Empty batch".to_string(),
-            });
-        }
-
-        let (padded, lengths) = self.pad_sequences(sequences);
-
-        // Convert to the format expected by forward_with_state_masked
-        let padded_refs: Vec<&[u32]> = padded.iter().map(|v| v.as_slice()).collect();
-
-        let mut state = self.state.lock().unwrap();
-        let logits = self
-            .model
-            .forward_with_state_masked(&padded_refs, &lengths, &mut state)?;
-
-        // Convert to TensorCpu
-        let vocab_size = self.model.info.n_vocab;
-        let max_len = padded[0].len();
-        let batch_size = sequences.len();
-        let shape = crate::tensor::shape::Shape::new(vocab_size, max_len * batch_size, 1, 1);
-
-        let tensor = TensorInit::from_data(shape, logits).map_err(|e| super::HipErrorKind {
-            code: -1,
-            message: format!("Failed to create output tensor: {}", e),
-        })?;
-
-        Ok((tensor, lengths))
     }
 
     /// Extract logits for the last real token of each sequence.
@@ -955,8 +927,9 @@ mod tests {
         // But we only care about the first batch's state
         let seq1: Vec<u32> = vec![1, 2, 3];
         let seq2: Vec<u32> = vec![4, 5]; // Different sequence, will be padded
-        let (_logits_padded, _lengths) = runtime_padded
-            .infer_variable_length(&[&seq1, &seq2])
+        // infer() now handles variable-length sequences automatically
+        let _logits_padded = runtime_padded
+            .infer(&[&seq1, &seq2])
             .expect("Padded inference failed");
         let state_padded = runtime_padded.get_state_snapshot();
 
@@ -1005,50 +978,4 @@ mod tests {
         println!("test_padding_preserves_hidden_state PASSED");
     }
 
-    /// Test variable-length inference end-to-end
-    #[test]
-    fn test_infer_variable_length() {
-        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
-        if !Path::new(model_path).exists() {
-            eprintln!("Skipping test: model not found at {}", model_path);
-            return;
-        }
-
-        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
-        let runtime = HipRuntime::new(model, 2);
-
-        // Two sequences of different lengths
-        let seq1: Vec<u32> = vec![1, 2, 3, 4, 5];
-        let seq2: Vec<u32> = vec![10, 20];
-
-        let (logits, lengths) = runtime
-            .infer_variable_length(&[&seq1, &seq2])
-            .expect("Variable-length inference failed");
-
-        // Verify lengths returned correctly
-        assert_eq!(lengths, vec![5, 2]);
-
-        // Verify logits shape
-        let max_len = 5;
-        let expected_total = vocab_size * max_len * 2;
-        assert_eq!(logits.data().len(), expected_total);
-
-        // Extract last logits and verify they're valid
-        let last_logits = runtime.extract_last_logits(&logits, &lengths, max_len);
-        assert_eq!(last_logits.len(), 2);
-        assert_eq!(last_logits[0].len(), vocab_size);
-        assert_eq!(last_logits[1].len(), vocab_size);
-
-        // Verify no NaN/Inf
-        for (i, seq_logits) in last_logits.iter().enumerate() {
-            assert!(
-                seq_logits.iter().all(|&x| x.is_finite()),
-                "Sequence {} has non-finite logits",
-                i
-            );
-        }
-
-        println!("test_infer_variable_length PASSED");
-    }
 }

@@ -1126,9 +1126,9 @@ mod tests {
         println!("HipState batched sizing test passed (B=4)");
     }
 
-    /// Test that forward() convenience wrapper works.
+    /// Test that forward() API works with new (logits, state) return.
     #[test]
-    fn test_forward_convenience_wrapper() {
+    fn test_forward_basic() {
         use std::path::Path;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
@@ -1138,16 +1138,17 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let tokens = vec![1u32, 2, 3, 4, 5];
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let lens = vec![tokens.len()];
 
-        let logits = model.forward(&tokens).expect("forward() failed");
+        let (logits, _state) = model.forward(&[&tokens], None, &lens).expect("forward() failed");
 
         // Should return vocab_size * T logits
         let expected_len = model.info.n_vocab * tokens.len();
         assert_eq!(logits.len(), expected_len,
             "Expected {} logits, got {}", expected_len, logits.len());
 
-        println!("forward() convenience wrapper test passed");
+        println!("forward() basic test passed");
     }
 
     /// Test batched inference with B=2 produces same results as sequential B=1.
@@ -1166,19 +1167,18 @@ mod tests {
         // Two sequences
         let seq1: Vec<u32> = vec![1, 2, 3];
         let seq2: Vec<u32> = vec![4, 5, 6];
+        let t = seq1.len();
 
-        // Run sequentially with B=1
-        let logits1 = model.forward(&seq1).expect("seq1 forward failed");
-        let logits2 = model.forward(&seq2).expect("seq2 forward failed");
+        // Run sequentially with B=1 (fresh state each time)
+        let (logits1, _) = model.forward(&[&seq1], None, &[t]).expect("seq1 forward failed");
+        let (logits2, _) = model.forward(&[&seq2], None, &[t]).expect("seq2 forward failed");
 
-        // Run batched with B=2
-        let mut state = HipState::new(&model.info, 2);
-        let batched_logits = model.forward_with_state(&[&seq1, &seq2], &mut state)
+        // Run batched with B=2 (fresh state)
+        let (batched_logits, _) = model.forward(&[&seq1, &seq2], None, &[t, t])
             .expect("batched forward failed");
 
         // Batched output should have shape [vocab_size, T, B]
         let vocab = model.info.n_vocab;
-        let t = 3;
         let b = 2;
         assert_eq!(batched_logits.len(), vocab * t * b);
 
@@ -1223,18 +1223,18 @@ mod tests {
 
         let tokens: Vec<u32> = vec![1, 2, 3];
 
-        // Single-sequence batch forward
-        let mut state1 = HipState::new(&model.info, 1);
-        let logits_batch = model.forward_with_state(&[&tokens], &mut state1)
+        // Single-sequence batch forward (all tokens at once)
+        let (logits_batch, _) = model.forward(&[&tokens], None, &[tokens.len()])
             .expect("batch forward failed");
 
-        // Single-sequence streaming (token by token)
-        let mut state2 = HipState::new(&model.info, 1);
+        // Single-sequence streaming (token by token, chain state)
         let mut logits_stream = Vec::new();
+        let mut state: Option<HipState> = None;
         for &tok in &tokens {
-            let logits = model.forward_with_state(&[&[tok]], &mut state2)
+            let (logits, new_state) = model.forward(&[&[tok]], state, &[1])
                 .expect("streaming forward failed");
             logits_stream.extend(logits);
+            state = Some(new_state);
         }
 
         assert_eq!(logits_batch.len(), logits_stream.len());
@@ -1267,17 +1267,17 @@ mod tests {
         let chunk_size = 4;
 
         // Full forward
-        let mut state1 = HipState::new(&model.info, 1);
-        let logits_full = model.forward_with_state(&[&tokens], &mut state1)
+        let (logits_full, _) = model.forward(&[&tokens], None, &[tokens.len()])
             .expect("full forward failed");
 
         // Chunked forward
-        let mut state2 = HipState::new(&model.info, 1);
         let mut logits_chunked = Vec::new();
+        let mut state: Option<HipState> = None;
         for chunk in tokens.chunks(chunk_size) {
-            let logits = model.forward_with_state(&[chunk], &mut state2)
+            let (logits, new_state) = model.forward(&[chunk], state, &[chunk.len()])
                 .expect("chunked forward failed");
             logits_chunked.extend(logits);
+            state = Some(new_state);
         }
 
         assert_eq!(logits_full.len(), logits_chunked.len());
@@ -1307,31 +1307,23 @@ mod tests {
 
         let seq1: Vec<u32> = vec![1, 2, 3];
         let seq2: Vec<u32> = vec![4, 5, 6];
+        let t = seq1.len();
 
-        let mut state = HipState::new(&model.info, 2);
-
-        // State starts at zero
-        let att_sum_before: f32 = state.att_states.iter()
-            .flat_map(|v| v.iter())
-            .map(|x| x.abs())
-            .sum();
-        assert_eq!(att_sum_before, 0.0);
-
-        // Run forward
-        let _ = model.forward_with_state(&[&seq1, &seq2], &mut state)
+        // Run forward with fresh state (None)
+        let (_, state) = model.forward(&[&seq1, &seq2], None, &[t, t])
             .expect("forward failed");
 
-        // State should have evolved
-        let att_sum_after: f32 = state.att_states.iter()
+        // Returned state should have evolved (non-zero)
+        let att_sum: f32 = state.att_states.iter()
             .flat_map(|v| v.iter())
             .map(|x| x.abs())
             .sum();
-        assert!(att_sum_after > 0.0, "att_states should be non-zero after forward");
+        assert!(att_sum > 0.0, "att_states should be non-zero after forward");
 
         println!("Batched state evolution test PASSED");
     }
 
-    /// Test batch size mismatch error.
+    /// Test batch size mismatch error when state batch_size != input batch size.
     #[test]
     fn test_batch_size_mismatch_error() {
         use std::path::Path;
@@ -1345,10 +1337,11 @@ mod tests {
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
 
         // State with batch_size=2, but provide 3 sequences
-        let mut state = HipState::new(&model.info, 2);
-        let result = model.forward_with_state(
+        let state = HipState::new(&model.info, 2);
+        let result = model.forward(
             &[&[1u32], &[2u32], &[3u32]],
-            &mut state
+            Some(state),
+            &[1, 1, 1]
         );
 
         assert!(result.is_err(), "Should error on batch size mismatch");
@@ -1368,11 +1361,11 @@ mod tests {
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
 
-        // Two sequences with different lengths
-        let mut state = HipState::new(&model.info, 2);
-        let result = model.forward_with_state(
+        // Two sequences with different (unpadded) lengths - should error
+        let result = model.forward(
             &[&[1u32, 2, 3], &[4u32, 5]],  // length 3 vs length 2
-            &mut state
+            None,
+            &[3, 2]
         );
 
         assert!(result.is_err(), "Should error on sequence length mismatch");

@@ -393,8 +393,7 @@ fn test_hip_layer_by_layer_step0() {
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let mut state = HipState::new(&model.info, 1);
-    let _logits = model.forward_with_state(&[&[token]], &mut state)
+    let (_logits, _state) = model.forward(&[&[token]], None, &[1])
         .expect("Forward pass failed");
 
     // Validate all captured values
@@ -560,8 +559,7 @@ fn test_probe_coverage() {
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let mut state = HipState::new(&model.info, 1);
-    let _logits = model.forward_with_state(&[&[0]], &mut state)
+    let (_logits, _state) = model.forward(&[&[0]], None, &[1])
         .expect("Forward pass failed");
 
     let captured = captured.lock().unwrap();
@@ -653,7 +651,7 @@ fn test_hip_divergence_progression() {
 
     // Load model (without probes for speed)
     let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-    let mut state = HipState::new(&model.info, 1);
+    let mut state: Option<HipState> = None;
 
     for step in 0..n_steps {
         let token = tokens_i64[step] as u32;
@@ -667,8 +665,9 @@ fn test_hip_divergence_progression() {
         let fixture = TestFixture::load(&fixture_path)
             .expect(&format!("Failed to load {}", fixture_path));
 
-        let logits = model.forward_with_state(&[&[token]], &mut state)
+        let (logits, new_state) = model.forward(&[&[token]], state, &[1])
             .expect("Forward failed");
+        state = Some(new_state);
 
         let expected = fixture.f32("logits");
 

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use web_rwkv::hip::{HipHook, HipProbeBuilder, Rwkv7Hip, HipState};
+use web_rwkv::hip::{HipHook, HipProbeBuilder, Rwkv7Hip};
 
 /// Test that probes capture intermediate values during forward pass.
 #[test]
@@ -61,8 +61,7 @@ fn test_probe_captures_intermediates() {
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let mut state = HipState::new(&model.info, 1);
-    let _logits = model.forward_with_state(&[&[0, 1, 2]], &mut state)
+    let (_logits, _state) = model.forward(&[&[0, 1, 2]], None, &[3])
         .expect("Forward failed");
 
     // Check captured values
@@ -138,9 +137,8 @@ fn test_probe_context() {
         .with_probes(probes);
 
     // Test with batch_size=2, seq_len=4
-    let mut state = HipState::new(&model.info, 2);
     let tokens = vec![0u32, 1, 2, 3];
-    let _logits = model.forward_with_state(&[&tokens, &tokens], &mut state)
+    let (_logits, _state) = model.forward(&[&tokens, &tokens], None, &[4, 4])
         .expect("Forward failed");
 
     let contexts = contexts.lock().unwrap();
@@ -159,7 +157,7 @@ fn test_probe_context() {
     println!("Context test passed - captured {} contexts", contexts.len());
 }
 
-/// Test that probes work with forward_with_state_masked.
+/// Test that probes work with variable-length forward pass.
 #[test]
 fn test_probe_with_masked_forward() {
     let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
@@ -185,14 +183,13 @@ fn test_probe_with_masked_forward() {
 
     let n_layer = model.info.n_layer;
 
-    // Use masked forward with variable lengths
-    let mut state = HipState::new(&model.info, 2);
+    // Use forward with variable lengths
     let seq1 = vec![0u32, 1, 2, 0, 0]; // length 3
     let seq2 = vec![0u32, 1, 2, 3, 4]; // length 5
     let lengths = vec![3, 5];
 
-    let _logits = model.forward_with_state_masked(&[&seq1, &seq2], &lengths, &mut state)
-        .expect("Masked forward failed");
+    let (_logits, _state) = model.forward(&[&seq1, &seq2], None, &lengths)
+        .expect("Forward failed");
 
     let captured = captured.lock().unwrap();
     let wkv_count = captured.get(&HipHook::PostWkv).copied().unwrap_or(0);
