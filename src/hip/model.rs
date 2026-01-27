@@ -16,7 +16,8 @@ use super::kernels::{
     layer_norm_f32, group_norm_f32, l2_norm_f32,
     sigmoid_f32, tanh_f32, softplus_decay_f32, squared_relu_f32,
     channel_mix_state_f32, control_k_f32, wkv7_f32, wkv_bonus_f32,
-    add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32,
+    add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32, broadcast_mul_f32,
+    lerp_f32, copy_tensor_f32,
 };
 use super::blas::{hip_sgemm, HipBlasContext};
 use super::scratch::HipScratch;
@@ -1704,9 +1705,8 @@ impl Rwkv7Hip {
                     &x, &self.embed.ln.weight, &self.embed.ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
-                // Copy x_ln to x for subsequent operations
-                let x_ln_data = x_ln.to_vec(stream)?;
-                x.copy_from_slice(&x_ln_data, stream)?;
+                // Copy x_ln to x for subsequent operations (GPU-to-GPU)
+                copy_tensor_f32(&x_ln, &mut x, stream)?;
             }
 
             // ==== Time-Mix (Attention) ====
@@ -1780,28 +1780,17 @@ impl Rwkv7Hip {
                     ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
                     broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
                     sigmoid_f32(&temp1, &mut temp2, stream)?;
-                    // v = v + (v_first - v) * v_residual (CPU fallback)
-                    let v_host = att_v.to_vec(stream)?;
-                    let vf_host = v_first.to_vec(stream)?;
-                    let vr_host = temp2.to_vec(stream)?;
-                    let v_updated: Vec<f32> = v_host.iter().zip(vf_host.iter()).zip(vr_host.iter())
-                        .map(|((&vi, &vfi), &vri)| vi + (vfi - vi) * vri)
-                        .collect();
-                    att_v.copy_from_slice(&v_updated, stream)?;
+                    // v = v + (v_first - v) * v_residual = lerp(v, v_first, v_residual)
+                    lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
+                    copy_tensor_f32(&temp1, &mut att_v, stream)?;
                 }
             } else {
-                // Store v_first from layer 0
-                let v_data = att_v.to_vec(stream)?;
-                v_first.copy_from_slice(&v_data, stream)?;
+                // Store v_first from layer 0 (GPU-to-GPU copy)
+                copy_tensor_f32(&att_v, &mut v_first, stream)?;
             }
 
-            // L2 normalize k: k_scaled = k * k_k, then L2 norm (CPU fallback for broadcast mul)
-            let k_host = att_k.to_vec(stream)?;
-            let k_k_host = layer.att.k_k.to_vec(stream)?;
-            let k_scaled: Vec<f32> = k_host.iter().zip(k_k_host.iter().cycle())
-                .map(|(&ki, &kki)| ki * kki)
-                .collect();
-            temp1.copy_from_slice(&k_scaled, stream)?;
+            // L2 normalize k: k_scaled = k * k_k, then L2 norm
+            broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
             l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
 
             // Control K: k_ctrl = k * (1 + (a - 1) * k_a)
@@ -1812,24 +1801,22 @@ impl Rwkv7Hip {
             mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
             exp_f32(&att_w, &mut w_decay, stream)?;
 
-            // Reshape for WKV
-            let w_decay_wkv = TensorHip::from_slice(&w_decay.to_vec(stream)?, wkv_data_shape, stream)?;
-            let r_wkv = TensorHip::from_slice(&att_r.to_vec(stream)?, wkv_data_shape, stream)?;
-            let k_ctrl_wkv = TensorHip::from_slice(&att_k_ctrl.to_vec(stream)?, wkv_data_shape, stream)?;
-            let v_wkv = TensorHip::from_slice(&att_v.to_vec(stream)?, wkv_data_shape, stream)?;
-            let wkv_a_gpu = TensorHip::from_slice(&wkv_a.to_vec(stream)?, wkv_data_shape, stream)?;
-            let wkv_b_gpu = TensorHip::from_slice(&wkv_b.to_vec(stream)?, wkv_data_shape, stream)?;
-            let mut wkv_out_wkv = TensorHip::<f32>::new(wkv_data_shape)?;
+            // Reshape for WKV: [n_embd, t, b] -> [head_size, n_head, t, b] (zero-copy)
+            let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;
+            let r_wkv = att_r.reshape_view(wkv_data_shape)?;
+            let k_ctrl_wkv = att_k_ctrl.reshape_view(wkv_data_shape)?;
+            let v_wkv = att_v.reshape_view(wkv_data_shape)?;
+            let wkv_a_wkv = wkv_a.reshape_view(wkv_data_shape)?;
+            let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
+            let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
             // Run WKV7
             wkv7_f32(
-                &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_gpu, &wkv_b_gpu,
+                &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
                 &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state, stream
             )?;
             std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
-
-            // Copy WKV output back to standard shape
-            wkv_out.copy_from_slice(&wkv_out_wkv.to_vec(stream)?, stream)?;
+            // wkv_out already has the output via reshape_view_mut (same memory)
 
             // Group norm on WKV output
             group_norm_f32(
@@ -1837,12 +1824,12 @@ impl Rwkv7Hip {
                 &mut wkv_normed, n_head, 64e-5, stream
             )?;
 
-            // WKV bonus
+            // WKV bonus (zero-copy reshape)
             let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
-            let r_k_gpu = TensorHip::from_slice(&layer.att.r_k.to_vec(stream)?, r_k_shape, stream)?;
-            let mut wkv_bonus_wkv = TensorHip::<f32>::new(wkv_data_shape)?;
-            wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_gpu, &mut wkv_bonus_wkv, stream)?;
-            wkv_bonus.copy_from_slice(&wkv_bonus_wkv.to_vec(stream)?, stream)?;
+            let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
+            let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
+            wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
+            // wkv_bonus already has the output via reshape_view_mut
 
             // Combine: wkv_normed + wkv_bonus
             add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
@@ -1853,10 +1840,9 @@ impl Rwkv7Hip {
             // Output projection
             ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
 
-            // Residual: x = x + att_out
+            // Residual: x = x + att_out (GPU-to-GPU)
             add_f32(&x, &att_out, &mut temp1, stream)?;
-            let temp1_data = temp1.to_vec(stream)?;
-            x.copy_from_slice(&temp1_data, stream)?;
+            copy_tensor_f32(&temp1, &mut x, stream)?;
 
             // ==== Channel-Mix (FFN) ====
             // Layer norm
@@ -1881,10 +1867,9 @@ impl Rwkv7Hip {
             // Value projection
             ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
 
-            // Residual: x = x + ffn_out
+            // Residual: x = x + ffn_out (GPU-to-GPU)
             add_f32(&x, &ffn_out, &mut temp1, stream)?;
-            let temp1_data = temp1.to_vec(stream)?;
-            x.copy_from_slice(&temp1_data, stream)?;
+            copy_tensor_f32(&temp1, &mut x, stream)?;
         }
 
         // ==== Output Head ====

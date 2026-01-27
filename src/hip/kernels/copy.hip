@@ -1272,6 +1272,27 @@ hipError_t launch_broadcast_add_f32(const float* input, const float* bias, float
     return hipGetLastError();
 }
 
+// Broadcast multiply: output[i] = input[i] * scale[i % scale_len]
+// Used for per-channel scaling (e.g., k * k_k in RWKV7)
+__global__ void kernel_broadcast_mul_f32(const float* __restrict__ input,
+                                         const float* __restrict__ scale,
+                                         float* __restrict__ output,
+                                         int n, int scale_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = input[idx] * scale[idx % scale_len];
+    }
+}
+
+hipError_t launch_broadcast_mul_f32(const float* input, const float* scale, float* output,
+                                    int n, int scale_len, hipStream_t stream) {
+    const int BLOCK_SIZE = 256;
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_broadcast_mul_f32, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       input, scale, output, n, scale_len);
+    return hipGetLastError();
+}
+
 // Get device count for initialization check
 hipError_t hip_get_device_count(int* count) {
     return hipGetDeviceCount(count);

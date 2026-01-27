@@ -217,6 +217,7 @@ extern "C" {
     pub fn launch_negate_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_broadcast_add_f32(input: *const f32, bias: *const f32, output: *mut f32, n: c_int, bias_len: c_int, stream: HipStream) -> HipError;
+    pub fn launch_broadcast_mul_f32(input: *const f32, scale: *const f32, output: *mut f32, n: c_int, scale_len: c_int, stream: HipStream) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     pub fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;

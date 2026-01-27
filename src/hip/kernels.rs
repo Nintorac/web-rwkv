@@ -10,7 +10,8 @@ use super::ffi::{
     launch_tanh_f32, launch_token_shift_f32, launch_channel_mix_state_f32,
     launch_wkv_bonus_f32, launch_control_k_f32, launch_wkv7_f32, launch_wkv7_f32_masked,
     // Elementwise operations
-    launch_add_f32, launch_mul_f32, launch_negate_f32, launch_exp_f32, launch_broadcast_add_f32,
+    launch_add_f32, launch_mul_f32, launch_negate_f32, launch_exp_f32,
+    launch_broadcast_add_f32, launch_broadcast_mul_f32,
 };
 use super::device::Stream;
 use super::buffer::DeviceBuffer;
@@ -34,6 +35,41 @@ pub fn copy_f32(
                 input.len(),
                 output.len()
             ),
+        });
+    }
+    unsafe {
+        check(launch_copy_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// GPU-to-GPU copy for TensorHip: output = input
+///
+/// Copies data from one GPU tensor to another without CPU round-trip.
+/// Both tensors must have the same length and be contiguous.
+pub fn copy_tensor_f32(
+    input: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "copy_tensor_f32 requires contiguous tensors".to_string(),
         });
     }
     unsafe {
@@ -1750,6 +1786,52 @@ pub fn broadcast_add_f32(
             output.as_mut_ptr(),
             input.len() as c_int,
             bias.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Broadcast multiply: output[i] = input[i] * scale[i % scale_len]
+///
+/// Used for per-channel scaling (e.g., k * k_k in RWKV7).
+/// Input shape: [C, T, B], scale shape: [C], output shape: [C, T, B]
+pub fn broadcast_mul_f32(
+    input: &TensorHip<f32>,
+    scale: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if input.len() % scale.len() != 0 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Broadcast incompatible: input len {} not divisible by scale len {}",
+                input.len(), scale.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !scale.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "broadcast_mul_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_broadcast_mul_f32(
+            input.as_ptr(),
+            scale.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            scale.len() as c_int,
             stream.handle(),
         ))
     }

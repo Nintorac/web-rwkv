@@ -522,6 +522,78 @@ impl<T: Copy> TensorHip<T> {
             owned: false, // View doesn't own memory
         })
     }
+
+    /// Reinterpret the tensor with a different shape without copying data.
+    ///
+    /// This is a zero-copy reshape operation. The new shape must have the same
+    /// total number of elements as the current shape. The tensor must be contiguous.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Reshape [n_embd, t, b] to [head_size, n_head, t, b]
+    /// // where n_embd = head_size * n_head
+    /// let reshaped = tensor.reshape_view(new_shape)?;
+    /// ```
+    pub fn reshape_view(&self, new_shape: TensorShape) -> Result<TensorHip<T>> {
+        if !self.is_contiguous() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "reshape_view requires contiguous tensor".to_string(),
+            });
+        }
+
+        let old_len = self.len();
+        let new_len = new_shape.len();
+        if old_len != new_len {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Cannot reshape: old shape {} (len={}) != new shape {} (len={})",
+                    self.shape(), old_len, new_shape, new_len
+                ),
+            });
+        }
+
+        Ok(TensorHip {
+            ptr: self.ptr,
+            allocated_len: self.allocated_len,
+            view: TensorView::contiguous(new_shape),
+            memory_type: self.memory_type,
+            owned: false, // View doesn't own memory
+        })
+    }
+
+    /// Reinterpret the tensor with a different shape without copying data (mutable).
+    ///
+    /// Same as `reshape_view` but returns a mutable view.
+    pub fn reshape_view_mut(&mut self, new_shape: TensorShape) -> Result<TensorHip<T>> {
+        if !self.is_contiguous() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "reshape_view_mut requires contiguous tensor".to_string(),
+            });
+        }
+
+        let old_len = self.len();
+        let new_len = new_shape.len();
+        if old_len != new_len {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Cannot reshape: old shape {} (len={}) != new shape {} (len={})",
+                    self.shape(), old_len, new_shape, new_len
+                ),
+            });
+        }
+
+        Ok(TensorHip {
+            ptr: self.ptr,
+            allocated_len: self.allocated_len,
+            view: TensorView::contiguous(new_shape),
+            memory_type: self.memory_type,
+            owned: false, // View doesn't own memory
+        })
+    }
 }
 
 impl<T> Drop for TensorHip<T> {
