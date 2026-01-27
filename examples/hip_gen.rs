@@ -3,13 +3,11 @@
 //! Demonstrates the HIP backend with various inference scenarios:
 //! - Single sequence generation (short and long form)
 //! - Batched generation (same-length sequences)
+//! - Variable-length batched generation
+//! - Chunked processing for long prompts
 //! - Different prompt styles (Q&A, continuation, chat)
 //!
 //! Run with: cargo run --example hip_gen --features hip
-//!
-//! TODO: Add variable-length batch examples once length-masked kernel is implemented
-//! TODO: Add streaming/chunked generation examples
-//! TODO: Add state save/restore examples
 
 #[cfg(feature = "hip")]
 use std::io::Write;
@@ -169,27 +167,25 @@ fn generate_batched(
         .map(|p| tokenizer.encode(p.as_bytes()).expect("Failed to encode"))
         .collect();
 
-    // Check all same length (current limitation)
-    let max_len = prompt_tokens.iter().map(|t| t.len()).max().unwrap_or(0);
-    let all_same_len = prompt_tokens.iter().all(|t| t.len() == max_len);
-    if !all_same_len {
-        panic!("Variable-length batching not yet implemented");
-    }
+    let lengths: Vec<usize> = prompt_tokens.iter().map(|t| t.len()).collect();
+    println!("  Batch size: {}, Lengths: {:?}", batch_size, lengths);
 
-    println!("  Batch size: {}, Sequence length: {}", batch_size, max_len);
-
-    // Prefill
+    // Prefill with variable-length sequences
     let token_refs: Vec<&[u32]> = prompt_tokens.iter().map(|t| t.as_slice()).collect();
     let logits = runtime.infer(&token_refs).expect("Failed to run batched prefill");
     let vocab_size = runtime.info().n_vocab;
 
-    // Get last token logits for each sequence
+    // Get last token logits for each sequence (accounting for variable lengths)
+    // Logits layout: [seq0_logits...][seq1_logits...] concatenated
     let mut generated: Vec<Vec<u32>> = vec![Vec::new(); batch_size];
+    let mut offset = 0;
     for b in 0..batch_size {
-        let last_pos = (b * max_len + max_len - 1) * vocab_size;
+        let seq_len = lengths[b];
+        let last_pos = offset + (seq_len - 1) * vocab_size;
         let last_logits = &logits.data()[last_pos..last_pos + vocab_size];
         let token = sample_top_k_nucleus(last_logits, config.top_k, config.top_p, config.temperature);
         generated[b].push(token);
+        offset += seq_len * vocab_size;
     }
 
     // Decode loop
@@ -370,30 +366,64 @@ Assistant:"#;
     println!("{}", output);
 
     // =========================================================================
-    // TODO: Example 5: Variable-length batched generation
+    // Example 5: Variable-length batched generation
     // =========================================================================
     println!("\n{}", "=".repeat(70));
-    println!("TODO: Example 5: Variable-length batched generation");
+    println!("Example 5: Variable-length batched generation");
     println!("{}", "=".repeat(70));
-    println!("\nNot yet implemented. Requires:");
-    println!("  - Length-masked WKV7 kernel (bd-2sh.7.2)");
-    println!("  - Rust wrapper for masked forward pass (bd-2sh.7.3)");
-    println!("  - Variable-length batching support (bd-2sh.7.6)");
-    println!("\nExample prompts that would be batched:");
-    println!("  [0] \"Hi\" (2 tokens)");
-    println!("  [1] \"Hello, how are you?\" (5 tokens)");
-    println!("  [2] \"What is the meaning of life?\" (7 tokens)");
+
+    let var_prompts = [
+        "Hi",
+        "Hello, how are you?",
+        "What is the meaning of life?",
+    ];
+
+    let var_config = GenerationConfig {
+        max_tokens: 20,
+        temperature: 0.7,
+        top_k: 10,
+        top_p: 0.9,
+        stop_tokens: vec![0, 261],
+    };
+
+    println!("\nPrompts (variable lengths):");
+    for (i, p) in var_prompts.iter().enumerate() {
+        let tokens = tokenizer.encode(p.as_bytes()).unwrap();
+        println!("  [{}] \"{}\" ({} tokens)", i, p, tokens.len());
+    }
+
+    println!("\nGenerating with batch_size=3...");
+    let outputs = generate_batched(model_path, &tokenizer, &var_prompts, &var_config);
+
+    println!("\nOutputs:");
+    for (i, (prompt, output)) in var_prompts.iter().zip(outputs.iter()).enumerate() {
+        println!("  [{}] {} -> {}", i, prompt, output.trim());
+    }
 
     // =========================================================================
-    // TODO: Example 6: Streaming/chunked generation
+    // Example 6: Chunked processing for long prompts
     // =========================================================================
     println!("\n{}", "=".repeat(70));
-    println!("TODO: Example 6: Streaming/chunked generation");
+    println!("Example 6: Chunked processing for long prompts");
     println!("{}", "=".repeat(70));
-    println!("\nNot yet implemented. Would demonstrate:");
-    println!("  - Processing long prompts in chunks");
-    println!("  - State persistence across chunks");
-    println!("  - v_first handling for RWKV7 value residual");
+
+    // Create a long prompt by repeating text
+    let long_prompt = "The quick brown fox jumps over the lazy dog. ".repeat(20);
+    let long_tokens = tokenizer.encode(long_prompt.as_bytes()).unwrap();
+    println!("\nLong prompt: {} tokens", long_tokens.len());
+    println!("(Internally processed in chunks of 256 tokens)");
+
+    // Reset and generate
+    runtime.reset_state();
+    let chunk_config = GenerationConfig {
+        max_tokens: 30,
+        temperature: 0.7,
+        top_k: 10,
+        top_p: 0.9,
+        stop_tokens: vec![0],
+    };
+    let output = generate_single(&runtime, &tokenizer, &long_prompt, &chunk_config);
+    println!("\nGenerated continuation: {}", output.trim());
 
     // =========================================================================
     // TODO: Example 7: State save/restore
