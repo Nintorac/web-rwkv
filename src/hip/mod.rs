@@ -66,11 +66,12 @@ pub use kernels::{
     wkv7_f32_masked, hip_wkv7_masked,
 };
 
-// Re-export BLAS functions
+// Re-export BLAS functions and context
 pub use blas::{
     rocblas_create, rocblas_destroy, rocblas_set_stream,
     hgemm_f16, sgemm_f32,
     hip_sgemm, hip_hgemm,
+    HipBlasContext,
 };
 
 // Re-export model types

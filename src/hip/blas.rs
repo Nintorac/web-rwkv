@@ -1,4 +1,13 @@
 //! rocBLAS GEMV/GEMM wrapper functions.
+//!
+//! This module provides both low-level and high-level BLAS interfaces:
+//!
+//! - **Low-level**: `sgemm_f32`, `hgemm_f16` - raw rocBLAS wrappers
+//! - **High-level**: `hip_sgemm` - convenience wrapper with automatic memory management
+//! - **Context-based**: `HipBlasContext` - reusable handle for efficient batched operations
+//!
+//! For best performance in forward passes, use `HipBlasContext` to amortize
+//! handle creation cost and enable device-to-device operations.
 
 use std::ffi::c_int;
 
@@ -10,6 +19,135 @@ use super::ffi::{
 };
 use super::device::Stream;
 use super::tensor::{TensorShape, TensorHip};
+
+// ============================================================================
+// HipBlasContext - Reusable BLAS context for efficient batched operations
+// ============================================================================
+
+/// Long-lived BLAS context for efficient GPU compute.
+///
+/// Holds a rocBLAS handle bound to a single stream. Reuse this context across
+/// multiple GEMM calls to amortize handle creation cost and enable kernel warmup.
+///
+/// # Performance Benefits
+///
+/// - **Handle reuse**: rocBLAS keeps per-handle temporary device memory
+/// - **Stream binding**: All operations execute on the same stream for ordering
+/// - **Warmup amortization**: First GEMM may be slower; subsequent calls benefit
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// // Create once at start of forward pass
+/// let ctx = HipBlasContext::new()?;
+///
+/// // Reuse for all GEMMs
+/// ctx.sgemm_into(&weight_r, &input, &mut output_r)?;
+/// ctx.sgemm_into(&weight_k, &input, &mut output_k)?;
+/// ctx.sgemm_into(&weight_v, &input, &mut output_v)?;
+///
+/// // Sync before reading results
+/// ctx.synchronize()?;
+/// ```
+pub struct HipBlasContext {
+    handle: RocblasHandle,
+    stream: Stream,
+}
+
+impl HipBlasContext {
+    /// Create a new BLAS context with a dedicated stream.
+    pub fn new() -> Result<Self> {
+        let stream = Stream::new()?;
+        let handle = rocblas_create()?;
+        rocblas_set_stream(handle, &stream)?;
+        Ok(Self { handle, stream })
+    }
+
+    /// Create a BLAS context using the null (default) stream.
+    ///
+    /// Operations on the null stream are implicitly synchronized with
+    /// other null-stream operations but may have less overlap potential.
+    pub fn with_null_stream() -> Result<Self> {
+        let stream = Stream::null();
+        let handle = rocblas_create()?;
+        rocblas_set_stream(handle, &stream)?;
+        Ok(Self { handle, stream })
+    }
+
+    /// Get a reference to the underlying stream.
+    pub fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
+    /// Synchronize the stream (wait for all enqueued operations to complete).
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize()
+    }
+
+    /// Device-to-device SGEMM: output = weight @ input
+    ///
+    /// All tensors must be GPU-resident. No host copies occur.
+    ///
+    /// # Arguments
+    /// * `weight` - Weight matrix on GPU [M, K] (output_features × input_features)
+    /// * `input` - Input matrix on GPU [K, N] (input_features × tokens)
+    /// * `output` - Output matrix on GPU [M, N] (output_features × tokens), must be pre-allocated
+    ///
+    /// # Panics
+    /// Panics if dimensions don't match.
+    pub fn sgemm_into(
+        &self,
+        weight: &TensorHip<f32>,
+        input: &TensorHip<f32>,
+        output: &mut TensorHip<f32>,
+    ) -> Result<()> {
+        sgemm_f32(self.handle, weight, input, output)
+    }
+
+    /// Device-to-device HGEMM: output = weight @ input (FP16)
+    ///
+    /// All tensors must be GPU-resident. No host copies occur.
+    pub fn hgemm_into(
+        &self,
+        weight: &TensorHip<f32>,  // Actually f16 storage
+        input: &TensorHip<f32>,   // Actually f16 storage
+        output: &mut TensorHip<f32>, // Actually f16 storage
+    ) -> Result<()> {
+        hgemm_f16(self.handle, weight, input, output)
+    }
+
+    /// Copy host data to a GPU tensor using this context's stream.
+    ///
+    /// This is useful for staging input data before GEMM operations.
+    pub fn upload_to_tensor(&self, data: &[f32], tensor: &mut TensorHip<f32>) -> Result<()> {
+        if data.len() != tensor.len() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Upload size mismatch: data has {} elements, tensor has {}",
+                    data.len(),
+                    tensor.len()
+                ),
+            });
+        }
+        tensor.copy_from_slice(data, &self.stream)
+    }
+
+    /// Copy GPU tensor data to host using this context's stream.
+    ///
+    /// Note: This operation synchronizes the stream before returning.
+    pub fn download_from_tensor(&self, tensor: &TensorHip<f32>) -> Result<Vec<f32>> {
+        tensor.to_vec(&self.stream)
+    }
+}
+
+impl Drop for HipBlasContext {
+    fn drop(&mut self) {
+        // Best-effort cleanup - ignore errors in drop
+        let _ = rocblas_destroy(self.handle);
+        // Stream is dropped automatically
+    }
+}
 
 // ============================================================================
 // rocBLAS GEMV/GEMM Functions
