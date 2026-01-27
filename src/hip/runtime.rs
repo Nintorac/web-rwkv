@@ -5,9 +5,16 @@
 
 use std::sync::Mutex;
 
+use futures::future::BoxFuture;
+
 use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
 use super::scratch::HipRuntimeConfig;
-use crate::tensor::{TensorCpu, TensorError, TensorInit, TensorShape as TensorShapeTrait};
+use crate::runtime::{
+    infer::{Rnn, RnnInput, RnnOutput, RnnOutputBatch, RnnRedirect, Token},
+    JobInput, Runtime, RuntimeError,
+};
+use crate::tensor::shape::Shape;
+use crate::tensor::{TensorCpu, TensorError, TensorErrorKind, TensorInit, TensorShape as TensorShapeTrait};
 
 /// CPU-only softmax for HIP backend.
 ///
@@ -270,6 +277,101 @@ impl HipRuntime {
         }
 
         results
+    }
+
+    // ========== Runtime<Rnn> support methods ==========
+
+    /// Extract per-batch outputs based on RnnOption (Last vs Full).
+    ///
+    /// Uses the redirect information to slice the flat logits tensor
+    /// into per-batch outputs with the correct shapes.
+    fn extract_rnn_outputs(
+        &self,
+        logits: &TensorCpu<f32>,
+        redirect: &RnnRedirect,
+    ) -> Result<RnnOutput, RuntimeError> {
+        let vocab_size = self.model.info.n_vocab;
+        let data = logits.data();
+
+        let mut outputs = Vec::with_capacity(redirect.outputs.len());
+        for (out_start, out_end) in &redirect.outputs {
+            let num_out_tokens = out_end - out_start;
+
+            if num_out_tokens == 0 {
+                outputs.push(RnnOutputBatch(
+                    TensorInit::from_data(Shape::new(vocab_size, 0, 1, 1), vec![]).map_err(
+                        |e| RuntimeError::TensorError(e),
+                    )?,
+                ));
+            } else {
+                // Extract logits for this batch's output tokens
+                let start = out_start * vocab_size;
+                let end = out_end * vocab_size;
+                let batch_logits = data[start..end].to_vec();
+                outputs.push(RnnOutputBatch(
+                    TensorInit::from_data(
+                        Shape::new(vocab_size, num_out_tokens, 1, 1),
+                        batch_logits,
+                    )
+                    .map_err(|e| RuntimeError::TensorError(e))?,
+                ));
+            }
+        }
+        Ok(RnnOutput(outputs))
+    }
+
+    /// Core inference logic for Runtime<Rnn> trait.
+    ///
+    /// Processes one chunk of tokens from the input, returning the remaining
+    /// input and the output for this chunk.
+    fn infer_rnn(&self, mut input: RnnInput) -> Result<(RnnInput, RnnOutput), RuntimeError> {
+        // 1. Get chunk info - if None, input is exhausted
+        let Some(info) = input.iter().next() else {
+            return Err(RuntimeError::InputExhausted);
+        };
+        let chunk = input.chunk();
+        let redirect = info.redirect();
+
+        // 2. If no tokens to process, input is exhausted
+        if chunk.num_token() == 0 {
+            return Err(RuntimeError::InputExhausted);
+        }
+
+        // 3. Extract tokens from chunk
+        let token_vecs: Vec<Vec<u32>> = chunk
+            .iter()
+            .map(|batch| {
+                batch
+                    .0
+                    .iter()
+                    .map(|t| match t {
+                        Token::Token(id) => *id,
+                        Token::Embed(_) => 0, // Embed tokens not supported yet
+                    })
+                    .collect()
+            })
+            .collect();
+        let token_refs: Vec<&[u32]> = token_vecs.iter().map(|v| v.as_slice()).collect();
+
+        // 4. Run forward pass
+        let logits_tensor = self.infer(&token_refs).map_err(|_e| {
+            // Convert HIP error to RuntimeError via TensorError
+            RuntimeError::TensorError(TensorError::new(TensorErrorKind::Deduce))
+        })?;
+
+        // 5. Extract outputs based on redirect (Last vs Full per batch)
+        let output = self.extract_rnn_outputs(&logits_tensor, &redirect)?;
+
+        input.step();
+        Ok((input, output))
+    }
+}
+
+// ========== Runtime<Rnn> trait implementation ==========
+
+impl Runtime<Rnn> for HipRuntime {
+    fn infer(&self, input: RnnInput) -> BoxFuture<'_, Result<(RnnInput, RnnOutput), RuntimeError>> {
+        Box::pin(async move { self.infer_rnn(input) })
     }
 }
 
@@ -998,6 +1100,231 @@ mod tests {
         );
 
         println!("test_padding_preserves_hidden_state PASSED");
+    }
+
+    // ========== Runtime<Rnn> trait tests ==========
+
+    /// Test Runtime<Rnn>::infer with a single sequence using RnnOption::Last
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_hip_runtime_infer_single_sequence() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model.info.n_vocab;
+        let runtime = HipRuntime::new(model, 1);
+
+        // Create input with single sequence, RnnOption::Last
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let batch = RnnInputBatch::new(tokens.clone(), RnnOption::Last);
+        let input = RnnInput::new(vec![batch], 128);
+
+        // Run inference via Runtime<Rnn> trait
+        let (remaining, output) = RuntimeTrait::<Rnn>::infer(&runtime, input)
+            .await
+            .expect("Inference failed");
+
+        // Verify output shape: Last option should give [vocab, 1, 1, 1]
+        assert_eq!(output.0.len(), 1, "Should have 1 batch output");
+        let out_shape = output.0[0].0.shape();
+        assert_eq!(out_shape[0], vocab_size, "First dim should be vocab_size");
+        assert_eq!(out_shape[1], 1, "Second dim should be 1 for RnnOption::Last");
+
+        // Verify input was consumed
+        assert_eq!(remaining.num_token(), 0, "Input should be consumed");
+
+        println!("test_hip_runtime_infer_single_sequence PASSED");
+    }
+
+    /// Test Runtime<Rnn>::infer with variable-length batch and mixed options
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_hip_runtime_infer_variable_length_batch() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model.info.n_vocab;
+        let runtime = HipRuntime::new(model, 2);
+
+        // Create input with two sequences, different lengths and options
+        let batch0 = RnnInputBatch::new(vec![1u32, 2, 3, 4, 5], RnnOption::Last);
+        let batch1 = RnnInputBatch::new(vec![10u32, 20], RnnOption::Full);
+        let input = RnnInput::new(vec![batch0, batch1], 128);
+
+        // Run inference
+        let (remaining, output) = RuntimeTrait::<Rnn>::infer(&runtime, input)
+            .await
+            .expect("Inference failed");
+
+        // Verify output shapes
+        assert_eq!(output.0.len(), 2, "Should have 2 batch outputs");
+
+        // Batch 0: Last option → [vocab, 1, 1, 1]
+        let shape0 = output.0[0].0.shape();
+        assert_eq!(shape0[0], vocab_size);
+        assert_eq!(shape0[1], 1, "Batch 0 with Last should have 1 output token");
+
+        // Batch 1: Full option → [vocab, 2, 1, 1]
+        let shape1 = output.0[1].0.shape();
+        assert_eq!(shape1[0], vocab_size);
+        assert_eq!(shape1[1], 2, "Batch 1 with Full should have 2 output tokens");
+
+        // Verify input was consumed
+        assert_eq!(remaining.num_token(), 0, "Input should be consumed");
+
+        println!("test_hip_runtime_infer_variable_length_batch PASSED");
+    }
+
+    /// Test Runtime<Rnn>::infer with an empty batch item
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_hip_runtime_infer_empty_batch_item() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model.info.n_vocab;
+        let runtime = HipRuntime::new(model, 2);
+
+        // Create input with one non-empty and one empty sequence
+        let batch0 = RnnInputBatch::new(vec![1u32, 2, 3], RnnOption::Last);
+        let batch1 = RnnInputBatch::new(Vec::<u32>::new(), RnnOption::Full);
+        let input = RnnInput::new(vec![batch0, batch1], 128);
+
+        // Run inference
+        let (_remaining, output) = RuntimeTrait::<Rnn>::infer(&runtime, input)
+            .await
+            .expect("Inference failed");
+
+        // Verify output shapes
+        assert_eq!(output.0.len(), 2, "Should have 2 batch outputs");
+
+        // Batch 0: 3 tokens with Last → [vocab, 1, 1, 1]
+        let shape0 = output.0[0].0.shape();
+        assert_eq!(shape0[0], vocab_size);
+        assert_eq!(shape0[1], 1, "Batch 0 should have 1 output token");
+
+        // Batch 1: empty → [vocab, 0, 1, 1]
+        let shape1 = output.0[1].0.shape();
+        assert_eq!(shape1[0], vocab_size);
+        assert_eq!(shape1[1], 0, "Empty batch should have 0 output tokens");
+
+        println!("test_hip_runtime_infer_empty_batch_item PASSED");
+    }
+
+    /// Test that infer returns InputExhausted error on exhausted input
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_hip_runtime_input_exhausted() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime = HipRuntime::new(model, 1);
+
+        // Create input and exhaust it
+        let batch = RnnInputBatch::new(vec![1u32, 2, 3], RnnOption::Last);
+        let input = RnnInput::new(vec![batch], 128);
+
+        // First call should succeed
+        let (remaining, _output) = RuntimeTrait::<Rnn>::infer(&runtime, input)
+            .await
+            .expect("First inference should succeed");
+
+        // Second call on exhausted input should fail
+        let result = RuntimeTrait::<Rnn>::infer(&runtime, remaining).await;
+
+        assert!(
+            matches!(result, Err(RuntimeError::InputExhausted)),
+            "Expected InputExhausted error, got: {:?}",
+            result
+        );
+
+        println!("test_hip_runtime_input_exhausted PASSED");
+    }
+
+    /// Test that chunked inference via Runtime matches direct forward
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_hip_runtime_chunked_matches_direct() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        // Generate 64 tokens
+        let tokens: Vec<u32> = (1..=64).collect();
+
+        // === Direct forward (single call) ===
+        let model1 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime_direct = HipRuntime::new(model1, 1);
+        let direct_logits = runtime_direct
+            .infer_one(&tokens)
+            .expect("Direct inference failed");
+
+        // === Chunked via Runtime<Rnn> (chunk_size=32) ===
+        let model2 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime_chunked = HipRuntime::new(model2, 1);
+
+        let batch = RnnInputBatch::new(tokens.clone(), RnnOption::Full);
+        let mut input = RnnInput::new(vec![batch], 32); // chunk_size=32
+
+        let mut chunked_outputs: Vec<Vec<f32>> = Vec::new();
+        loop {
+            if input.num_token() == 0 {
+                break;
+            }
+            let (remaining, output) = RuntimeTrait::<Rnn>::infer(&runtime_chunked, input)
+                .await
+                .expect("Chunked inference failed");
+            chunked_outputs.push(output.0[0].0.data().to_vec());
+            input = remaining;
+        }
+
+        // Concatenate chunked outputs
+        let chunked_logits: Vec<f32> = chunked_outputs.into_iter().flatten().collect();
+
+        // Compare
+        let direct_data = direct_logits.data();
+        assert_eq!(
+            chunked_logits.len(),
+            direct_data.len(),
+            "Output sizes should match"
+        );
+
+        // Calculate max difference
+        let max_diff: f32 = chunked_logits
+            .iter()
+            .zip(direct_data.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        println!("Max difference between chunked and direct: {:.6e}", max_diff);
+
+        // Should match within tolerance (rtol=1e-2, atol=1e-3)
+        // For exact match, max_diff should be 0 (same model, same computation)
+        assert!(
+            max_diff < 1e-3,
+            "Chunked and direct outputs should match within tolerance, max_diff={}",
+            max_diff
+        );
+
+        println!("test_hip_runtime_chunked_matches_direct PASSED");
     }
 
 }

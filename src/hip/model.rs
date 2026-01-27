@@ -1,7 +1,7 @@
 //! RWKV7 HIP model loading and forward pass implementation.
 
 use half::f16;
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::path::Path;
 
 use super::ffi::{HipErrorKind, Result};
@@ -146,7 +146,7 @@ pub struct Rwkv7Hip {
     pub layers: Vec<LayerHip>,
 
     /// Lazily initialized scratch buffers for GPU-native forward pass.
-    scratch: RefCell<Option<HipScratch>>,
+    scratch: Mutex<Option<HipScratch>>,
 
     #[cfg(feature = "hip-probes")]
     pub(crate) probes: Option<HipProbeMapRef>,
@@ -159,7 +159,7 @@ impl std::fmt::Debug for Rwkv7Hip {
             .field("embed", &self.embed)
             .field("head", &self.head)
             .field("layers", &self.layers)
-            .field("scratch", &self.scratch.borrow().as_ref().map(|_| "initialized"));
+            .field("scratch", &self.scratch.lock().unwrap().as_ref().map(|_| "initialized"));
         #[cfg(feature = "hip-probes")]
         s.field("probes", &self.probes.as_ref().map(|p| format!("{} hooks", p.len())));
         s.finish()
@@ -578,7 +578,7 @@ impl Rwkv7Hip {
             embed,
             head,
             layers,
-            scratch: RefCell::new(None),
+            scratch: Mutex::new(None),
             #[cfg(feature = "hip-probes")]
             probes: None,
         })
@@ -725,18 +725,18 @@ impl Rwkv7Hip {
     pub fn with_config(self, config: HipRuntimeConfig) -> Result<Self> {
         let lora_dims = self.lora_dims();
         let scratch = HipScratch::new(&self.info, lora_dims, config)?;
-        *self.scratch.borrow_mut() = Some(scratch);
+        *self.scratch.lock().unwrap() = Some(scratch);
         Ok(self)
     }
 
     /// Get the configured chunk size, if scratch buffers are initialized.
     pub fn chunk_size(&self) -> Option<usize> {
-        self.scratch.borrow().as_ref().map(|s| s.config.max_prefill_chunk)
+        self.scratch.lock().unwrap().as_ref().map(|s| s.config.max_prefill_chunk)
     }
 
     /// Get the configured batch size, if scratch buffers are initialized.
     pub fn max_batch_size(&self) -> Option<usize> {
-        self.scratch.borrow().as_ref().map(|s| s.config.batch_size)
+        self.scratch.lock().unwrap().as_ref().map(|s| s.config.batch_size)
     }
 
     /// Run a forward pass on variable-length input sequences.
@@ -787,7 +787,7 @@ impl Rwkv7Hip {
         }
 
         // Get scratch and config
-        let mut scratch_ref = self.scratch.borrow_mut();
+        let mut scratch_ref = self.scratch.lock().unwrap();
         let scratch = scratch_ref.as_mut().ok_or_else(|| HipErrorKind {
             code: -1,
             message: "Scratch not initialized - call with_config() first".to_string(),

@@ -1524,6 +1524,10 @@ pub(crate) fn extract_shift_state_at_lengths(
 ) -> Vec<f32> {
     let mut state_out = vec![0.0f32; c * b];
     for batch_idx in 0..b {
+        // Skip empty sequences - keep state as zeros
+        if lengths[batch_idx] == 0 {
+            continue;
+        }
         let time_idx = lengths[batch_idx] - 1; // Last valid position
         for channel in 0..c {
             // x layout: [C, T, B] = x[batch_idx * T * C + time_idx * C + channel]
