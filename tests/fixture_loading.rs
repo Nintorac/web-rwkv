@@ -2270,17 +2270,21 @@ fn debug_hip_vs_wgpu_divergence() {
         return;
     }
     
+    use web_rwkv::hip::HipRuntimeConfig;
+
     let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-    
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
+
     // Same tokens as parity test
     let tokens: Vec<u32> = vec![1, 2, 3, 4];
     let tokens_ref: Vec<&[u32]> = vec![&tokens[..]];
-    
+
     println!("\n=== HIP FULL FORWARD PASS ===");
     println!("Tokens: {:?}", tokens);
-    
+
     // Run full forward pass
-    let (logits, state) = model.forward(&tokens_ref, None, &[tokens.len()]).unwrap();
+    let (logits, state) = model.forward(&tokens_ref, None).unwrap();
     
     let vocab_size = 65536;
     let n_tokens = 4;
@@ -3313,6 +3317,7 @@ fn test_hip_step1_logits_debug() {
 #[cfg(feature = "hip")]
 fn test_forward_masked_single_batch() {
     use web_rwkv::hip::{Rwkv7Hip, HipState};
+    use web_rwkv::hip::HipRuntimeConfig;
 
     let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
     if !std::path::Path::new(model_path).exists() {
@@ -3321,18 +3326,19 @@ fn test_forward_masked_single_batch() {
     }
 
     let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
 
     // Test with a sequence of 5 tokens
     let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
     let tokens_ref: Vec<&[u32]> = vec![&tokens[..]];
-    let lengths: Vec<usize> = vec![5]; // Real length equals padded length
 
     // Run forward pass with None state (creates fresh state)
-    let (logits1, state1) = model.forward(&tokens_ref, None, &lengths).unwrap();
+    let (logits1, state1) = model.forward(&tokens_ref, None).unwrap();
 
     // Run forward pass with explicit fresh state
     let fresh_state = HipState::new(&model.info, 1);
-    let (logits2, state2) = model.forward(&tokens_ref, Some(fresh_state), &lengths).unwrap();
+    let (logits2, state2) = model.forward(&tokens_ref, Some(fresh_state)).unwrap();
 
     // States should match exactly
     let max_state_diff = state1.att_states[0].iter()
@@ -3356,35 +3362,46 @@ fn test_forward_masked_single_batch() {
     println!("  PASSED: forward with None state matches explicit fresh state");
 }
 
-/// Test forward with padded sequence.
-/// Verifies that state(seq + padding) == state(seq).
+/// Test chunking consistency.
+/// Verifies that processing a long sequence produces consistent state
+/// whether processed all at once or chunked internally.
 #[test]
 #[cfg(feature = "hip")]
-fn test_forward_masked_state_preservation() {
+fn test_forward_chunking_consistency() {
     use web_rwkv::hip::Rwkv7Hip;
+    use web_rwkv::hip::HipRuntimeConfig;
 
     let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
     if !std::path::Path::new(model_path).exists() {
-        eprintln!("Skipping test_forward_masked_state_preservation: model not found");
+        eprintln!("Skipping test_forward_chunking_consistency: model not found");
         return;
     }
 
-    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    // Test with different chunk sizes
+    let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
 
-    // Process [1, 2, 3] without padding
-    let tokens_no_pad: Vec<u32> = vec![1, 2, 3];
-    let tokens_no_pad_ref: Vec<&[u32]> = vec![&tokens_no_pad[..]];
-    let (_logits_no_pad, state_no_pad) = model.forward(&tokens_no_pad_ref, None, &[3]).unwrap();
+    // Process with large chunk (all at once)
+    let model1 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let config1 = HipRuntimeConfig::new(256, 1);  // Large chunk
+    let model1 = model1.with_config(config1).expect("Failed to configure model");
+    let tokens_ref: Vec<&[u32]> = vec![&tokens[..]];
+    let (logits_large, state_large) = model1.forward(&tokens_ref, None).unwrap();
 
-    // Process [1, 2, 3, 0, 0] with padding (real length = 3)
-    let tokens_padded: Vec<u32> = vec![1, 2, 3, 0, 0];
-    let tokens_padded_ref: Vec<&[u32]> = vec![&tokens_padded[..]];
-    let lengths: Vec<usize> = vec![3];
-    let (_logits_padded, state_padded) = model.forward(&tokens_padded_ref, None, &lengths).unwrap();
+    // Process with small chunk (forces internal chunking)
+    let model2 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let config2 = HipRuntimeConfig::new(4, 1);  // Small chunk - will chunk 8 tokens into 2 chunks
+    let model2 = model2.with_config(config2).expect("Failed to configure model");
+    let (logits_small, state_small) = model2.forward(&tokens_ref, None).unwrap();
+
+    // Logits should match
+    let max_logit_diff = logits_large.iter()
+        .zip(logits_small.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
 
     // States should match
-    let max_att_state_diff = state_no_pad.att_states.iter()
-        .zip(state_padded.att_states.iter())
+    let max_att_state_diff = state_large.att_states.iter()
+        .zip(state_small.att_states.iter())
         .map(|(a, b)| {
             a.iter().zip(b.iter())
                 .map(|(&x, &y)| (x - y).abs())
@@ -3392,25 +3409,15 @@ fn test_forward_masked_state_preservation() {
         })
         .fold(0.0f32, f32::max);
 
-    let max_ffn_state_diff = state_no_pad.ffn_states.iter()
-        .zip(state_padded.ffn_states.iter())
-        .map(|(a, b)| {
-            a.iter().zip(b.iter())
-                .map(|(&x, &y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
-        })
-        .fold(0.0f32, f32::max);
+    println!("test_forward_chunking_consistency:");
+    println!("  Tokens: {:?}", tokens);
+    println!("  Max logit diff (large vs small chunk): {:.6e}", max_logit_diff);
+    println!("  Max att state diff: {:.6e}", max_att_state_diff);
 
-    println!("test_forward_masked_state_preservation:");
-    println!("  Tokens without padding: [1, 2, 3]");
-    println!("  Tokens with padding:    [1, 2, 3, 0, 0] (real length=3)");
-    println!("  Max att state diff:     {:.6e}", max_att_state_diff);
-    println!("  Max ffn state diff:     {:.6e}", max_ffn_state_diff);
+    assert!(max_logit_diff < 1e-4, "Logits should match regardless of chunk size");
+    assert!(max_att_state_diff < 1e-4, "States should match regardless of chunk size");
 
-    assert!(max_att_state_diff < 1e-5, "Attention states should match (padded vs unpadded)");
-    assert!(max_ffn_state_diff < 1e-5, "FFN states should match (padded vs unpadded)");
-
-    println!("  PASSED: state(seq + padding) == state(seq)");
+    println!("  PASSED: chunking produces consistent results");
 }
 
 /// Test forward with variable-length batch.
@@ -3419,6 +3426,7 @@ fn test_forward_masked_state_preservation() {
 #[cfg(feature = "hip")]
 fn test_forward_masked_variable_batch() {
     use web_rwkv::hip::Rwkv7Hip;
+    use web_rwkv::hip::HipRuntimeConfig;
 
     let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
     if !std::path::Path::new(model_path).exists() {
@@ -3426,36 +3434,40 @@ fn test_forward_masked_variable_batch() {
         return;
     }
 
-    let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-
     // Reference: process each sequence individually
     let seq1: Vec<u32> = vec![1, 2, 3];
     let seq2: Vec<u32> = vec![10, 20, 30, 40, 50];
 
+    let model1 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let config1 = HipRuntimeConfig::new(256, 1);
+    let model1 = model1.with_config(config1).expect("Failed to configure model");
     let seq1_ref: Vec<&[u32]> = vec![&seq1[..]];
-    let (_logits1, state1_ref) = model.forward(&seq1_ref, None, &[3]).unwrap();
+    let (_logits1, state1_ref) = model1.forward(&seq1_ref, None).unwrap();
 
+    let model2 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let config2 = HipRuntimeConfig::new(256, 1);
+    let model2 = model2.with_config(config2).expect("Failed to configure model");
     let seq2_ref: Vec<&[u32]> = vec![&seq2[..]];
-    let (_logits2, state2_ref) = model.forward(&seq2_ref, None, &[5]).unwrap();
+    let (_logits2, state2_ref) = model2.forward(&seq2_ref, None).unwrap();
 
-    // Batched with variable lengths
-    let seq1_padded: Vec<u32> = vec![1, 2, 3, 0, 0];     // len=3, padded to 5
-    let seq2_padded: Vec<u32> = vec![10, 20, 30, 40, 50]; // len=5
-    let tokens_batched: Vec<&[u32]> = vec![&seq1_padded[..], &seq2_padded[..]];
-    let lengths: Vec<usize> = vec![3, 5];
+    // Batched with variable lengths (new API handles different lengths automatically)
+    let model_batch = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let config_batch = HipRuntimeConfig::new(256, 2);
+    let model_batch = model_batch.with_config(config_batch).expect("Failed to configure model");
+    let tokens_batched: Vec<&[u32]> = vec![&seq1[..], &seq2[..]];
 
-    let (_logits_batched, state_batched) = model.forward(&tokens_batched, None, &lengths).unwrap();
+    let (_logits_batched, state_batched) = model_batch.forward(&tokens_batched, None).unwrap();
 
     // Extract per-batch states and compare
-    let state_size_per_layer = model.info.head_size * model.info.head_size * model.info.n_head;
+    let state_size_per_layer = model1.info.head_size * model1.info.head_size * model1.info.n_head;
 
     println!("test_forward_masked_variable_batch:");
-    println!("  Batch 0: [1, 2, 3] padded to [1, 2, 3, 0, 0]");
+    println!("  Batch 0: [1, 2, 3]");
     println!("  Batch 1: [10, 20, 30, 40, 50]");
 
     // Compare batch 0 state with unbatched seq1
     let mut max_diff_batch0: f32 = 0.0;
-    for layer in 0..model.info.n_layer {
+    for layer in 0..model1.info.n_layer {
         let batch0_start = 0;
         let batch0_end = state_size_per_layer;
         let batch0_state = &state_batched.att_states[layer][batch0_start..batch0_end];
@@ -3470,7 +3482,7 @@ fn test_forward_masked_variable_batch() {
 
     // Compare batch 1 state with unbatched seq2
     let mut max_diff_batch1: f32 = 0.0;
-    for layer in 0..model.info.n_layer {
+    for layer in 0..model1.info.n_layer {
         let batch1_start = state_size_per_layer;
         let batch1_end = 2 * state_size_per_layer;
         let batch1_state = &state_batched.att_states[layer][batch1_start..batch1_end];

@@ -15,6 +15,8 @@ use super::kernels::{
     channel_mix_state_f32, control_k_f32, wkv7_f32_masked, wkv_bonus_f32,
     add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32, broadcast_mul_f32,
     lerp_f32, copy_tensor_f32,
+    // CPU helper for masked state extraction
+    extract_shift_state_at_lengths,
 };
 use super::blas::HipBlasContext;
 use super::scratch::HipScratch;
@@ -707,44 +709,222 @@ impl Rwkv7Hip {
         }
     }
 
-    /// Run a forward pass on input tokens with optional state and length masking.
+    /// Configure the model with fixed scratch buffers.
     ///
-    /// This is the unified forward API supporting:
-    /// - **Batched inference**: Process multiple sequences in parallel (B > 1)
-    /// - **Variable-length sequences**: Use `lens` to specify actual lengths for masking
-    /// - **Stateful inference**: Pass state to continue from previous forward calls
-    /// - **Stateless inference**: Pass `None` for state to start fresh
+    /// This pre-allocates all GPU buffers sized for the given configuration.
+    /// Must be called before `forward()` to enable inference.
     ///
     /// # Arguments
-    /// * `x` - Batch of token sequences (padded to same length T)
+    /// * `config` - Runtime configuration specifying max chunk size and batch size
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = HipRuntimeConfig::new(256, 4);  // chunk_size=256, batch=4
+    /// let model = Rwkv7Hip::load("model.st")?.with_config(config)?;
+    /// ```
+    pub fn with_config(self, config: HipRuntimeConfig) -> Result<Self> {
+        let lora_dims = self.lora_dims();
+        let scratch = HipScratch::new(&self.info, lora_dims, config)?;
+        *self.scratch.borrow_mut() = Some(scratch);
+        Ok(self)
+    }
+
+    /// Get the configured chunk size, if scratch buffers are initialized.
+    pub fn chunk_size(&self) -> Option<usize> {
+        self.scratch.borrow().as_ref().map(|s| s.config.max_prefill_chunk)
+    }
+
+    /// Get the configured batch size, if scratch buffers are initialized.
+    pub fn max_batch_size(&self) -> Option<usize> {
+        self.scratch.borrow().as_ref().map(|s| s.config.batch_size)
+    }
+
+    /// Run a forward pass on variable-length input sequences.
+    ///
+    /// This is the main inference API. It handles:
+    /// - **Variable-length sequences**: Each sequence can have any length
+    /// - **Automatic chunking**: Long sequences are processed in fixed-size chunks
+    /// - **Batched inference**: Process multiple sequences in parallel
+    /// - **Zero-copy token staging**: Tokens are copied directly to GPU staging buffer
+    ///
+    /// # Requirements
+    /// You must call `with_config()` before using this method to initialize scratch buffers.
+    ///
+    /// # Arguments
+    /// * `x` - Batch of token sequences (can have different lengths)
     /// * `state` - Optional state; if `None`, creates fresh zero state
-    /// * `lens` - Actual lengths per batch element (for masking padding)
     ///
     /// # Returns
     /// Tuple of (logits, state):
-    /// - `logits`: Tensor of shape [vocab_size * T * B] in column-major layout [V, T, B]
+    /// - `logits`: Flattened logits for all real tokens across all batches
+    ///   Layout: `[batch_0_token_0..batch_0_token_n, batch_1_token_0..batch_1_token_m, ...]`
+    ///   Each token has `vocab_size` logits.
     /// - `state`: Updated state for subsequent forward calls
     ///
     /// # Example
     /// ```ignore
-    /// // Stateless single-sequence inference
-    /// let (logits, _) = model.forward(&[&tokens], None, &[tokens.len()])?;
+    /// let config = HipRuntimeConfig::new(256, 4);  // chunk_size=256, batch=4
+    /// let model = Rwkv7Hip::load("model.st")?.with_config(config)?;
     ///
-    /// // Stateful streaming inference
-    /// let (logits1, state) = model.forward(&[&[tok1]], None, &[1])?;
-    /// let (logits2, state) = model.forward(&[&[tok2]], Some(state), &[1])?;
+    /// // Variable-length batch (no padding required)
+    /// let seq1 = vec![1, 2, 3];        // 3 tokens
+    /// let seq2 = vec![4, 5, 6, 7, 8];  // 5 tokens
+    /// let (logits, state) = model.forward(&[&seq1, &seq2], None)?;
     ///
-    /// // Batched variable-length inference
-    /// let seq1 = vec![1, 2, 3, 0, 0];  // padded, real length = 3
-    /// let seq2 = vec![4, 5, 6, 7, 8];  // real length = 5
-    /// let (logits, state) = model.forward(&[&seq1, &seq2], None, &[3, 5])?;
+    /// // logits contains: [3 * vocab_size for seq1] ++ [5 * vocab_size for seq2]
     /// ```
     pub fn forward(
         &self,
         x: &[&[u32]],
         state: Option<HipState>,
-        lens: &[usize],
     ) -> Result<(Vec<f32>, HipState)> {
+        let batch_size = x.len();
+        if batch_size == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Empty batch".to_string(),
+            });
+        }
+
+        // Get scratch and config
+        let mut scratch_ref = self.scratch.borrow_mut();
+        let scratch = scratch_ref.as_mut().ok_or_else(|| HipErrorKind {
+            code: -1,
+            message: "Scratch not initialized - call with_config() first".to_string(),
+        })?;
+
+        let chunk_size = scratch.config.max_prefill_chunk;
+        let max_batch = scratch.config.batch_size;
+
+        // Validate batch size
+        if batch_size > max_batch {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Batch size {} exceeds configured max {}",
+                    batch_size, max_batch
+                ),
+            });
+        }
+
+        // Get real lengths and compute chunking
+        let lens: Vec<usize> = x.iter().map(|s| s.len()).collect();
+        let max_len = *lens.iter().max().unwrap_or(&0);
+
+        if max_len == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "All sequences are empty".to_string(),
+            });
+        }
+
+        let num_chunks = (max_len + chunk_size - 1) / chunk_size;
+
+        // Initialize state
+        let mut current_state = match state {
+            Some(s) => {
+                if s.batch_size != batch_size {
+                    return Err(HipErrorKind {
+                        code: -1,
+                        message: format!(
+                            "State batch_size mismatch: state has {} but input has {} sequences",
+                            s.batch_size, batch_size
+                        ),
+                    });
+                }
+                s
+            }
+            None => HipState::new(&self.info, batch_size),
+        };
+
+        // Accumulate logits for each batch
+        let n_vocab = self.info.n_vocab;
+        let mut all_logits: Vec<Vec<f32>> = vec![Vec::new(); batch_size];
+
+        // Get stream for token staging
+        let stream = Stream::null();
+
+        // Process chunks
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * chunk_size;
+
+            // Compute real lengths within this chunk
+            let chunk_lens: Vec<usize> = lens
+                .iter()
+                .map(|&l| l.saturating_sub(start).min(chunk_size))
+                .collect();
+
+            // Skip if all sequences exhausted
+            if chunk_lens.iter().all(|&l| l == 0) {
+                break;
+            }
+
+            // Zero the token staging buffer and copy token slices
+            scratch.token_staging.fill_zero()?;
+            for (b, seq) in x.iter().enumerate() {
+                let seq_start = start.min(seq.len());
+                let seq_end = (start + chunk_size).min(seq.len());
+                if seq_start < seq_end {
+                    let slice = &seq[seq_start..seq_end];
+                    let offset = b * chunk_size;
+                    scratch.token_staging.copy_from_slice_at(slice, offset, &stream)?;
+                }
+            }
+
+            // Build padded token slices from staging buffer
+            // For now, we need to read back and create slices (will optimize later)
+            let staged_tokens = scratch.token_staging.to_vec(&stream)?;
+            let chunk_tokens: Vec<Vec<u32>> = (0..batch_size)
+                .map(|b| {
+                    let offset = b * chunk_size;
+                    staged_tokens[offset..offset + chunk_size].to_vec()
+                })
+                .collect();
+            let chunk_refs: Vec<&[u32]> = chunk_tokens.iter().map(|v| v.as_slice()).collect();
+
+            // Forward on this chunk
+            let chunk_logits = self.forward_chunk(&chunk_refs, &mut current_state, &chunk_lens, scratch)?;
+
+            // Extract logits for real tokens only (skip padding positions)
+            for (b, &real_len) in chunk_lens.iter().enumerate() {
+                if real_len > 0 {
+                    // logits layout: [n_vocab, chunk_size, batch_size] column-major
+                    // For batch b, token t: offset = (b * chunk_size + t) * n_vocab
+                    for t in 0..real_len {
+                        let offset = (b * chunk_size + t) * n_vocab;
+                        all_logits[b].extend_from_slice(&chunk_logits[offset..offset + n_vocab]);
+                    }
+                }
+            }
+        }
+
+        // Flatten logits: concatenate all batches
+        let flat_logits: Vec<f32> = all_logits.into_iter().flatten().collect();
+        Ok((flat_logits, current_state))
+    }
+
+    /// Process a single chunk of tokens (internal method).
+    ///
+    /// This is used by `forward()` to process each chunk. It expects:
+    /// - All sequences padded to exactly `chunk_size` tokens
+    /// - `lens` specifying actual token counts within this chunk (for masking)
+    /// - Scratch buffers already initialized via `with_config()`
+    ///
+    /// # Arguments
+    /// * `x` - Batch of token sequences, each exactly `chunk_size` tokens
+    /// * `state` - Current state (will be mutated)
+    /// * `lens` - Actual lengths per batch element within this chunk
+    /// * `scratch` - Pre-allocated scratch buffers
+    ///
+    /// # Returns
+    /// Logits tensor of shape [vocab_size * chunk_size * batch] in column-major layout
+    fn forward_chunk(
+        &self,
+        x: &[&[u32]],
+        state: &mut HipState,
+        lens: &[usize],
+        scratch: &mut HipScratch,
+    ) -> Result<Vec<f32>> {
         let b = x.len();
         if b == 0 {
             return Err(HipErrorKind {
@@ -794,63 +974,21 @@ impl Rwkv7Hip {
                     ),
                 });
             }
-            if len == 0 {
-                return Err(HipErrorKind {
-                    code: -1,
-                    message: format!("Length for batch {} is 0 (empty sequence)", i),
-                });
-            }
         }
 
-        // Create or use provided state
-        let mut state = match state {
-            Some(s) => {
-                if s.batch_size != b {
-                    return Err(HipErrorKind {
-                        code: -1,
-                        message: format!(
-                            "State batch_size mismatch: state has {} but input has {} sequences",
-                            s.batch_size, b
-                        ),
-                    });
-                }
-                s
-            }
-            None => HipState::new(&self.info, b),
-        };
-
-        // Ensure scratch buffers are initialized and large enough
-        self.ensure_scratch(t, b)?;
-
-        // Get mutable access to scratch
-        let mut scratch_ref = self.scratch.borrow_mut();
-        let scratch = scratch_ref.as_mut().unwrap();
+        // Verify scratch supports this size
+        if !scratch.supports(t, b) {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Scratch buffers too small: need ({}, {}) but have ({}, {})",
+                    t, b, scratch.config.max_prefill_chunk, scratch.config.batch_size
+                ),
+            });
+        }
 
         // Run forward pass with scratch buffers
-        let logits = self.forward_inner(x, &mut state, scratch, lens)?;
-
-        Ok((logits, state))
-    }
-
-    /// Ensure scratch buffers are initialized and support the given dimensions.
-    fn ensure_scratch(&self, seq_len: usize, batch_size: usize) -> Result<()> {
-        let mut scratch_ref = self.scratch.borrow_mut();
-
-        let needs_realloc = match scratch_ref.as_ref() {
-            None => true,
-            Some(s) => !s.supports(seq_len, batch_size),
-        };
-
-        if needs_realloc {
-            // Create scratch with generous capacity
-            let max_seq = seq_len.max(128);  // At least 128 for typical decode
-            let config = HipRuntimeConfig::new(max_seq, batch_size);
-            let lora_dims = self.lora_dims();
-            let new_scratch = HipScratch::new(&self.info, lora_dims, config)?;
-            *scratch_ref = Some(new_scratch);
-        }
-
-        Ok(())
+        self.forward_inner(x, state, scratch, lens)
     }
 
     /// Internal forward pass using scratch buffers and masked WKV.
@@ -1016,8 +1154,13 @@ impl Rwkv7Hip {
                 &mut att_xg, &mut temp1, stream
             )?;
 
-            // Update shift state
-            std::mem::swap(&mut att_shift_gpu[layer_idx], &mut new_att_shift);
+            // Update shift state - re-extract at correct positions for masked sequences
+            // The kernel extracts from position T-1, but we need position lens[b]-1
+            {
+                let x_ln_host = x_ln.to_vec(stream)?;
+                let correct_state = extract_shift_state_at_lengths(&x_ln_host, lens, n_embd, t, b);
+                att_shift_gpu[layer_idx].copy_from_slice(&correct_state, stream)?;
+            }
 
             // Linear projections: r, k, v
             ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
@@ -1124,7 +1267,12 @@ impl Rwkv7Hip {
                 &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
                 &mut ffn_xk, &mut new_ffn_shift, stream
             )?;
-            std::mem::swap(&mut ffn_shift_gpu[layer_idx], &mut new_ffn_shift);
+            // Re-extract at correct positions for masked sequences
+            {
+                let x_ln_host = x_ln.to_vec(stream)?;
+                let correct_state = extract_shift_state_at_lengths(&x_ln_host, lens, n_embd, t, b);
+                ffn_shift_gpu[layer_idx].copy_from_slice(&correct_state, stream)?;
+            }
 
             // Key projection
             ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;

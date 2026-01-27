@@ -54,14 +54,17 @@ fn test_probe_captures_intermediates() {
         })
         .build();
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
 
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let (_logits, _state) = model.forward(&[&[0, 1, 2]], None, &[3])
+    let (_logits, _state) = model.forward(&[&[0, 1, 2]], None)
         .expect("Forward failed");
 
     // Check captured values
@@ -132,13 +135,16 @@ fn test_probe_context() {
         })
         .build();
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
+    let config = HipRuntimeConfig::new(256, 2);
+    let model = model.with_config(config).expect("Failed to configure model");
 
     // Test with batch_size=2, seq_len=4
     let tokens = vec![0u32, 1, 2, 3];
-    let (_logits, _state) = model.forward(&[&tokens, &tokens], None, &[4, 4])
+    let (_logits, _state) = model.forward(&[&tokens, &tokens], None)
         .expect("Forward failed");
 
     let contexts = contexts.lock().unwrap();
@@ -177,18 +183,20 @@ fn test_probe_with_masked_forward() {
         })
         .build();
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
+    let config = HipRuntimeConfig::new(256, 2);
+    let model = model.with_config(config).expect("Failed to configure model");
 
     let n_layer = model.info.n_layer;
 
-    // Use forward with variable lengths
-    let seq1 = vec![0u32, 1, 2, 0, 0]; // length 3
+    // Use forward with variable lengths (new API handles this automatically)
+    let seq1 = vec![0u32, 1, 2];       // length 3
     let seq2 = vec![0u32, 1, 2, 3, 4]; // length 5
-    let lengths = vec![3, 5];
 
-    let (_logits, _state) = model.forward(&[&seq1, &seq2], None, &lengths)
+    let (_logits, _state) = model.forward(&[&seq1, &seq2], None)
         .expect("Forward failed");
 
     let captured = captured.lock().unwrap();

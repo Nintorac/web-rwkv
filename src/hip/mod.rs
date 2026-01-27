@@ -1130,6 +1130,7 @@ mod tests {
     #[test]
     fn test_forward_basic() {
         use std::path::Path;
+        use super::scratch::HipRuntimeConfig;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
@@ -1138,10 +1139,12 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
-        let lens = vec![tokens.len()];
+        let config = HipRuntimeConfig::new(256, 1);
+        let model = model.with_config(config).expect("Failed to configure model");
 
-        let (logits, _state) = model.forward(&[&tokens], None, &lens).expect("forward() failed");
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+
+        let (logits, _state) = model.forward(&[&tokens], None).expect("forward() failed");
 
         // Should return vocab_size * T logits
         let expected_len = model.info.n_vocab * tokens.len();
@@ -1155,6 +1158,7 @@ mod tests {
     #[test]
     fn test_batched_matches_sequential() {
         use std::path::Path;
+        use super::scratch::HipRuntimeConfig;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
@@ -1162,7 +1166,18 @@ mod tests {
             return;
         }
 
-        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        // Load two separate models to get fresh state each time
+        let model1 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config1 = HipRuntimeConfig::new(256, 1);
+        let model1 = model1.with_config(config1).expect("Failed to configure model");
+
+        let model2 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config2 = HipRuntimeConfig::new(256, 1);
+        let model2 = model2.with_config(config2).expect("Failed to configure model");
+
+        let model_batch = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config_batch = HipRuntimeConfig::new(256, 2);
+        let model_batch = model_batch.with_config(config_batch).expect("Failed to configure model");
 
         // Two sequences
         let seq1: Vec<u32> = vec![1, 2, 3];
@@ -1170,20 +1185,20 @@ mod tests {
         let t = seq1.len();
 
         // Run sequentially with B=1 (fresh state each time)
-        let (logits1, _) = model.forward(&[&seq1], None, &[t]).expect("seq1 forward failed");
-        let (logits2, _) = model.forward(&[&seq2], None, &[t]).expect("seq2 forward failed");
+        let (logits1, _) = model1.forward(&[&seq1], None).expect("seq1 forward failed");
+        let (logits2, _) = model2.forward(&[&seq2], None).expect("seq2 forward failed");
 
         // Run batched with B=2 (fresh state)
-        let (batched_logits, _) = model.forward(&[&seq1, &seq2], None, &[t, t])
+        let (batched_logits, _) = model_batch.forward(&[&seq1, &seq2], None)
             .expect("batched forward failed");
 
-        // Batched output should have shape [vocab_size, T, B]
-        let vocab = model.info.n_vocab;
+        // Batched output: [seq1 tokens, seq2 tokens] concatenated
+        let vocab = model1.info.n_vocab;
         let b = 2;
         assert_eq!(batched_logits.len(), vocab * t * b);
 
         // Compare: batched logits should match sequential
-        // Layout: batched[v, t, b] = batched[b * T * V + t * V + v]
+        // New layout: [seq1_t0, seq1_t1, seq1_t2, seq2_t0, seq2_t1, seq2_t2]
         let mut max_diff = 0.0f32;
         for ti in 0..t {
             for vi in 0..vocab {
@@ -1191,9 +1206,9 @@ mod tests {
                 let seq1_val = logits1[vi + ti * vocab];
                 let seq2_val = logits2[vi + ti * vocab];
 
-                // Batched: logits[v, t, 0] and logits[v, t, 1]
-                let batch1_val = batched_logits[0 * t * vocab + ti * vocab + vi];
-                let batch2_val = batched_logits[1 * t * vocab + ti * vocab + vi];
+                // Batched: first t tokens are seq1, next t tokens are seq2
+                let batch1_val = batched_logits[(0 * t + ti) * vocab + vi];
+                let batch2_val = batched_logits[(1 * t + ti) * vocab + vi];
 
                 let diff1 = (seq1_val - batch1_val).abs();
                 let diff2 = (seq2_val - batch2_val).abs();
@@ -1212,6 +1227,7 @@ mod tests {
     #[test]
     fn test_batched_streaming_equivalence() {
         use std::path::Path;
+        use super::scratch::HipRuntimeConfig;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
@@ -1220,18 +1236,20 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 1);
+        let model = model.with_config(config).expect("Failed to configure model");
 
         let tokens: Vec<u32> = vec![1, 2, 3];
 
         // Single-sequence batch forward (all tokens at once)
-        let (logits_batch, _) = model.forward(&[&tokens], None, &[tokens.len()])
+        let (logits_batch, _) = model.forward(&[&tokens], None)
             .expect("batch forward failed");
 
         // Single-sequence streaming (token by token, chain state)
         let mut logits_stream = Vec::new();
         let mut state: Option<HipState> = None;
         for &tok in &tokens {
-            let (logits, new_state) = model.forward(&[&[tok]], state, &[1])
+            let (logits, new_state) = model.forward(&[&[tok]], state)
                 .expect("streaming forward failed");
             logits_stream.extend(logits);
             state = Some(new_state);
@@ -1253,6 +1271,7 @@ mod tests {
     #[test]
     fn test_batched_chunked_equivalence() {
         use std::path::Path;
+        use super::scratch::HipRuntimeConfig;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
@@ -1261,20 +1280,22 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 1);
+        let model = model.with_config(config).expect("Failed to configure model");
 
         // 10 tokens, chunk into [4, 4, 2]
         let tokens: Vec<u32> = (1..=10).collect();
         let chunk_size = 4;
 
         // Full forward
-        let (logits_full, _) = model.forward(&[&tokens], None, &[tokens.len()])
+        let (logits_full, _) = model.forward(&[&tokens], None)
             .expect("full forward failed");
 
-        // Chunked forward
+        // Chunked forward (manual chunking)
         let mut logits_chunked = Vec::new();
         let mut state: Option<HipState> = None;
         for chunk in tokens.chunks(chunk_size) {
-            let (logits, new_state) = model.forward(&[chunk], state, &[chunk.len()])
+            let (logits, new_state) = model.forward(&[chunk], state)
                 .expect("chunked forward failed");
             logits_chunked.extend(logits);
             state = Some(new_state);
@@ -1296,6 +1317,7 @@ mod tests {
     #[test]
     fn test_batched_state_evolution() {
         use std::path::Path;
+        use super::scratch::HipRuntimeConfig;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
@@ -1304,13 +1326,14 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 2);
+        let model = model.with_config(config).expect("Failed to configure model");
 
         let seq1: Vec<u32> = vec![1, 2, 3];
         let seq2: Vec<u32> = vec![4, 5, 6];
-        let t = seq1.len();
 
         // Run forward with fresh state (None)
-        let (_, state) = model.forward(&[&seq1, &seq2], None, &[t, t])
+        let (_, state) = model.forward(&[&seq1, &seq2], None)
             .expect("forward failed");
 
         // Returned state should have evolved (non-zero)
@@ -1327,6 +1350,7 @@ mod tests {
     #[test]
     fn test_batch_size_mismatch_error() {
         use std::path::Path;
+        use super::scratch::HipRuntimeConfig;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
@@ -1335,23 +1359,25 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 3);
+        let model = model.with_config(config).expect("Failed to configure model");
 
         // State with batch_size=2, but provide 3 sequences
         let state = HipState::new(&model.info, 2);
         let result = model.forward(
             &[&[1u32], &[2u32], &[3u32]],
-            Some(state),
-            &[1, 1, 1]
+            Some(state)
         );
 
         assert!(result.is_err(), "Should error on batch size mismatch");
         println!("Batch size mismatch error test PASSED");
     }
 
-    /// Test sequence length mismatch error.
+    /// Test variable-length sequences (now supported, not an error).
     #[test]
-    fn test_sequence_length_mismatch_error() {
+    fn test_variable_length_sequences() {
         use std::path::Path;
+        use super::scratch::HipRuntimeConfig;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
@@ -1360,16 +1386,22 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 2);
+        let model = model.with_config(config).expect("Failed to configure model");
 
-        // Two sequences with different (unpadded) lengths - should error
-        let result = model.forward(
-            &[&[1u32, 2, 3], &[4u32, 5]],  // length 3 vs length 2
-            None,
-            &[3, 2]
-        );
+        // Two sequences with different lengths - should now work
+        let seq1: Vec<u32> = vec![1, 2, 3];  // length 3
+        let seq2: Vec<u32> = vec![4, 5];     // length 2
+        let result = model.forward(&[&seq1, &seq2], None);
 
-        assert!(result.is_err(), "Should error on sequence length mismatch");
-        println!("Sequence length mismatch error test PASSED");
+        assert!(result.is_ok(), "Variable-length sequences should be supported");
+
+        let (logits, _) = result.unwrap();
+        let vocab = model.info.n_vocab;
+        // Logits should have (3 + 2) * vocab elements
+        assert_eq!(logits.len(), 5 * vocab, "Should have logits for all 5 tokens");
+
+        println!("Variable-length sequences test PASSED");
     }
 
     /// Test HipState reset.

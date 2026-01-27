@@ -6,6 +6,7 @@
 use std::sync::Mutex;
 
 use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
+use super::scratch::HipRuntimeConfig;
 use crate::tensor::{TensorCpu, TensorError, TensorInit, TensorShape as TensorShapeTrait};
 
 /// CPU-only softmax for HIP backend.
@@ -56,21 +57,46 @@ pub struct HipRuntime {
     model: Rwkv7Hip,
     state: Mutex<HipState>,
     num_batch: usize,
+    chunk_size: usize,
 }
 
 impl HipRuntime {
-    /// Create a new HipRuntime.
+    /// Create a new HipRuntime with specified configuration.
+    ///
+    /// # Arguments
+    /// * `model` - Loaded RWKV7 HIP model
+    /// * `config` - Runtime configuration (chunk size and batch size)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let model = Rwkv7Hip::load("model.st")?;
+    /// let config = HipRuntimeConfig::new(256, 4);  // chunk_size=256, batch=4
+    /// let runtime = HipRuntime::new(model, config)?;
+    /// ```
+    pub fn with_config(model: Rwkv7Hip, config: HipRuntimeConfig) -> Result<Self, super::HipErrorKind> {
+        let num_batch = config.batch_size;
+        let chunk_size = config.max_prefill_chunk;
+        let model = model.with_config(config)?;
+        let state = HipState::new(&model.info, num_batch);
+        Ok(Self {
+            model,
+            state: Mutex::new(state),
+            num_batch,
+            chunk_size,
+        })
+    }
+
+    /// Create a new HipRuntime with default configuration.
+    ///
+    /// Uses chunk_size=256 and the specified batch size.
     ///
     /// # Arguments
     /// * `model` - Loaded RWKV7 HIP model
     /// * `num_batch` - Maximum batch size for inference
     pub fn new(model: Rwkv7Hip, num_batch: usize) -> Self {
-        let state = HipState::new(&model.info, num_batch);
-        Self {
-            model,
-            state: Mutex::new(state),
-            num_batch,
-        }
+        let config = HipRuntimeConfig::new(256, num_batch);
+        // Note: This panics on failure. Use with_config() for error handling.
+        Self::with_config(model, config).expect("Failed to initialize HipRuntime")
     }
 
     /// Get model info.
@@ -81,6 +107,11 @@ impl HipRuntime {
     /// Get configured batch size.
     pub fn num_batch(&self) -> usize {
         self.num_batch
+    }
+
+    /// Get configured chunk size.
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
     }
 
     /// Reset all state to initial values.
@@ -97,14 +128,16 @@ impl HipRuntime {
 
     /// Run inference on a batch of token sequences.
     ///
-    /// Supports variable-length sequences through padding and masking.
+    /// Supports variable-length sequences - no manual padding required.
     /// State is preserved across calls for streaming inference.
     ///
     /// # Arguments
     /// * `sequences` - Batch of token sequences (can be variable length)
     ///
     /// # Returns
-    /// Logits tensor with shape [vocab_size, max_len * batch_size, 1, 1]
+    /// Logits tensor containing logits for all real tokens (no padding).
+    /// Layout: `[vocab_size, total_tokens, 1, 1]` where total_tokens is
+    /// sum of all sequence lengths.
     pub fn infer(&self, sequences: &[&[u32]]) -> Result<TensorCpu<f32>, super::HipErrorKind> {
         if sequences.is_empty() {
             return Err(super::HipErrorKind {
@@ -113,26 +146,24 @@ impl HipRuntime {
             });
         }
 
-        // Pad sequences and get original lengths
-        let (padded, lengths) = self.pad_sequences(sequences);
-        let padded_refs: Vec<&[u32]> = padded.iter().map(|v| v.as_slice()).collect();
-
         // Take state from mutex, run forward, put new state back
         let mut state_guard = self.state.lock().unwrap();
         let old_state = std::mem::replace(&mut *state_guard, HipState::new(&self.model.info, self.num_batch));
         drop(state_guard);
 
-        let (logits, new_state) = self.model.forward(&padded_refs, Some(old_state), &lengths)?;
+        // New forward() handles variable-length sequences automatically
+        let (logits, new_state) = self.model.forward(sequences, Some(old_state))?;
 
         // Store the updated state
         let mut state_guard = self.state.lock().unwrap();
         *state_guard = new_state;
 
         // Convert to TensorCpu
+        // Output is flattened: [batch_0_tokens..., batch_1_tokens..., ...]
+        // Each token has vocab_size logits
         let vocab_size = self.model.info.n_vocab;
-        let max_len = padded[0].len();
-        let batch_size = sequences.len();
-        let shape = crate::tensor::shape::Shape::new(vocab_size, max_len * batch_size, 1, 1);
+        let total_tokens: usize = sequences.iter().map(|s| s.len()).sum();
+        let shape = crate::tensor::shape::Shape::new(vocab_size, total_tokens, 1, 1);
 
         TensorInit::from_data(shape, logits).map_err(|e| super::HipErrorKind {
             code: -1,
@@ -177,13 +208,12 @@ impl HipRuntime {
 
     /// Extract logits for the last real token of each sequence.
     ///
-    /// Given logits from a padded batch and the original lengths,
-    /// extracts only the logits at the last valid position for each sequence.
+    /// The new forward() output contains only real token logits (no padding).
+    /// Layout: `[batch_0_tokens..., batch_1_tokens..., ...]`
     ///
     /// # Arguments
-    /// * `logits` - Full logits tensor [vocab_size, max_len * batch_size, 1, 1]
-    /// * `lengths` - Original sequence lengths
-    /// * `max_len` - Padded sequence length
+    /// * `logits` - Logits tensor [vocab_size, total_tokens, 1, 1]
+    /// * `lengths` - Original sequence lengths (used to find last token of each batch)
     ///
     /// # Returns
     /// Vec of logit slices, one per sequence (each of length vocab_size)
@@ -191,57 +221,52 @@ impl HipRuntime {
         &self,
         logits: &TensorCpu<f32>,
         lengths: &[usize],
-        max_len: usize,
     ) -> Vec<Vec<f32>> {
         let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
-        let batch_size = lengths.len();
 
-        let mut results = Vec::with_capacity(batch_size);
+        let mut results = Vec::with_capacity(lengths.len());
+        let mut offset = 0usize;
 
-        for (batch_idx, &real_len) in lengths.iter().enumerate() {
-            // For batch b, token t: index = (b * max_len + t) * vocab_size
-            // We want the last real token: t = real_len - 1
-            let last_token_idx = real_len.saturating_sub(1);
-            let offset = (batch_idx * max_len + last_token_idx) * vocab_size;
-            let slice = &data[offset..offset + vocab_size];
+        for &len in lengths {
+            // Last token of this batch is at offset + (len - 1) tokens
+            let last_token_offset = (offset + len.saturating_sub(1)) * vocab_size;
+            let slice = &data[last_token_offset..last_token_offset + vocab_size];
             results.push(slice.to_vec());
+            offset += len;
         }
 
         results
     }
 
-    /// Extract all valid logits for each sequence (not padding).
+    /// Extract all logits for each sequence.
+    ///
+    /// The new forward() output contains only real token logits (no padding).
+    /// This method splits the flat output by sequence.
     ///
     /// # Arguments
-    /// * `logits` - Full logits tensor [vocab_size, max_len * batch_size, 1, 1]
+    /// * `logits` - Logits tensor [vocab_size, total_tokens, 1, 1]
     /// * `lengths` - Original sequence lengths
-    /// * `max_len` - Padded sequence length
     ///
     /// # Returns
     /// Vec of logit vectors, one per sequence. Each inner vec has length
-    /// `real_len * vocab_size` containing logits for all valid positions.
+    /// `seq_len * vocab_size` containing logits for all tokens in that sequence.
     pub fn extract_all_logits(
         &self,
         logits: &TensorCpu<f32>,
         lengths: &[usize],
-        max_len: usize,
     ) -> Vec<Vec<f32>> {
         let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
-        let batch_size = lengths.len();
 
-        let mut results = Vec::with_capacity(batch_size);
+        let mut results = Vec::with_capacity(lengths.len());
+        let mut offset = 0usize;
 
-        for (batch_idx, &real_len) in lengths.iter().enumerate() {
-            let mut seq_logits = Vec::with_capacity(real_len * vocab_size);
-
-            for t in 0..real_len {
-                let offset = (batch_idx * max_len + t) * vocab_size;
-                seq_logits.extend_from_slice(&data[offset..offset + vocab_size]);
-            }
-
-            results.push(seq_logits);
+        for &len in lengths {
+            let start = offset * vocab_size;
+            let end = (offset + len) * vocab_size;
+            results.push(data[start..end].to_vec());
+            offset += len;
         }
 
         results
@@ -813,36 +838,33 @@ mod tests {
         let vocab_size = model.info.n_vocab;
         let runtime = HipRuntime::new(model, 2);
 
-        // Create mock logits: [vocab_size, max_len * batch_size, 1, 1]
-        // batch_size=2, max_len=3
-        let max_len = 3;
-        let batch_size = 2;
-        let total = vocab_size * max_len * batch_size;
+        // Create mock logits in new format: [vocab_size, total_tokens, 1, 1]
+        // New format: all batch 0 tokens, then all batch 1 tokens (no padding)
+        // lengths = [2, 3] means: 2 tokens from batch 0, 3 tokens from batch 1
+        let lengths = vec![2usize, 3usize];
+        let total_tokens = lengths.iter().sum::<usize>();
+        let total = vocab_size * total_tokens;
         let mut data = vec![0.0f32; total];
 
         // Mark specific positions with identifiable values
-        // Batch 0, token 0: all 1.0
-        // Batch 0, token 1: all 2.0
-        // Batch 0, token 2: all 3.0
-        // Batch 1, token 0: all 10.0
-        // Batch 1, token 1: all 20.0
-        // Batch 1, token 2: all 30.0
-        for b in 0..batch_size {
-            for t in 0..max_len {
+        // Batch 0: token 0 = 1.0, token 1 = 2.0
+        // Batch 1: token 0 = 10.0, token 1 = 20.0, token 2 = 30.0
+        let mut offset = 0usize;
+        for (b, &len) in lengths.iter().enumerate() {
+            for t in 0..len {
                 let base_val = if b == 0 { (t + 1) as f32 } else { ((t + 1) * 10) as f32 };
                 for v in 0..vocab_size {
-                    data[(b * max_len + t) * vocab_size + v] = base_val;
+                    data[(offset + t) * vocab_size + v] = base_val;
                 }
             }
+            offset += len;
         }
 
         let logits: TensorCpu<f32> =
-            TensorInit::from_data(Shape::new(vocab_size, max_len * batch_size, 1, 1), data)
+            TensorInit::from_data(Shape::new(vocab_size, total_tokens, 1, 1), data)
                 .unwrap();
 
-        // lengths = [2, 3] means batch 0 has 2 real tokens, batch 1 has 3
-        let lengths = vec![2, 3];
-        let extracted = runtime.extract_last_logits(&logits, &lengths, max_len);
+        let extracted = runtime.extract_last_logits(&logits, &lengths);
 
         // Batch 0: last real token is at index 1 (value 2.0)
         assert_eq!(extracted[0][0], 2.0);
@@ -864,28 +886,28 @@ mod tests {
         let vocab_size = model.info.n_vocab;
         let runtime = HipRuntime::new(model, 2);
 
-        // Same setup as above
-        let max_len = 3;
-        let batch_size = 2;
-        let total = vocab_size * max_len * batch_size;
+        // New format: all batch 0 tokens, then all batch 1 tokens (no padding)
+        let lengths = vec![2usize, 3usize];
+        let total_tokens = lengths.iter().sum::<usize>();
+        let total = vocab_size * total_tokens;
         let mut data = vec![0.0f32; total];
 
-        for b in 0..batch_size {
-            for t in 0..max_len {
+        let mut offset = 0usize;
+        for (b, &len) in lengths.iter().enumerate() {
+            for t in 0..len {
                 let base_val = if b == 0 { (t + 1) as f32 } else { ((t + 1) * 10) as f32 };
                 for v in 0..vocab_size {
-                    data[(b * max_len + t) * vocab_size + v] = base_val;
+                    data[(offset + t) * vocab_size + v] = base_val;
                 }
             }
+            offset += len;
         }
 
         let logits: TensorCpu<f32> =
-            TensorInit::from_data(Shape::new(vocab_size, max_len * batch_size, 1, 1), data)
+            TensorInit::from_data(Shape::new(vocab_size, total_tokens, 1, 1), data)
                 .unwrap();
 
-        // lengths = [2, 3]
-        let lengths = vec![2, 3];
-        let extracted = runtime.extract_all_logits(&logits, &lengths, max_len);
+        let extracted = runtime.extract_all_logits(&logits, &lengths);
 
         // Batch 0: 2 tokens * vocab_size
         assert_eq!(extracted[0].len(), 2 * vocab_size);

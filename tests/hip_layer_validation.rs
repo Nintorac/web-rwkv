@@ -386,14 +386,17 @@ fn test_hip_layer_by_layer_step0() {
     let (probes, captured) = build_capture_probes();
 
     // Load model with probes
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
 
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let (_logits, _state) = model.forward(&[&[token]], None, &[1])
+    let (_logits, _state) = model.forward(&[&[token]], None)
         .expect("Forward pass failed");
 
     // Validate all captured values
@@ -552,14 +555,17 @@ fn test_probe_coverage() {
 
     let (probes, captured) = build_capture_probes();
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
 
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let (_logits, _state) = model.forward(&[&[0]], None, &[1])
+    let (_logits, _state) = model.forward(&[&[0]], None)
         .expect("Forward pass failed");
 
     let captured = captured.lock().unwrap();
@@ -650,7 +656,10 @@ fn test_hip_divergence_progression() {
     println!("\n=== Divergence Progression (first {} steps) ===\n", n_steps);
 
     // Load model (without probes for speed)
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
     let mut state: Option<HipState> = None;
 
     for step in 0..n_steps {
@@ -665,7 +674,7 @@ fn test_hip_divergence_progression() {
         let fixture = TestFixture::load(&fixture_path)
             .expect(&format!("Failed to load {}", fixture_path));
 
-        let (logits, new_state) = model.forward(&[&[token]], state, &[1])
+        let (logits, new_state) = model.forward(&[&[token]], state)
             .expect("Forward failed");
         state = Some(new_state);
 

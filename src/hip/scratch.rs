@@ -208,6 +208,11 @@ pub struct HipScratch {
 
     /// Final logits output
     pub logits: TensorHip<f32>,
+
+    // ========== Token staging buffer [T, B] ==========
+
+    /// GPU staging buffer for tokens (zero-copy chunking)
+    pub token_staging: TensorHip<u32>,
 }
 
 impl HipScratch {
@@ -293,6 +298,9 @@ impl HipScratch {
 
             // Output buffer
             logits: TensorHip::new(out_shape)?,
+
+            // Token staging buffer [T, B]
+            token_staging: TensorHip::new(TensorShape::new(t, b, 1, 1))?,
         })
     }
 
@@ -308,14 +316,16 @@ impl HipScratch {
         let std_size = c * t * b;
         let ffn_size = h * t * b;
         let out_size = v * t * b;
+        let token_size = t * b; // Token staging buffer
 
         let std_count = 26; // Number of standard buffers
         let ffn_count = 2;  // Number of FFN hidden buffers
 
         let lora_size = (ld.w_dim + ld.a_dim + ld.g_dim + ld.v_dim.unwrap_or(0)) * t * b;
 
-        let total_elements = std_count * std_size + ffn_count * ffn_size + lora_size + out_size;
-        total_elements * std::mem::size_of::<f32>()
+        let f32_elements = std_count * std_size + ffn_count * ffn_size + lora_size + out_size;
+        let u32_elements = token_size;
+        f32_elements * std::mem::size_of::<f32>() + u32_elements * std::mem::size_of::<u32>()
     }
 
     /// Check if buffers are large enough for given sequence length and batch size.

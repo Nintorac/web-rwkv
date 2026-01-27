@@ -440,6 +440,64 @@ impl<T: Copy> TensorHip<T> {
         }
     }
 
+    /// Copy data from host to this tensor at a specific element offset.
+    ///
+    /// This allows writing a partial slice to a larger pre-allocated buffer.
+    /// The tensor must be contiguous.
+    ///
+    /// # Arguments
+    /// * `data` - Host data to copy
+    /// * `offset` - Element offset into the tensor (not bytes)
+    /// * `stream` - HIP stream for async copy
+    pub fn copy_from_slice_at(&mut self, data: &[T], offset: usize, stream: &Stream) -> Result<()> {
+        if !self.is_contiguous() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Cannot copy to non-contiguous tensor directly".to_string(),
+            });
+        }
+
+        if offset + data.len() > self.allocated_len {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Copy would exceed buffer: offset {} + len {} > allocated {}",
+                    offset, data.len(), self.allocated_len
+                ),
+            });
+        }
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let size = data.len() * std::mem::size_of::<T>();
+        let dst = unsafe { self.ptr.add(offset) };
+        unsafe {
+            check(hip_memcpy_h2d(
+                dst as *mut c_void,
+                data.as_ptr() as *const c_void,
+                size,
+                stream.handle(),
+            ))
+        }
+    }
+
+    /// Fill the tensor with zeros.
+    ///
+    /// This sets all bytes of the tensor to zero, which is equivalent to
+    /// setting all numeric elements to 0.
+    pub fn fill_zero(&mut self) -> Result<()> {
+        if self.allocated_len == 0 {
+            return Ok(());
+        }
+
+        let size = self.allocated_len * std::mem::size_of::<T>();
+        unsafe {
+            check(hip_memset(self.ptr as *mut c_void, 0, size))
+        }
+    }
+
     /// Create a view (slice) of this tensor.
     ///
     /// The view shares the same underlying memory but has different shape/offset.

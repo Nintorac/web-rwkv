@@ -49,8 +49,11 @@ fn test_hip_against_ground_truth() {
     println!("  Steps: {}", n_steps);
 
     // Load model
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
 
     // State for streaming inference (starts as None, then chains through)
     let mut state: Option<web_rwkv::hip::HipState> = None;
@@ -64,7 +67,7 @@ fn test_hip_against_ground_truth() {
             .expect(&format!("Failed to load {}", fixture_path));
 
         // Run single token through HIP model
-        let (logits, new_state) = model.forward(&[&[token]], state, &[1])
+        let (logits, new_state) = model.forward(&[&[token]], state)
             .expect(&format!("Forward pass failed at step {}", step));
         state = Some(new_state);
 
@@ -199,8 +202,11 @@ fn test_top1_match_all_steps() {
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Top-1 (Argmax) Match Test ===\n");
@@ -213,7 +219,7 @@ fn test_top1_match_all_steps() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state, &[1])
+        let (logits, new_state) = model.forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
@@ -262,8 +268,11 @@ fn test_top5_overlap_all_steps() {
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Top-5 Overlap Test ===\n");
@@ -277,7 +286,7 @@ fn test_top5_overlap_all_steps() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state, &[1])
+        let (logits, new_state) = model.forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
@@ -333,8 +342,11 @@ fn test_top10_overlap_all_steps() {
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Top-10 Overlap Test ===\n");
@@ -347,7 +359,7 @@ fn test_top10_overlap_all_steps() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state, &[1])
+        let (logits, new_state) = model.forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
@@ -392,8 +404,11 @@ fn test_spearman_rank_correlation() {
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
+    use web_rwkv::hip::HipRuntimeConfig;
     let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
+    let config = HipRuntimeConfig::new(256, 1);
+    let model = model.with_config(config).expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Spearman Rank Correlation Test ===\n");
@@ -408,7 +423,7 @@ fn test_spearman_rank_correlation() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state, &[1])
+        let (logits, new_state) = model.forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
