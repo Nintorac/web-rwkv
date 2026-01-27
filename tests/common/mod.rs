@@ -155,6 +155,7 @@ impl TestFixture {
     }
 
     /// Check if a key exists.
+    #[allow(dead_code)] // Used by hip_layer_validation tests
     pub fn contains(&self, name: &str) -> bool {
         self.data.contains_key(name)
     }
