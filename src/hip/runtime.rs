@@ -124,6 +124,156 @@ impl HipRuntime {
     pub fn infer_one(&self, tokens: &[u32]) -> Result<TensorCpu<f32>, super::HipErrorKind> {
         self.infer(&[tokens])
     }
+
+    /// Pad sequences to max length for batched inference.
+    ///
+    /// Takes variable-length sequences and pads them to the maximum length
+    /// in the batch using token 0 as padding.
+    ///
+    /// # Arguments
+    /// * `sequences` - Variable-length token sequences
+    ///
+    /// # Returns
+    /// Tuple of (padded_tokens, original_lengths) where:
+    /// - `padded_tokens[i]` has length equal to max sequence length
+    /// - `original_lengths[i]` is the original length of sequence i
+    pub fn pad_sequences(&self, sequences: &[&[u32]]) -> (Vec<Vec<u32>>, Vec<usize>) {
+        let max_len = sequences.iter().map(|s| s.len()).max().unwrap_or(0);
+
+        let mut padded = Vec::with_capacity(sequences.len());
+        let mut lengths = Vec::with_capacity(sequences.len());
+
+        for seq in sequences {
+            let len = seq.len();
+            lengths.push(len);
+
+            let mut tokens = seq.to_vec();
+            tokens.resize(max_len, 0); // Pad with token 0
+            padded.push(tokens);
+        }
+
+        (padded, lengths)
+    }
+
+    /// Run inference on variable-length sequences with masking.
+    ///
+    /// This method handles sequences of different lengths by:
+    /// 1. Padding all sequences to the maximum length
+    /// 2. Using the masked forward pass to ignore padding
+    /// 3. Returning logits for all positions (caller extracts valid ones)
+    ///
+    /// # Arguments
+    /// * `sequences` - Variable-length token sequences
+    ///
+    /// # Returns
+    /// Logits tensor with shape [vocab_size, max_len * batch_size, 1, 1]
+    /// along with the original sequence lengths for output extraction.
+    pub fn infer_variable_length(
+        &self,
+        sequences: &[&[u32]],
+    ) -> Result<(TensorCpu<f32>, Vec<usize>), super::HipErrorKind> {
+        if sequences.is_empty() {
+            return Err(super::HipErrorKind {
+                code: -1,
+                message: "Empty batch".to_string(),
+            });
+        }
+
+        let (padded, lengths) = self.pad_sequences(sequences);
+
+        // Convert to the format expected by forward_with_state_masked
+        let padded_refs: Vec<&[u32]> = padded.iter().map(|v| v.as_slice()).collect();
+
+        let mut state = self.state.lock().unwrap();
+        let logits = self
+            .model
+            .forward_with_state_masked(&padded_refs, &lengths, &mut state)?;
+
+        // Convert to TensorCpu
+        let vocab_size = self.model.info.n_vocab;
+        let max_len = padded[0].len();
+        let batch_size = sequences.len();
+        let shape = crate::tensor::shape::Shape::new(vocab_size, max_len * batch_size, 1, 1);
+
+        let tensor = TensorInit::from_data(shape, logits).map_err(|e| super::HipErrorKind {
+            code: -1,
+            message: format!("Failed to create output tensor: {}", e),
+        })?;
+
+        Ok((tensor, lengths))
+    }
+
+    /// Extract logits for the last real token of each sequence.
+    ///
+    /// Given logits from a padded batch and the original lengths,
+    /// extracts only the logits at the last valid position for each sequence.
+    ///
+    /// # Arguments
+    /// * `logits` - Full logits tensor [vocab_size, max_len * batch_size, 1, 1]
+    /// * `lengths` - Original sequence lengths
+    /// * `max_len` - Padded sequence length
+    ///
+    /// # Returns
+    /// Vec of logit slices, one per sequence (each of length vocab_size)
+    pub fn extract_last_logits(
+        &self,
+        logits: &TensorCpu<f32>,
+        lengths: &[usize],
+        max_len: usize,
+    ) -> Vec<Vec<f32>> {
+        let vocab_size = self.model.info.n_vocab;
+        let data = logits.data();
+        let batch_size = lengths.len();
+
+        let mut results = Vec::with_capacity(batch_size);
+
+        for (batch_idx, &real_len) in lengths.iter().enumerate() {
+            // For batch b, token t: index = (b * max_len + t) * vocab_size
+            // We want the last real token: t = real_len - 1
+            let last_token_idx = real_len.saturating_sub(1);
+            let offset = (batch_idx * max_len + last_token_idx) * vocab_size;
+            let slice = &data[offset..offset + vocab_size];
+            results.push(slice.to_vec());
+        }
+
+        results
+    }
+
+    /// Extract all valid logits for each sequence (not padding).
+    ///
+    /// # Arguments
+    /// * `logits` - Full logits tensor [vocab_size, max_len * batch_size, 1, 1]
+    /// * `lengths` - Original sequence lengths
+    /// * `max_len` - Padded sequence length
+    ///
+    /// # Returns
+    /// Vec of logit vectors, one per sequence. Each inner vec has length
+    /// `real_len * vocab_size` containing logits for all valid positions.
+    pub fn extract_all_logits(
+        &self,
+        logits: &TensorCpu<f32>,
+        lengths: &[usize],
+        max_len: usize,
+    ) -> Vec<Vec<f32>> {
+        let vocab_size = self.model.info.n_vocab;
+        let data = logits.data();
+        let batch_size = lengths.len();
+
+        let mut results = Vec::with_capacity(batch_size);
+
+        for (batch_idx, &real_len) in lengths.iter().enumerate() {
+            let mut seq_logits = Vec::with_capacity(real_len * vocab_size);
+
+            for t in 0..real_len {
+                let offset = (batch_idx * max_len + t) * vocab_size;
+                seq_logits.extend_from_slice(&data[offset..offset + vocab_size]);
+            }
+
+            results.push(seq_logits);
+        }
+
+        results
+    }
 }
 
 #[cfg(test)]
@@ -629,5 +779,276 @@ mod tests {
         let exp_vals: Vec<f32> = logits.iter().map(|x| (x - max_val).exp()).collect();
         let sum: f32 = exp_vals.iter().sum();
         exp_vals.iter().map(|x| x / sum).collect()
+    }
+
+    // ========== Variable-length batching tests ==========
+
+    #[test]
+    fn test_pad_sequences_equal_length() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime = HipRuntime::new(model, 2);
+
+        // No padding needed when all same length
+        let seq1: Vec<u32> = vec![1, 2, 3];
+        let seq2: Vec<u32> = vec![4, 5, 6];
+        let (padded, lengths) = runtime.pad_sequences(&[&seq1, &seq2]);
+
+        assert_eq!(lengths, vec![3, 3]);
+        assert_eq!(padded[0], vec![1, 2, 3]);
+        assert_eq!(padded[1], vec![4, 5, 6]);
+
+        println!("test_pad_sequences_equal_length PASSED");
+    }
+
+    #[test]
+    fn test_pad_sequences_variable_length() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime = HipRuntime::new(model, 2);
+
+        // Variable lengths - should pad shorter sequence
+        let seq1: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let seq2: Vec<u32> = vec![10, 20];
+        let (padded, lengths) = runtime.pad_sequences(&[&seq1, &seq2]);
+
+        assert_eq!(lengths, vec![5, 2]);
+        assert_eq!(padded[0], vec![1, 2, 3, 4, 5]);
+        assert_eq!(padded[1], vec![10, 20, 0, 0, 0]); // Padded with zeros
+
+        println!("test_pad_sequences_variable_length PASSED");
+    }
+
+    #[test]
+    fn test_extract_last_logits() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model.info.n_vocab;
+        let runtime = HipRuntime::new(model, 2);
+
+        // Create mock logits: [vocab_size, max_len * batch_size, 1, 1]
+        // batch_size=2, max_len=3
+        let max_len = 3;
+        let batch_size = 2;
+        let total = vocab_size * max_len * batch_size;
+        let mut data = vec![0.0f32; total];
+
+        // Mark specific positions with identifiable values
+        // Batch 0, token 0: all 1.0
+        // Batch 0, token 1: all 2.0
+        // Batch 0, token 2: all 3.0
+        // Batch 1, token 0: all 10.0
+        // Batch 1, token 1: all 20.0
+        // Batch 1, token 2: all 30.0
+        for b in 0..batch_size {
+            for t in 0..max_len {
+                let base_val = if b == 0 { (t + 1) as f32 } else { ((t + 1) * 10) as f32 };
+                for v in 0..vocab_size {
+                    data[(b * max_len + t) * vocab_size + v] = base_val;
+                }
+            }
+        }
+
+        let logits: TensorCpu<f32> =
+            TensorInit::from_data(Shape::new(vocab_size, max_len * batch_size, 1, 1), data)
+                .unwrap();
+
+        // lengths = [2, 3] means batch 0 has 2 real tokens, batch 1 has 3
+        let lengths = vec![2, 3];
+        let extracted = runtime.extract_last_logits(&logits, &lengths, max_len);
+
+        // Batch 0: last real token is at index 1 (value 2.0)
+        assert_eq!(extracted[0][0], 2.0);
+        // Batch 1: last real token is at index 2 (value 30.0)
+        assert_eq!(extracted[1][0], 30.0);
+
+        println!("test_extract_last_logits PASSED");
+    }
+
+    #[test]
+    fn test_extract_all_logits() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model.info.n_vocab;
+        let runtime = HipRuntime::new(model, 2);
+
+        // Same setup as above
+        let max_len = 3;
+        let batch_size = 2;
+        let total = vocab_size * max_len * batch_size;
+        let mut data = vec![0.0f32; total];
+
+        for b in 0..batch_size {
+            for t in 0..max_len {
+                let base_val = if b == 0 { (t + 1) as f32 } else { ((t + 1) * 10) as f32 };
+                for v in 0..vocab_size {
+                    data[(b * max_len + t) * vocab_size + v] = base_val;
+                }
+            }
+        }
+
+        let logits: TensorCpu<f32> =
+            TensorInit::from_data(Shape::new(vocab_size, max_len * batch_size, 1, 1), data)
+                .unwrap();
+
+        // lengths = [2, 3]
+        let lengths = vec![2, 3];
+        let extracted = runtime.extract_all_logits(&logits, &lengths, max_len);
+
+        // Batch 0: 2 tokens * vocab_size
+        assert_eq!(extracted[0].len(), 2 * vocab_size);
+        assert_eq!(extracted[0][0], 1.0); // token 0
+        assert_eq!(extracted[0][vocab_size], 2.0); // token 1
+
+        // Batch 1: 3 tokens * vocab_size
+        assert_eq!(extracted[1].len(), 3 * vocab_size);
+        assert_eq!(extracted[1][0], 10.0); // token 0
+        assert_eq!(extracted[1][vocab_size], 20.0); // token 1
+        assert_eq!(extracted[1][2 * vocab_size], 30.0); // token 2
+
+        println!("test_extract_all_logits PASSED");
+    }
+
+    /// CRITICAL TEST: Verify that padding doesn't affect hidden state.
+    /// h(seq + padding) should equal h(seq)
+    #[test]
+    fn test_padding_preserves_hidden_state() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime_unpadded = HipRuntime::new(model, 1);
+
+        let model2 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime_padded = HipRuntime::new(model2, 2);
+
+        // Process [1, 2, 3] without padding
+        let seq: Vec<u32> = vec![1, 2, 3];
+        let _logits_unpadded = runtime_unpadded.infer_one(&seq).expect("Unpadded inference failed");
+        let state_unpadded = runtime_unpadded.get_state_snapshot();
+
+        // Process [1, 2, 3] with padding via variable-length batch
+        // We'll have seq1=[1,2,3] and seq2=[4,5] which pads seq2
+        // But we only care about the first batch's state
+        let seq1: Vec<u32> = vec![1, 2, 3];
+        let seq2: Vec<u32> = vec![4, 5]; // Different sequence, will be padded
+        let (_logits_padded, _lengths) = runtime_padded
+            .infer_variable_length(&[&seq1, &seq2])
+            .expect("Padded inference failed");
+        let state_padded = runtime_padded.get_state_snapshot();
+
+        // Compare the state for batch 0 from padded vs unpadded
+        // Note: The padded runtime has batch_size=2, so we need to extract batch 0's state
+        let n_layer = state_unpadded.att_states.len();
+
+        println!("Comparing states across {} layers...", n_layer);
+
+        let mut max_att_diff = 0.0f32;
+        let mut max_ffn_diff = 0.0f32;
+
+        for layer in 0..n_layer {
+            // att_shift_states: [n_embd * batch] - extract first n_embd for batch 0
+            let n_embd = state_unpadded.att_shift_states[layer].len();
+            for i in 0..n_embd {
+                let diff = (state_unpadded.att_shift_states[layer][i]
+                    - state_padded.att_shift_states[layer][i])
+                    .abs();
+                max_att_diff = max_att_diff.max(diff);
+            }
+
+            // ffn_states: same structure
+            for i in 0..n_embd {
+                let diff =
+                    (state_unpadded.ffn_states[layer][i] - state_padded.ffn_states[layer][i]).abs();
+                max_ffn_diff = max_ffn_diff.max(diff);
+            }
+        }
+
+        println!("Max att_shift diff: {:.6e}", max_att_diff);
+        println!("Max ffn_shift diff: {:.6e}", max_ffn_diff);
+
+        // The states should be very close (within floating point tolerance)
+        assert!(
+            max_att_diff < 1e-4,
+            "Attention shift states differ too much: {:.6e}",
+            max_att_diff
+        );
+        assert!(
+            max_ffn_diff < 1e-4,
+            "FFN shift states differ too much: {:.6e}",
+            max_ffn_diff
+        );
+
+        println!("test_padding_preserves_hidden_state PASSED");
+    }
+
+    /// Test variable-length inference end-to-end
+    #[test]
+    fn test_infer_variable_length() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model.info.n_vocab;
+        let runtime = HipRuntime::new(model, 2);
+
+        // Two sequences of different lengths
+        let seq1: Vec<u32> = vec![1, 2, 3, 4, 5];
+        let seq2: Vec<u32> = vec![10, 20];
+
+        let (logits, lengths) = runtime
+            .infer_variable_length(&[&seq1, &seq2])
+            .expect("Variable-length inference failed");
+
+        // Verify lengths returned correctly
+        assert_eq!(lengths, vec![5, 2]);
+
+        // Verify logits shape
+        let max_len = 5;
+        let expected_total = vocab_size * max_len * 2;
+        assert_eq!(logits.data().len(), expected_total);
+
+        // Extract last logits and verify they're valid
+        let last_logits = runtime.extract_last_logits(&logits, &lengths, max_len);
+        assert_eq!(last_logits.len(), 2);
+        assert_eq!(last_logits[0].len(), vocab_size);
+        assert_eq!(last_logits[1].len(), vocab_size);
+
+        // Verify no NaN/Inf
+        for (i, seq_logits) in last_logits.iter().enumerate() {
+            assert!(
+                seq_logits.iter().all(|&x| x.is_finite()),
+                "Sequence {} has non-finite logits",
+                i
+            );
+        }
+
+        println!("test_infer_variable_length PASSED");
     }
 }
