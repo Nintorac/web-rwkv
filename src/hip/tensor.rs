@@ -466,6 +466,62 @@ impl<T: Copy> TensorHip<T> {
     pub fn tensor_view(&self) -> TensorView {
         self.view
     }
+
+    /// Create a contiguous view with a smaller shape.
+    ///
+    /// This allows reusing pre-allocated buffers with different sequence lengths.
+    /// The new shape must fit within the allocated memory.
+    ///
+    /// # Arguments
+    /// * `new_shape` - The new shape, which must have total elements <= allocated_len
+    ///
+    /// # Returns
+    /// A new TensorHip that shares the same memory but has the new shape.
+    /// The returned tensor does not own the memory and will not free it on drop.
+    pub fn resized_view(&self, new_shape: TensorShape) -> Result<TensorHip<T>> {
+        let new_len = new_shape.len();
+        if new_len > self.allocated_len {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "New shape {} (len={}) exceeds allocated size {}",
+                    new_shape, new_len, self.allocated_len
+                ),
+            });
+        }
+
+        Ok(TensorHip {
+            ptr: self.ptr,
+            allocated_len: self.allocated_len,
+            view: TensorView::contiguous(new_shape),
+            memory_type: self.memory_type,
+            owned: false, // View doesn't own memory
+        })
+    }
+
+    /// Create a mutable contiguous view with a smaller shape.
+    ///
+    /// Same as `resized_view` but for mutable access.
+    pub fn resized_view_mut(&mut self, new_shape: TensorShape) -> Result<TensorHip<T>> {
+        let new_len = new_shape.len();
+        if new_len > self.allocated_len {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "New shape {} (len={}) exceeds allocated size {}",
+                    new_shape, new_len, self.allocated_len
+                ),
+            });
+        }
+
+        Ok(TensorHip {
+            ptr: self.ptr,
+            allocated_len: self.allocated_len,
+            view: TensorView::contiguous(new_shape),
+            memory_type: self.memory_type,
+            owned: false, // View doesn't own memory
+        })
+    }
 }
 
 impl<T> Drop for TensorHip<T> {

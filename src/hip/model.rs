@@ -12,8 +12,14 @@ use super::kernels::{
     hip_softplus_decay, hip_sigmoid, hip_squared_relu,
     hip_l2_norm, hip_group_norm, hip_wkv_bonus, hip_control_k,
     hip_wkv7_masked, extract_shift_state_at_lengths,
+    // GPU-native kernels for forward_with_scratch
+    layer_norm_f32, group_norm_f32, l2_norm_f32,
+    sigmoid_f32, tanh_f32, softplus_decay_f32, squared_relu_f32,
+    channel_mix_state_f32, control_k_f32, wkv7_f32, wkv_bonus_f32,
+    add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32,
 };
-use super::blas::hip_sgemm;
+use super::blas::{hip_sgemm, HipBlasContext};
+use super::scratch::HipScratch;
 
 #[cfg(feature = "hip-probes")]
 use crate::hip_probe;
@@ -1500,6 +1506,410 @@ impl Rwkv7Hip {
         hip_probe!(self, probe_ctx, probe::HipHook::PostHead, &logits, [n_vocab, t, b]);
 
         Ok(logits)
+    }
+
+    /// GPU-native forward pass using pre-allocated scratch buffers.
+    ///
+    /// This method keeps all computation on the GPU, only copying logits to host
+    /// at the end. It provides better performance than `forward_with_state` by:
+    /// - Reusing a `HipBlasContext` for all GEMM operations
+    /// - Using pre-allocated GPU buffers from `HipScratch`
+    /// - Using GPU-native kernel functions instead of host-side copies
+    ///
+    /// # Arguments
+    /// * `tokens` - Batch of sequences. Each `&[u32]` is one sequence.
+    ///              All sequences must have the same length T.
+    /// * `state` - Mutable reference to inference state. Must have `batch_size == tokens.len()`.
+    /// * `scratch` - Pre-allocated scratch buffers. Must support the sequence length and batch size.
+    ///
+    /// # Returns
+    /// Logits tensor of shape [vocab_size * T * B] in column-major layout [V, T, B].
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = HipRuntimeConfig::new(128, 4);
+    /// let scratch = HipScratch::new(&model.info, model.lora_dims(), config)?;
+    /// let mut state = HipState::new(&model.info, 4);
+    ///
+    /// let sequences: Vec<&[u32]> = vec![&seq1, &seq2, &seq3, &seq4];
+    /// let logits = model.forward_with_scratch(&sequences, &mut state, &scratch)?;
+    /// ```
+    pub fn forward_with_scratch(
+        &self,
+        tokens: &[&[u32]],
+        state: &mut HipState,
+        scratch: &mut HipScratch,
+    ) -> Result<Vec<f32>> {
+        let b = tokens.len();
+        if b == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Empty batch".to_string(),
+            });
+        }
+        if b != state.batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Batch size mismatch: tokens has {} sequences but state has batch_size={}",
+                    b, state.batch_size
+                ),
+            });
+        }
+
+        let t = tokens[0].len();
+        if t == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Empty sequence".to_string(),
+            });
+        }
+
+        // Verify scratch supports this configuration
+        if !scratch.supports(t, b) {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Scratch doesn't support seq_len={}, batch_size={} (max: {}, {})",
+                    t, b, scratch.config.max_prefill_chunk, scratch.config.batch_size
+                ),
+            });
+        }
+
+        // Verify all sequences have the same length
+        for (i, seq) in tokens.iter().enumerate() {
+            if seq.len() != t {
+                return Err(HipErrorKind {
+                    code: -1,
+                    message: format!(
+                        "Sequence length mismatch: sequence 0 has {} tokens but sequence {} has {}",
+                        t, i, seq.len()
+                    ),
+                });
+            }
+        }
+
+        // Create BLAS context for all GEMM operations
+        let ctx = HipBlasContext::with_null_stream()?;
+        let stream = ctx.stream();
+
+        let n_embd = self.info.n_embd;
+        let n_head = self.info.n_head;
+        let head_size = self.info.head_size;
+        let n_layer = self.info.n_layer;
+        let n_hidden = self.info.n_hidden;
+        let n_vocab = self.info.n_vocab;
+        let lora_dims = &scratch.lora_dims;
+
+        // Shapes for this forward pass - use actual sequence length
+        let std_shape = TensorShape::new(n_embd, t, b, 1);
+        let ffn_shape = TensorShape::new(n_hidden, t, b, 1);
+        let out_shape = TensorShape::new(n_vocab, t, b, 1);
+        let state_shape = TensorShape::new(n_embd, b, 1, 1);
+        let wkv_data_shape = TensorShape::new(head_size, n_head, t, b);
+        let wkv_state_shape = TensorShape::new(head_size, head_size, n_head, b);
+        let lora_w_shape = TensorShape::new(lora_dims.w_dim, t, b, 1);
+        let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, b, 1);
+        let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, b, 1);
+        let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
+
+        // Create resized views of scratch buffers for the actual sequence length
+        // Standard buffers [n_embd, t, b]
+        let mut x = scratch.x.resized_view_mut(std_shape)?;
+        let mut x_ln = scratch.x_ln.resized_view_mut(std_shape)?;
+        let mut att_xr = scratch.att_xr.resized_view_mut(std_shape)?;
+        let mut att_xw = scratch.att_xw.resized_view_mut(std_shape)?;
+        let mut att_xk = scratch.att_xk.resized_view_mut(std_shape)?;
+        let mut att_xv = scratch.att_xv.resized_view_mut(std_shape)?;
+        let mut att_xa = scratch.att_xa.resized_view_mut(std_shape)?;
+        let mut att_xg = scratch.att_xg.resized_view_mut(std_shape)?;
+        let mut att_r = scratch.att_r.resized_view_mut(std_shape)?;
+        let mut att_k = scratch.att_k.resized_view_mut(std_shape)?;
+        let mut att_v = scratch.att_v.resized_view_mut(std_shape)?;
+        let mut att_w = scratch.att_w.resized_view_mut(std_shape)?;
+        let mut att_a = scratch.att_a.resized_view_mut(std_shape)?;
+        let mut att_g = scratch.att_g.resized_view_mut(std_shape)?;
+        let mut att_kk = scratch.att_kk.resized_view_mut(std_shape)?;
+        let mut att_k_ctrl = scratch.att_k_ctrl.resized_view_mut(std_shape)?;
+        let mut wkv_a = scratch.wkv_a.resized_view_mut(std_shape)?;
+        let mut wkv_b = scratch.wkv_b.resized_view_mut(std_shape)?;
+        let mut w_decay = scratch.w_decay.resized_view_mut(std_shape)?;
+        let mut wkv_out = scratch.wkv_out.resized_view_mut(std_shape)?;
+        let mut wkv_normed = scratch.wkv_normed.resized_view_mut(std_shape)?;
+        let mut wkv_bonus = scratch.wkv_bonus.resized_view_mut(std_shape)?;
+        let mut att_out = scratch.att_out.resized_view_mut(std_shape)?;
+        let mut ffn_xk = scratch.ffn_xk.resized_view_mut(std_shape)?;
+        let mut ffn_out = scratch.ffn_out.resized_view_mut(std_shape)?;
+        let mut v_first = scratch.v_first.resized_view_mut(std_shape)?;
+
+        // FFN hidden buffers [n_hidden, t, b]
+        let mut ffn_k = scratch.ffn_k.resized_view_mut(ffn_shape)?;
+        let mut ffn_k_sq = scratch.ffn_k_sq.resized_view_mut(ffn_shape)?;
+
+        // LoRA buffers
+        let mut lora_w = scratch.lora_w.resized_view_mut(lora_w_shape)?;
+        let mut lora_a = scratch.lora_a.resized_view_mut(lora_a_shape)?;
+        let mut lora_g = scratch.lora_g.resized_view_mut(lora_g_shape)?;
+        let mut lora_v = scratch.lora_v.resized_view_mut(lora_v_shape)?;
+
+        // Output buffer [n_vocab, t, b]
+        let mut logits = scratch.logits.resized_view_mut(out_shape)?;
+
+        // Embedding lookup: tokens[b][t] -> x[c, t, b]
+        let emb_data = self.embed.w.to_vec(stream)?;
+        let mut x_host = vec![0.0f32; n_embd * t * b];
+        for batch_idx in 0..b {
+            for time_idx in 0..t {
+                let token = tokens[batch_idx][time_idx] as usize;
+                for c in 0..n_embd {
+                    let idx = batch_idx * t * n_embd + time_idx * n_embd + c;
+                    x_host[idx] = emb_data[token * n_embd + c];
+                }
+            }
+        }
+        x.copy_from_slice(&x_host, stream)?;
+
+        // Create temporary GPU buffers for state (upload at start, download at end)
+        let mut att_shift_gpu: Vec<TensorHip<f32>> = state.att_shift_states
+            .iter()
+            .map(|s| TensorHip::from_slice(s, state_shape, stream))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut ffn_shift_gpu: Vec<TensorHip<f32>> = state.ffn_states
+            .iter()
+            .map(|s| TensorHip::from_slice(s, state_shape, stream))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut wkv_state_gpu: Vec<TensorHip<f32>> = state.att_states
+            .iter()
+            .map(|s| TensorHip::from_slice(s, wkv_state_shape, stream))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Temporary buffers for new shift states
+        let mut new_att_shift = TensorHip::<f32>::new(state_shape)?;
+        let mut new_ffn_shift = TensorHip::<f32>::new(state_shape)?;
+        let mut new_wkv_state = TensorHip::<f32>::new(wkv_state_shape)?;
+
+        // Temporary buffers for operations requiring distinct input/output
+        let mut temp1 = TensorHip::<f32>::new(std_shape)?;
+        let mut temp2 = TensorHip::<f32>::new(std_shape)?;
+
+        // Process each layer
+        for layer_idx in 0..n_layer {
+            let layer = &self.layers[layer_idx];
+
+            // Apply ln0 for layer 0
+            if layer_idx == 0 {
+                layer_norm_f32(
+                    &x, &self.embed.ln.weight, &self.embed.ln.bias,
+                    &mut x_ln, 1e-5, stream
+                )?;
+                // Copy x_ln to x for subsequent operations
+                let x_ln_data = x_ln.to_vec(stream)?;
+                x.copy_from_slice(&x_ln_data, stream)?;
+            }
+
+            // ==== Time-Mix (Attention) ====
+            // Layer norm
+            layer_norm_f32(
+                &x, &layer.att_ln.weight, &layer.att_ln.bias,
+                &mut x_ln, 1e-5, stream
+            )?;
+
+            // Token shifts for attention
+            channel_mix_state_f32(
+                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
+                &mut att_xr, &mut new_att_shift, stream
+            )?;
+            channel_mix_state_f32(
+                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
+                &mut att_xw, &mut temp1, stream
+            )?;
+            channel_mix_state_f32(
+                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_k,
+                &mut att_xk, &mut temp1, stream
+            )?;
+            channel_mix_state_f32(
+                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_v,
+                &mut att_xv, &mut temp1, stream
+            )?;
+            channel_mix_state_f32(
+                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_a,
+                &mut att_xa, &mut temp1, stream
+            )?;
+            channel_mix_state_f32(
+                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
+                &mut att_xg, &mut temp1, stream
+            )?;
+
+            // Update shift state
+            std::mem::swap(&mut att_shift_gpu[layer_idx], &mut new_att_shift);
+
+            // Linear projections: r, k, v
+            ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
+            ctx.sgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
+            ctx.sgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+
+            // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
+            ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
+            let mut lora_tanh = TensorHip::<f32>::new(lora_w_shape)?;
+            tanh_f32(&lora_w, &mut lora_tanh, stream)?;
+            ctx.sgemm_into(&layer.att.w2, &lora_tanh, &mut att_w)?;
+            broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
+            softplus_decay_f32(&temp1, &mut att_w, stream)?;
+
+            // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
+            ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
+            let mut lora_a_proj = TensorHip::<f32>::new(std_shape)?;
+            ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
+            broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
+            sigmoid_f32(&temp1, &mut att_a, stream)?;
+
+            // Gate: g = sigmoid(xg @ g1) @ g2
+            ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
+            let mut lora_g_sig = TensorHip::<f32>::new(lora_g_shape)?;
+            sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
+            ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+
+            // Value residual (layers > 0)
+            if layer_idx > 0 {
+                if let (Some(v0), Some(v1), Some(v2)) =
+                    (&layer.att.v0, &layer.att.v1, &layer.att.v2) {
+                    ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
+                    let mut v_lora2 = TensorHip::<f32>::new(std_shape)?;
+                    ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
+                    broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
+                    sigmoid_f32(&temp1, &mut temp2, stream)?;
+                    // v = v + (v_first - v) * v_residual (CPU fallback)
+                    let v_host = att_v.to_vec(stream)?;
+                    let vf_host = v_first.to_vec(stream)?;
+                    let vr_host = temp2.to_vec(stream)?;
+                    let v_updated: Vec<f32> = v_host.iter().zip(vf_host.iter()).zip(vr_host.iter())
+                        .map(|((&vi, &vfi), &vri)| vi + (vfi - vi) * vri)
+                        .collect();
+                    att_v.copy_from_slice(&v_updated, stream)?;
+                }
+            } else {
+                // Store v_first from layer 0
+                let v_data = att_v.to_vec(stream)?;
+                v_first.copy_from_slice(&v_data, stream)?;
+            }
+
+            // L2 normalize k: k_scaled = k * k_k, then L2 norm (CPU fallback for broadcast mul)
+            let k_host = att_k.to_vec(stream)?;
+            let k_k_host = layer.att.k_k.to_vec(stream)?;
+            let k_scaled: Vec<f32> = k_host.iter().zip(k_k_host.iter().cycle())
+                .map(|(&ki, &kki)| ki * kki)
+                .collect();
+            temp1.copy_from_slice(&k_scaled, stream)?;
+            l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
+
+            // Control K: k_ctrl = k * (1 + (a - 1) * k_a)
+            control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
+
+            // WKV inputs
+            negate_f32(&att_kk, &mut wkv_a, stream)?;
+            mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
+            exp_f32(&att_w, &mut w_decay, stream)?;
+
+            // Reshape for WKV
+            let w_decay_wkv = TensorHip::from_slice(&w_decay.to_vec(stream)?, wkv_data_shape, stream)?;
+            let r_wkv = TensorHip::from_slice(&att_r.to_vec(stream)?, wkv_data_shape, stream)?;
+            let k_ctrl_wkv = TensorHip::from_slice(&att_k_ctrl.to_vec(stream)?, wkv_data_shape, stream)?;
+            let v_wkv = TensorHip::from_slice(&att_v.to_vec(stream)?, wkv_data_shape, stream)?;
+            let wkv_a_gpu = TensorHip::from_slice(&wkv_a.to_vec(stream)?, wkv_data_shape, stream)?;
+            let wkv_b_gpu = TensorHip::from_slice(&wkv_b.to_vec(stream)?, wkv_data_shape, stream)?;
+            let mut wkv_out_wkv = TensorHip::<f32>::new(wkv_data_shape)?;
+
+            // Run WKV7
+            wkv7_f32(
+                &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_gpu, &wkv_b_gpu,
+                &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state, stream
+            )?;
+            std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
+
+            // Copy WKV output back to standard shape
+            wkv_out.copy_from_slice(&wkv_out_wkv.to_vec(stream)?, stream)?;
+
+            // Group norm on WKV output
+            group_norm_f32(
+                &wkv_out, &layer.att.gn.weight, &layer.att.gn.bias,
+                &mut wkv_normed, n_head, 64e-5, stream
+            )?;
+
+            // WKV bonus
+            let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
+            let r_k_gpu = TensorHip::from_slice(&layer.att.r_k.to_vec(stream)?, r_k_shape, stream)?;
+            let mut wkv_bonus_wkv = TensorHip::<f32>::new(wkv_data_shape)?;
+            wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_gpu, &mut wkv_bonus_wkv, stream)?;
+            wkv_bonus.copy_from_slice(&wkv_bonus_wkv.to_vec(stream)?, stream)?;
+
+            // Combine: wkv_normed + wkv_bonus
+            add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
+
+            // Gate: combined * g
+            mul_f32(&temp1, &att_g, &mut temp2, stream)?;
+
+            // Output projection
+            ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+
+            // Residual: x = x + att_out
+            add_f32(&x, &att_out, &mut temp1, stream)?;
+            let temp1_data = temp1.to_vec(stream)?;
+            x.copy_from_slice(&temp1_data, stream)?;
+
+            // ==== Channel-Mix (FFN) ====
+            // Layer norm
+            layer_norm_f32(
+                &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
+                &mut x_ln, 1e-5, stream
+            )?;
+
+            // Token shift for FFN
+            channel_mix_state_f32(
+                &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
+                &mut ffn_xk, &mut new_ffn_shift, stream
+            )?;
+            std::mem::swap(&mut ffn_shift_gpu[layer_idx], &mut new_ffn_shift);
+
+            // Key projection
+            ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+
+            // Squared ReLU
+            squared_relu_f32(&ffn_k, &mut ffn_k_sq, stream)?;
+
+            // Value projection
+            ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+
+            // Residual: x = x + ffn_out
+            add_f32(&x, &ffn_out, &mut temp1, stream)?;
+            let temp1_data = temp1.to_vec(stream)?;
+            x.copy_from_slice(&temp1_data, stream)?;
+        }
+
+        // ==== Output Head ====
+        // Layer norm
+        layer_norm_f32(
+            &x, &self.head.ln.weight, &self.head.ln.bias,
+            &mut x_ln, 1e-5, stream
+        )?;
+
+        // Head projection -> logits
+        ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
+
+        // Download state back to host
+        for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
+            state.att_shift_states[i] = gpu_state.to_vec(stream)?;
+        }
+        for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
+            state.ffn_states[i] = gpu_state.to_vec(stream)?;
+        }
+        for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
+            state.att_states[i] = gpu_state.to_vec(stream)?;
+        }
+
+        // Download logits and return
+        logits.to_vec(stream)
     }
 }
 
