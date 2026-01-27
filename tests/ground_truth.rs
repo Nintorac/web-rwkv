@@ -103,6 +103,335 @@ fn test_hip_against_ground_truth() {
     println!("\nAll {} steps passed ground truth validation!", n_steps);
 }
 
+/// Get top-k indices from logits, sorted by descending logit value.
+fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
+    let mut indexed: Vec<_> = logits.iter().enumerate().collect();
+    indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.iter().take(k).map(|(i, _)| *i).collect()
+}
+
+/// Calculate overlap between two top-k sets as a fraction.
+fn top_k_overlap(actual: &[usize], expected: &[usize]) -> f64 {
+    let expected_set: std::collections::HashSet<_> = expected.iter().collect();
+    let matches = actual.iter().filter(|i| expected_set.contains(i)).count();
+    matches as f64 / expected.len() as f64
+}
+
+/// Compute ranks for a slice of values (higher value = lower rank, i.e., rank 1 is highest).
+/// Handles ties by assigning average rank.
+fn compute_ranks(values: &[f32]) -> Vec<f64> {
+    let n = values.len();
+    let mut indexed: Vec<_> = values.iter().enumerate().collect();
+    // Sort by value descending (highest value gets rank 1)
+    indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut ranks = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        // Find all elements with the same value (ties)
+        let mut j = i + 1;
+        while j < n && (indexed[j].1 - indexed[i].1).abs() < 1e-10 {
+            j += 1;
+        }
+        // Assign average rank to all tied elements
+        // Ranks are 1-indexed: positions i..j get average of (i+1)..(j+1)
+        let avg_rank = (i + 1 + j) as f64 / 2.0;
+        for k in i..j {
+            ranks[indexed[k].0] = avg_rank;
+        }
+        i = j;
+    }
+    ranks
+}
+
+/// Compute Spearman's rank correlation coefficient between two slices.
+/// Returns a value in [-1, 1] where 1 means perfect positive correlation.
+fn spearman_correlation(a: &[f32], b: &[f32]) -> f64 {
+    assert_eq!(a.len(), b.len(), "Slices must have equal length");
+    let n = a.len() as f64;
+
+    let ranks_a = compute_ranks(a);
+    let ranks_b = compute_ranks(b);
+
+    // Compute Pearson correlation of ranks
+    let mean_a: f64 = ranks_a.iter().sum::<f64>() / n;
+    let mean_b: f64 = ranks_b.iter().sum::<f64>() / n;
+
+    let mut cov = 0.0;
+    let mut var_a = 0.0;
+    let mut var_b = 0.0;
+
+    for i in 0..a.len() {
+        let da = ranks_a[i] - mean_a;
+        let db = ranks_b[i] - mean_b;
+        cov += da * db;
+        var_a += da * da;
+        var_b += db * db;
+    }
+
+    if var_a < 1e-10 || var_b < 1e-10 {
+        return 1.0; // All same values = perfect correlation
+    }
+
+    cov / (var_a.sqrt() * var_b.sqrt())
+}
+
+/// Test top-1 (argmax) match at every generation step.
+///
+/// This is the primary functional correctness test. Even if logit values differ
+/// slightly due to BF16 vs FP32 precision, the model should produce the same
+/// greedy predictions.
+#[test]
+#[cfg(feature = "hip")]
+fn test_top1_match_all_steps() {
+    if !model_exists() {
+        eprintln!("Skipping test: model file not found");
+        return;
+    }
+    if !ground_truth_fixtures_exist() {
+        eprintln!("Skipping test: ground truth fixtures not found");
+        return;
+    }
+
+    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
+        .expect("Failed to load config");
+    let tokens_i64 = config.i64("tokens");
+    let n_steps = config.i64("n_steps")[0] as usize;
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load model");
+    let mut state = web_rwkv::hip::HipState::new(&model.info, 1);
+
+    println!("\n=== Top-1 (Argmax) Match Test ===\n");
+
+    let mut matches = 0;
+    let mut mismatches = Vec::new();
+
+    for step in 0..n_steps {
+        let token = tokens_i64[step] as u32;
+        let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
+        let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
+
+        let logits = model.forward_with_state(&[&[token]], &mut state)
+            .expect("Forward pass failed");
+        let expected_logits = fixture.f32("logits");
+
+        let actual_top1 = top_k_indices(&logits, 1)[0];
+        let expected_top1 = top_k_indices(expected_logits, 1)[0];
+
+        if actual_top1 == expected_top1 {
+            matches += 1;
+            println!("  Step {:2}: token {:5} -> top1={:5} ✓", step, token, actual_top1);
+        } else {
+            mismatches.push((step, token, actual_top1, expected_top1));
+            println!("  Step {:2}: token {:5} -> HIP={:5}, expected={:5} ✗",
+                     step, token, actual_top1, expected_top1);
+        }
+    }
+
+    println!("\n=== Summary ===");
+    println!("Top-1 matches: {}/{} ({:.1}%)", matches, n_steps, 100.0 * matches as f64 / n_steps as f64);
+
+    if !mismatches.is_empty() {
+        println!("\nMismatches:");
+        for (step, token, actual, expected) in &mismatches {
+            println!("  Step {}: token {} -> HIP predicts {}, expected {}", step, token, actual, expected);
+        }
+    }
+
+    assert_eq!(matches, n_steps, "All steps should have matching top-1 predictions");
+    println!("\n✓ All {} steps have matching top-1 predictions!", n_steps);
+}
+
+/// Test top-5 overlap at every generation step.
+///
+/// Validates that the top 5 candidate tokens match between HIP and reference.
+/// Order may vary due to numerical precision, but the same tokens should appear.
+#[test]
+#[cfg(feature = "hip")]
+fn test_top5_overlap_all_steps() {
+    if !model_exists() || !ground_truth_fixtures_exist() {
+        eprintln!("Skipping test: model or fixtures not found");
+        return;
+    }
+
+    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
+        .expect("Failed to load config");
+    let tokens_i64 = config.i64("tokens");
+    let n_steps = config.i64("n_steps")[0] as usize;
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load model");
+    let mut state = web_rwkv::hip::HipState::new(&model.info, 1);
+
+    println!("\n=== Top-5 Overlap Test ===\n");
+
+    const MIN_OVERLAP_THRESHOLD: f64 = 0.80; // 80% overlap required
+    let mut total_overlap = 0.0;
+    let mut steps_below_threshold = Vec::new();
+
+    for step in 0..n_steps {
+        let token = tokens_i64[step] as u32;
+        let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
+        let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
+
+        let logits = model.forward_with_state(&[&[token]], &mut state)
+            .expect("Forward pass failed");
+        let expected_logits = fixture.f32("logits");
+
+        let actual_top5 = top_k_indices(&logits, 5);
+        let expected_top5 = top_k_indices(expected_logits, 5);
+        let overlap = top_k_overlap(&actual_top5, &expected_top5);
+        total_overlap += overlap;
+
+        let status = if overlap >= MIN_OVERLAP_THRESHOLD { "✓" } else { "✗" };
+        println!("  Step {:2}: overlap={:.0}% ({}/5) {}",
+                 step, overlap * 100.0, (overlap * 5.0) as usize, status);
+
+        if overlap < MIN_OVERLAP_THRESHOLD {
+            steps_below_threshold.push((step, overlap, actual_top5.clone(), expected_top5.clone()));
+        }
+    }
+
+    let avg_overlap = total_overlap / n_steps as f64;
+    println!("\n=== Summary ===");
+    println!("Average top-5 overlap: {:.1}%", avg_overlap * 100.0);
+    println!("Steps below {:.0}% threshold: {}", MIN_OVERLAP_THRESHOLD * 100.0, steps_below_threshold.len());
+
+    if !steps_below_threshold.is_empty() {
+        println!("\nSteps with low overlap:");
+        for (step, overlap, actual, expected) in &steps_below_threshold {
+            println!("  Step {}: {:.0}% overlap", step, overlap * 100.0);
+            println!("    HIP top-5:      {:?}", actual);
+            println!("    Expected top-5: {:?}", expected);
+        }
+    }
+
+    assert!(avg_overlap >= MIN_OVERLAP_THRESHOLD,
+            "Average top-5 overlap {:.1}% below threshold {:.0}%",
+            avg_overlap * 100.0, MIN_OVERLAP_THRESHOLD * 100.0);
+
+    println!("\n✓ Top-5 overlap test passed! Average: {:.1}%", avg_overlap * 100.0);
+}
+
+/// Test top-10 overlap with detailed reporting.
+///
+/// A more relaxed test that validates broader prediction agreement.
+#[test]
+#[cfg(feature = "hip")]
+fn test_top10_overlap_all_steps() {
+    if !model_exists() || !ground_truth_fixtures_exist() {
+        eprintln!("Skipping test: model or fixtures not found");
+        return;
+    }
+
+    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
+        .expect("Failed to load config");
+    let tokens_i64 = config.i64("tokens");
+    let n_steps = config.i64("n_steps")[0] as usize;
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load model");
+    let mut state = web_rwkv::hip::HipState::new(&model.info, 1);
+
+    println!("\n=== Top-10 Overlap Test ===\n");
+
+    const MIN_OVERLAP_THRESHOLD: f64 = 0.70; // 70% overlap required for top-10
+    let mut total_overlap = 0.0;
+
+    for step in 0..n_steps {
+        let token = tokens_i64[step] as u32;
+        let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
+        let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
+
+        let logits = model.forward_with_state(&[&[token]], &mut state)
+            .expect("Forward pass failed");
+        let expected_logits = fixture.f32("logits");
+
+        let actual_top10 = top_k_indices(&logits, 10);
+        let expected_top10 = top_k_indices(expected_logits, 10);
+        let overlap = top_k_overlap(&actual_top10, &expected_top10);
+        total_overlap += overlap;
+
+        println!("  Step {:2}: overlap={:.0}% ({}/10)", step, overlap * 100.0, (overlap * 10.0) as usize);
+    }
+
+    let avg_overlap = total_overlap / n_steps as f64;
+    println!("\n=== Summary ===");
+    println!("Average top-10 overlap: {:.1}%", avg_overlap * 100.0);
+
+    assert!(avg_overlap >= MIN_OVERLAP_THRESHOLD,
+            "Average top-10 overlap {:.1}% below threshold {:.0}%",
+            avg_overlap * 100.0, MIN_OVERLAP_THRESHOLD * 100.0);
+
+    println!("\n✓ Top-10 overlap test passed! Average: {:.1}%", avg_overlap * 100.0);
+}
+
+/// Test Spearman rank correlation of full logit distributions.
+///
+/// This is the most comprehensive functional test. It measures how well the entire
+/// ranking of all 65,536 tokens correlates between HIP and reference. Unlike top-k
+/// tests which only check the best predictions, this validates the full distribution.
+///
+/// Spearman's ρ ranges from -1 (inverse) to +1 (perfect agreement).
+/// For a correct implementation, we expect ρ > 0.999.
+#[test]
+#[cfg(feature = "hip")]
+fn test_spearman_rank_correlation() {
+    if !model_exists() || !ground_truth_fixtures_exist() {
+        eprintln!("Skipping test: model or fixtures not found");
+        return;
+    }
+
+    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
+        .expect("Failed to load config");
+    let tokens_i64 = config.i64("tokens");
+    let n_steps = config.i64("n_steps")[0] as usize;
+
+    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        .expect("Failed to load model");
+    let mut state = web_rwkv::hip::HipState::new(&model.info, 1);
+
+    println!("\n=== Spearman Rank Correlation Test ===\n");
+
+    const MIN_CORRELATION: f64 = 0.999; // Very high threshold for functional correctness
+    let mut total_rho = 0.0;
+    let mut min_rho = 1.0;
+    let mut min_rho_step = 0;
+
+    for step in 0..n_steps {
+        let token = tokens_i64[step] as u32;
+        let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
+        let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
+
+        let logits = model.forward_with_state(&[&[token]], &mut state)
+            .expect("Forward pass failed");
+        let expected_logits = fixture.f32("logits");
+
+        let rho = spearman_correlation(&logits, expected_logits);
+        total_rho += rho;
+
+        if rho < min_rho {
+            min_rho = rho;
+            min_rho_step = step;
+        }
+
+        let status = if rho >= MIN_CORRELATION { "✓" } else { "✗" };
+        println!("  Step {:2}: ρ = {:.6} {}", step, rho, status);
+    }
+
+    let avg_rho = total_rho / n_steps as f64;
+    println!("\n=== Summary ===");
+    println!("Average Spearman ρ: {:.6}", avg_rho);
+    println!("Minimum Spearman ρ: {:.6} (step {})", min_rho, min_rho_step);
+
+    assert!(avg_rho >= MIN_CORRELATION,
+            "Average Spearman correlation {:.6} below threshold {:.3}",
+            avg_rho, MIN_CORRELATION);
+
+    println!("\n✓ Spearman rank correlation test passed! Average ρ = {:.6}", avg_rho);
+}
+
 /// Test that final logits produce expected next token prediction.
 ///
 /// After processing the full prompt, the model should predict a reasonable
