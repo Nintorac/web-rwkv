@@ -4043,7 +4043,8 @@ impl Rwkv7Hip {
                     let v1_data = v1.to_vec(&stream)?;
                     let v2_data = v2.to_vec(&stream)?;
                     let v1_dim = v1.shape().dim(0);
-                    let v_lora1 = hip_sgemm(&v1_data, &v, v1_dim, n_embd, t * b)?;
+                    // Note: Use xv (token-shifted input), not v (projected value)
+                    let v_lora1 = hip_sgemm(&v1_data, &xv, v1_dim, n_embd, t * b)?;
                     let v_lora2 = hip_sgemm(&v2_data, &v_lora1, n_embd, v1_dim, t * b)?;
                     let v_biased: Vec<f32> = v0_data.iter().cycle().take(v_lora2.len())
                         .zip(v_lora2.iter())
@@ -4105,26 +4106,26 @@ impl Rwkv7Hip {
                 hip_probe!(self, probe_ctx, probe::HipHook::PostWkvState, &state.att_states[layer_idx], [head_size, head_size, n_head, b]);
             }
 
-            // WKV bonus
+            // Group norm on WKV output (BEFORE adding bonus, per RWKV7 spec)
+            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
+            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
+            let wkv_normed = hip_group_norm(&wkv_output, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
+            #[cfg(feature = "hip-probes")]
+            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGroupNorm, &wkv_normed, [n_embd, t, b]);
+
+            // WKV bonus (time_first) - added AFTER group norm
             let r_k = layer.att.r_k.to_vec(&stream)?;
             let wkv_bonus = hip_wkv_bonus(&r, &k_ctrl, &v, &r_k, head_size, n_head, t, b)?;
             #[cfg(feature = "hip-probes")]
             hip_probe!(self, probe_ctx, probe::HipHook::PostWkvBonus, &wkv_bonus, [n_embd, t, b]);
 
-            // Combine WKV output and bonus
-            let x_att: Vec<f32> = wkv_output.iter().zip(wkv_bonus.iter())
+            // Combine normalized output and bonus: p_t = LayerNorm(wkv) + u_t
+            let x_att_combined: Vec<f32> = wkv_normed.iter().zip(wkv_bonus.iter())
                 .map(|(&a, &b)| a + b)
                 .collect();
 
-            // Group norm
-            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
-            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
-            let x_att_gn = hip_group_norm(&x_att, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGroupNorm, &x_att_gn, [n_embd, t, b]);
-
             // Gate and output projection
-            let x_att_gated: Vec<f32> = x_att_gn.iter().zip(g.iter())
+            let x_att_gated: Vec<f32> = x_att_combined.iter().zip(g.iter())
                 .map(|(&xi, &gi)| xi * gi)
                 .collect();
             #[cfg(feature = "hip-probes")]
@@ -4454,7 +4455,8 @@ impl Rwkv7Hip {
                     let v1_data = v1.to_vec(&stream)?;
                     let v2_data = v2.to_vec(&stream)?;
                     let v1_dim = v1.shape().dim(0);
-                    let v_lora1 = hip_sgemm(&v1_data, &v, v1_dim, n_embd, t * b)?;
+                    // Note: Use xv (token-shifted input), not v (projected value)
+                    let v_lora1 = hip_sgemm(&v1_data, &xv, v1_dim, n_embd, t * b)?;
                     let v_lora2 = hip_sgemm(&v2_data, &v_lora1, n_embd, v1_dim, t * b)?;
                     let v_biased: Vec<f32> = v0_data.iter().cycle().take(v_lora2.len())
                         .zip(v_lora2.iter())
@@ -4516,26 +4518,26 @@ impl Rwkv7Hip {
                 hip_probe!(self, probe_ctx, probe::HipHook::PostWkvState, &state.att_states[layer_idx], [head_size, head_size, n_head, b]);
             }
 
-            // WKV bonus
+            // Group norm on WKV output (BEFORE adding bonus, per RWKV7 spec)
+            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
+            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
+            let wkv_normed = hip_group_norm(&wkv_output, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
+            #[cfg(feature = "hip-probes")]
+            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGroupNorm, &wkv_normed, [n_embd, t, b]);
+
+            // WKV bonus (time_first) - added AFTER group norm
             let r_k = layer.att.r_k.to_vec(&stream)?;
             let wkv_bonus = hip_wkv_bonus(&r, &k_ctrl, &v, &r_k, head_size, n_head, t, b)?;
             #[cfg(feature = "hip-probes")]
             hip_probe!(self, probe_ctx, probe::HipHook::PostWkvBonus, &wkv_bonus, [n_embd, t, b]);
 
-            // Combine WKV output and bonus
-            let x_att: Vec<f32> = wkv_output.iter().zip(wkv_bonus.iter())
+            // Combine normalized output and bonus: p_t = LayerNorm(wkv) + u_t
+            let x_att_combined: Vec<f32> = wkv_normed.iter().zip(wkv_bonus.iter())
                 .map(|(&a, &b)| a + b)
                 .collect();
 
-            // Group norm
-            let gn_w = layer.att.gn.weight.to_vec(&stream)?;
-            let gn_b = layer.att.gn.bias.to_vec(&stream)?;
-            let x_att_gn = hip_group_norm(&x_att, &gn_w, &gn_b, n_embd, t * b, n_head, 64e-5)?;
-            #[cfg(feature = "hip-probes")]
-            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGroupNorm, &x_att_gn, [n_embd, t, b]);
-
             // Gate and output projection
-            let x_att_gated: Vec<f32> = x_att_gn.iter().zip(g.iter())
+            let x_att_gated: Vec<f32> = x_att_combined.iter().zip(g.iter())
                 .map(|(&xi, &gi)| xi * gi)
                 .collect();
             #[cfg(feature = "hip-probes")]
