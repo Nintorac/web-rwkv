@@ -6,6 +6,7 @@ use std::path::Path;
 
 use super::ffi::{HipErrorKind, Result};
 use super::device::{Stream, Event};
+use super::pinned::PinnedBuffer;
 use super::tensor::{TensorShape, TensorHip};
 use super::scratch::{LoraDims, HipRuntimeConfig};
 use super::kernels::{
@@ -231,13 +232,17 @@ pub struct HipState {
     /// Batch size this state was created for
     pub batch_size: usize,
     /// WKV state per layer: [head_size * head_size * n_head * batch] per layer
-    pub att_states: Vec<Vec<f32>>,
+    /// Stored in pinned memory for fast GPU transfers.
+    pub att_states: Vec<PinnedBuffer<f32>>,
     /// Attention token shift state per layer: [n_embd * batch] per layer
-    pub att_shift_states: Vec<Vec<f32>>,
+    /// Stored in pinned memory for fast GPU transfers.
+    pub att_shift_states: Vec<PinnedBuffer<f32>>,
     /// FFN token shift state per layer: [n_embd * batch] per layer
-    pub ffn_states: Vec<Vec<f32>>,
+    /// Stored in pinned memory for fast GPU transfers.
+    pub ffn_states: Vec<PinnedBuffer<f32>>,
     /// Value residual from first layer for RWKV7, persisted across chunks: [n_embd * batch]
-    pub v_first: Option<Vec<f32>>,
+    /// Stored in pinned memory for fast GPU transfers.
+    pub v_first: Option<PinnedBuffer<f32>>,
 }
 
 impl HipState {
@@ -246,37 +251,53 @@ impl HipState {
     /// # Arguments
     /// * `info` - Model info containing dimensions
     /// * `batch_size` - Number of sequences to process in parallel
-    pub fn new(info: &Rwkv7ModelInfo, batch_size: usize) -> Self {
+    ///
+    /// # Errors
+    /// Returns error if pinned memory allocation fails.
+    pub fn new(info: &Rwkv7ModelInfo, batch_size: usize) -> Result<Self> {
         let n_layer = info.n_layer;
         let n_embd = info.n_embd;
         let head_size = info.head_size;
         let n_head = info.n_head;
 
-        HipState {
-            batch_size,
-            att_states: (0..n_layer)
-                .map(|_| vec![0.0f32; head_size * head_size * n_head * batch_size])
-                .collect(),
-            att_shift_states: (0..n_layer)
-                .map(|_| vec![0.0f32; n_embd * batch_size])
-                .collect(),
-            ffn_states: (0..n_layer)
-                .map(|_| vec![0.0f32; n_embd * batch_size])
-                .collect(),
-            v_first: None,
+        // Allocate pinned buffers for each layer
+        let mut att_states = Vec::with_capacity(n_layer);
+        let mut att_shift_states = Vec::with_capacity(n_layer);
+        let mut ffn_states = Vec::with_capacity(n_layer);
+
+        for _ in 0..n_layer {
+            let mut att = PinnedBuffer::new(head_size * head_size * n_head * batch_size)?;
+            att.as_slice_mut().fill(0.0);
+            att_states.push(att);
+
+            let mut att_shift = PinnedBuffer::new(n_embd * batch_size)?;
+            att_shift.as_slice_mut().fill(0.0);
+            att_shift_states.push(att_shift);
+
+            let mut ffn = PinnedBuffer::new(n_embd * batch_size)?;
+            ffn.as_slice_mut().fill(0.0);
+            ffn_states.push(ffn);
         }
+
+        Ok(HipState {
+            batch_size,
+            att_states,
+            att_shift_states,
+            ffn_states,
+            v_first: None,
+        })
     }
 
     /// Reset state to zeros.
     pub fn reset(&mut self) {
         for state in &mut self.att_states {
-            state.fill(0.0);
+            state.as_slice_mut().fill(0.0);
         }
         for state in &mut self.att_shift_states {
-            state.fill(0.0);
+            state.as_slice_mut().fill(0.0);
         }
         for state in &mut self.ffn_states {
-            state.fill(0.0);
+            state.as_slice_mut().fill(0.0);
         }
         self.v_first = None;
     }
@@ -312,10 +333,10 @@ pub struct ForwardCompletion {
 
 /// Internal buffers for async state download
 struct ForwardStateBuffers {
-    att_states: Vec<Vec<f32>>,
-    att_shift_states: Vec<Vec<f32>>,
-    ffn_states: Vec<Vec<f32>>,
-    v_first: Option<Vec<f32>>,
+    att_states: Vec<PinnedBuffer<f32>>,
+    att_shift_states: Vec<PinnedBuffer<f32>>,
+    ffn_states: Vec<PinnedBuffer<f32>>,
+    v_first: Option<PinnedBuffer<f32>>,
 }
 
 impl ForwardCompletion {
@@ -900,7 +921,7 @@ impl Rwkv7Hip {
                 }
                 s
             }
-            None => HipState::new(&self.info, batch_size),
+            None => HipState::new(&self.info, batch_size)?,
         };
 
         // Accumulate logits for each batch
@@ -1152,21 +1173,33 @@ impl Rwkv7Hip {
         }
         x.copy_from_slice(&x_host, stream)?;
 
-        // Upload state to GPU
-        let mut att_shift_gpu: Vec<TensorHip<f32>> = state.att_shift_states
-            .iter()
-            .map(|s| TensorHip::from_slice(s, state_shape, stream))
-            .collect::<Result<Vec<_>>>()?;
+        // Upload state to GPU using pinned async transfers
+        let mut att_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
+        for s in &state.att_shift_states {
+            let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+            unsafe {
+                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+            }
+            att_shift_gpu.push(gpu_tensor);
+        }
 
-        let mut ffn_shift_gpu: Vec<TensorHip<f32>> = state.ffn_states
-            .iter()
-            .map(|s| TensorHip::from_slice(s, state_shape, stream))
-            .collect::<Result<Vec<_>>>()?;
+        let mut ffn_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
+        for s in &state.ffn_states {
+            let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+            unsafe {
+                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+            }
+            ffn_shift_gpu.push(gpu_tensor);
+        }
 
-        let mut wkv_state_gpu: Vec<TensorHip<f32>> = state.att_states
-            .iter()
-            .map(|s| TensorHip::from_slice(s, wkv_state_shape, stream))
-            .collect::<Result<Vec<_>>>()?;
+        let mut wkv_state_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
+        for s in &state.att_states {
+            let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
+            unsafe {
+                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+            }
+            wkv_state_gpu.push(gpu_tensor);
+        }
 
         // Temporary buffers
         let mut new_att_shift = TensorHip::<f32>::new(state_shape)?;
@@ -1362,15 +1395,21 @@ impl Rwkv7Hip {
 
         ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
 
-        // Download state back to host
+        // Download state back to host using pinned async transfers
         for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
-            state.att_shift_states[i] = gpu_state.to_vec(stream)?;
+            unsafe {
+                state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            }
         }
         for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
-            state.ffn_states[i] = gpu_state.to_vec(stream)?;
+            unsafe {
+                state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            }
         }
         for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
-            state.att_states[i] = gpu_state.to_vec(stream)?;
+            unsafe {
+                state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            }
         }
 
         // Download logits and return
@@ -1479,7 +1518,7 @@ impl Rwkv7Hip {
                 }
                 s
             }
-            None => HipState::new(&self.info, batch_size),
+            None => HipState::new(&self.info, batch_size)?,
         };
 
         // Create stream for async operations (with fallback to null)

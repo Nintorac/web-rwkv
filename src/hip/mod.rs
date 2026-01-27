@@ -1114,7 +1114,7 @@ mod tests {
         };
 
         let batch_size = 4;
-        let state = HipState::new(&info, batch_size);
+        let state = HipState::new(&info, batch_size).expect("Failed to allocate state");
 
         assert_eq!(state.batch_size, 4);
         assert_eq!(state.att_states.len(), 12);
@@ -1344,7 +1344,7 @@ mod tests {
 
         // Returned state should have evolved (non-zero)
         let att_sum: f32 = state.att_states.iter()
-            .flat_map(|v| v.iter())
+            .flat_map(|v| v.as_slice().iter())
             .map(|x| x.abs())
             .sum();
         assert!(att_sum > 0.0, "att_states should be non-zero after forward");
@@ -1369,7 +1369,7 @@ mod tests {
         let model = model.with_config(config).expect("Failed to configure model");
 
         // State with batch_size=2, but provide 3 sequences
-        let state = HipState::new(&model.info, 2);
+        let state = HipState::new(&model.info, 2).expect("Failed to allocate state");
         let result = model.forward(
             &[&[1u32], &[2u32], &[3u32]],
             Some(state)
@@ -1422,19 +1422,19 @@ mod tests {
             n_hidden: 128,
         };
 
-        let mut state = HipState::new(&info, 2);
+        let mut state = HipState::new(&info, 2).expect("Failed to allocate state");
 
         // Fill with values
-        for s in &mut state.att_states { s.fill(1.0); }
-        for s in &mut state.att_shift_states { s.fill(2.0); }
-        for s in &mut state.ffn_states { s.fill(3.0); }
+        for s in &mut state.att_states { s.as_slice_mut().fill(1.0); }
+        for s in &mut state.att_shift_states { s.as_slice_mut().fill(2.0); }
+        for s in &mut state.ffn_states { s.as_slice_mut().fill(3.0); }
 
         state.reset();
 
         // All should be zero
-        assert!(state.att_states.iter().all(|s| s.iter().all(|&x| x == 0.0)));
-        assert!(state.att_shift_states.iter().all(|s| s.iter().all(|&x| x == 0.0)));
-        assert!(state.ffn_states.iter().all(|s| s.iter().all(|&x| x == 0.0)));
+        assert!(state.att_states.iter().all(|s| s.as_slice().iter().all(|&x| x == 0.0)));
+        assert!(state.att_shift_states.iter().all(|s| s.as_slice().iter().all(|&x| x == 0.0)));
+        assert!(state.ffn_states.iter().all(|s| s.as_slice().iter().all(|&x| x == 0.0)));
         assert!(state.v_first.is_none());
 
         println!("HipState reset test PASSED");
@@ -1453,11 +1453,13 @@ mod tests {
         };
 
         // Fresh state should have v_first = None
-        let mut state = HipState::new(&info, 1);
+        let mut state = HipState::new(&info, 1).expect("Failed to allocate state");
         assert!(state.v_first.is_none(), "New state should have v_first = None");
 
         // Set v_first and verify it persists
-        state.v_first = Some(vec![1.0f32; 64]);
+        let mut v_first_buf = PinnedBuffer::new(64).expect("Failed to allocate v_first");
+        v_first_buf.as_slice_mut().fill(1.0);
+        state.v_first = Some(v_first_buf);
         assert!(state.v_first.is_some(), "v_first should persist after assignment");
         assert_eq!(state.v_first.as_ref().unwrap().len(), 64);
 

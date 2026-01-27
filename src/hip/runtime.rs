@@ -84,7 +84,7 @@ impl HipRuntime {
         let num_batch = config.batch_size;
         let chunk_size = config.max_prefill_chunk;
         let model = model.with_config(config)?;
-        let state = HipState::new(&model.info, num_batch);
+        let state = HipState::new(&model.info, num_batch)?;
         Ok(Self {
             model,
             state: Mutex::new(state),
@@ -155,7 +155,7 @@ impl HipRuntime {
 
         // Take state from mutex, run forward, put new state back
         let mut state_guard = self.state.lock().unwrap();
-        let old_state = std::mem::replace(&mut *state_guard, HipState::new(&self.model.info, self.num_batch));
+        let old_state = std::mem::replace(&mut *state_guard, HipState::new(&self.model.info, self.num_batch)?);
         drop(state_guard);
 
         // New forward() handles variable-length sequences automatically
@@ -1069,17 +1069,18 @@ mod tests {
         for layer in 0..n_layer {
             // att_shift_states: [n_embd * batch] - extract first n_embd for batch 0
             let n_embd = state_unpadded.att_shift_states[layer].len();
+            let att_unpadded = state_unpadded.att_shift_states[layer].as_slice();
+            let att_padded = state_padded.att_shift_states[layer].as_slice();
             for i in 0..n_embd {
-                let diff = (state_unpadded.att_shift_states[layer][i]
-                    - state_padded.att_shift_states[layer][i])
-                    .abs();
+                let diff = (att_unpadded[i] - att_padded[i]).abs();
                 max_att_diff = max_att_diff.max(diff);
             }
 
             // ffn_states: same structure
+            let ffn_unpadded = state_unpadded.ffn_states[layer].as_slice();
+            let ffn_padded = state_padded.ffn_states[layer].as_slice();
             for i in 0..n_embd {
-                let diff =
-                    (state_unpadded.ffn_states[layer][i] - state_padded.ffn_states[layer][i]).abs();
+                let diff = (ffn_unpadded[i] - ffn_padded[i]).abs();
                 max_ffn_diff = max_ffn_diff.max(diff);
             }
         }

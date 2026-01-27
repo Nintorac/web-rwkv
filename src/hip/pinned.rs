@@ -171,6 +171,34 @@ impl<T> Drop for PinnedBuffer<T> {
 unsafe impl<T: Copy + Send> Send for PinnedBuffer<T> {}
 unsafe impl<T: Copy + Sync> Sync for PinnedBuffer<T> {}
 
+impl<T> std::fmt::Debug for PinnedBuffer<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedBuffer")
+            .field("len", &self.len)
+            .field("ptr", &self.ptr)
+            .finish()
+    }
+}
+
+impl<T: Copy> Clone for PinnedBuffer<T> {
+    fn clone(&self) -> Self {
+        if self.len == 0 {
+            return Self {
+                ptr: ptr::null_mut(),
+                len: 0,
+                _marker: PhantomData,
+            };
+        }
+
+        // Allocate a new pinned buffer and copy data
+        let mut new_buf = Self::new(self.len).expect("Failed to allocate pinned buffer for clone");
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr, new_buf.ptr, self.len);
+        }
+        new_buf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

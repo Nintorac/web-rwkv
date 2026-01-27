@@ -2313,8 +2313,8 @@ fn debug_hip_vs_wgpu_divergence() {
     }
     
     // Check state values
-    println!("\nAttention state[0][0:10]: {:?}", &state.att_states[0][0..10]);
-    println!("FFN state[0][0:10]: {:?}", &state.ffn_states[0][0..10]);
+    println!("\nAttention state[0][0:10]: {:?}", &state.att_states[0].as_slice()[0..10]);
+    println!("FFN state[0][0:10]: {:?}", &state.ffn_states[0].as_slice()[0..10]);
     
     println!("\n=== Done ===");
 }
@@ -3198,7 +3198,7 @@ fn test_hip_step1_logits_debug() {
 
     // Get state after BOS
     let state_bos = runtime.get_state_snapshot();
-    let att_state_bos = &state_bos.att_states[0];
+    let att_state_bos = state_bos.att_states[0].as_slice();
     let bos_min = att_state_bos.iter().cloned().fold(f32::INFINITY, f32::min);
     let bos_max = att_state_bos.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let bos_mean: f32 = att_state_bos.iter().sum::<f32>() / att_state_bos.len() as f32;
@@ -3213,7 +3213,7 @@ fn test_hip_step1_logits_debug() {
 
     // Get state after step 0 (BOS + 510)
     let state_step0 = runtime.get_state_snapshot();
-    let att_state_l0 = &state_step0.att_states[0];
+    let att_state_l0 = state_step0.att_states[0].as_slice();
 
     // State is [N, N, H, B] = [head_size, head_size, n_head, batch]
     // batch=1, so just [N, N, H]
@@ -3337,12 +3337,12 @@ fn test_forward_masked_single_batch() {
     let (logits1, state1) = model.forward(&tokens_ref, None).unwrap();
 
     // Run forward pass with explicit fresh state
-    let fresh_state = HipState::new(&model.info, 1);
+    let fresh_state = HipState::new(&model.info, 1).unwrap();
     let (logits2, state2) = model.forward(&tokens_ref, Some(fresh_state)).unwrap();
 
     // States should match exactly
-    let max_state_diff = state1.att_states[0].iter()
-        .zip(state2.att_states[0].iter())
+    let max_state_diff = state1.att_states[0].as_slice().iter()
+        .zip(state2.att_states[0].as_slice().iter())
         .map(|(&a, &b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
@@ -3403,7 +3403,7 @@ fn test_forward_chunking_consistency() {
     let max_att_state_diff = state_large.att_states.iter()
         .zip(state_small.att_states.iter())
         .map(|(a, b)| {
-            a.iter().zip(b.iter())
+            a.as_slice().iter().zip(b.as_slice().iter())
                 .map(|(&x, &y)| (x - y).abs())
                 .fold(0.0f32, f32::max)
         })
@@ -3470,8 +3470,8 @@ fn test_forward_masked_variable_batch() {
     for layer in 0..model1.info.n_layer {
         let batch0_start = 0;
         let batch0_end = state_size_per_layer;
-        let batch0_state = &state_batched.att_states[layer][batch0_start..batch0_end];
-        let ref_state = &state1_ref.att_states[layer][..];
+        let batch0_state = &state_batched.att_states[layer].as_slice()[batch0_start..batch0_end];
+        let ref_state = state1_ref.att_states[layer].as_slice();
 
         let layer_diff = batch0_state.iter()
             .zip(ref_state.iter())
@@ -3485,8 +3485,8 @@ fn test_forward_masked_variable_batch() {
     for layer in 0..model1.info.n_layer {
         let batch1_start = state_size_per_layer;
         let batch1_end = 2 * state_size_per_layer;
-        let batch1_state = &state_batched.att_states[layer][batch1_start..batch1_end];
-        let ref_state = &state2_ref.att_states[layer][..];
+        let batch1_state = &state_batched.att_states[layer].as_slice()[batch1_start..batch1_end];
+        let ref_state = state2_ref.att_states[layer].as_slice();
 
         let layer_diff = batch1_state.iter()
             .zip(ref_state.iter())
