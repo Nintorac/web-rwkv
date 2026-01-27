@@ -215,6 +215,21 @@ br list -a
 br blocked
 ```
 
+## Python Environment
+
+Use `uv` for all Python package management (faster than pip):
+
+```bash
+# Install packages
+uv pip install <package>
+
+# Install from requirements
+uv pip install -r requirements.txt
+
+# Run Python scripts
+python3 scripts/foo.py
+```
+
 ## Compact Instructions
 
 When context is compacted, preserve:
