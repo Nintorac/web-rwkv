@@ -3,12 +3,16 @@
 use std::ptr;
 
 use super::ffi::{
-    HipStream, HipErrorKind, Result, check,
+    HipStream, HipEvent, HipErrorKind, Result, check,
     get_device_count, get_device_name, get_gcn_arch_name, set_device,
     get_device_total_memory, get_device_mp_count, get_device_warp_size,
     get_device_compute_capability, is_device_integrated, device_supports_cooperative_launch,
     hip_stream_create, hip_stream_destroy, hip_stream_synchronize,
+    hip_stream_wait_event,
     hip_device_synchronize,
+    hip_event_create, hip_event_destroy, hip_event_record,
+    hip_event_synchronize, hip_event_query,
+    HIP_SUCCESS, HIP_ERROR_NOT_READY,
 };
 
 /// HIP context that manages device selection and provides a default stream.
@@ -182,6 +186,14 @@ impl Stream {
     pub fn is_null(&self) -> bool {
         self.handle.is_null()
     }
+
+    /// Make this stream wait for an event to complete before continuing.
+    ///
+    /// All operations enqueued on this stream after this call will wait until
+    /// the specified event has completed. This enables stream-to-stream dependencies.
+    pub fn wait_event(&self, event: &Event) -> Result<()> {
+        unsafe { check(hip_stream_wait_event(self.handle, event.handle(), 0)) }
+    }
 }
 
 impl Drop for Stream {
@@ -194,8 +206,202 @@ impl Drop for Stream {
     }
 }
 
+/// A HIP event for fine-grained asynchronous synchronization.
+///
+/// Events can be recorded on a stream and then waited on, either from the host
+/// (via `synchronize()`) or from another stream (via `Stream::wait_event()`).
+/// This enables overlapping compute and data transfers.
+pub struct Event {
+    handle: HipEvent,
+}
+
+impl Event {
+    /// Create a new HIP event.
+    pub fn new() -> Result<Self> {
+        let mut handle: HipEvent = ptr::null_mut();
+        unsafe { check(hip_event_create(&mut handle))? };
+        Ok(Self { handle })
+    }
+
+    /// Record this event on a stream.
+    ///
+    /// The event will be marked as complete when all operations submitted to the
+    /// stream before this call have finished.
+    pub fn record(&self, stream: &Stream) -> Result<()> {
+        unsafe { check(hip_event_record(self.handle, stream.handle())) }
+    }
+
+    /// Block the host until this event completes.
+    ///
+    /// This is a blocking operation that waits for all operations recorded before
+    /// this event to finish.
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe { check(hip_event_synchronize(self.handle)) }
+    }
+
+    /// Query whether this event has completed (non-blocking).
+    ///
+    /// Returns `Ok(true)` if the event has completed, `Ok(false)` if it's still
+    /// pending, or an error if something went wrong.
+    pub fn query(&self) -> Result<bool> {
+        let result = unsafe { hip_event_query(self.handle) };
+        if result == HIP_SUCCESS {
+            Ok(true)
+        } else if result == HIP_ERROR_NOT_READY {
+            Ok(false)
+        } else {
+            check(result)?;
+            unreachable!()
+        }
+    }
+
+    /// Get the raw event handle.
+    pub fn handle(&self) -> HipEvent {
+        self.handle
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                hip_event_destroy(self.handle);
+            }
+        }
+    }
+}
+
+// Safety: Event handles are thread-safe to send between threads
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+
 /// Synchronize the default stream / device
 pub fn device_synchronize() -> Result<()> {
     unsafe { check(hip_device_synchronize()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_event_new() {
+        // Event::new() should succeed on initialized HIP
+        let event = Event::new();
+        assert!(event.is_ok(), "Event::new() failed: {:?}", event.err());
+    }
+
+    #[test]
+    fn test_event_record_and_synchronize() {
+        // Create event and stream
+        let event = Event::new().expect("Failed to create event");
+        let stream = Stream::null();
+
+        // Record event on stream
+        let result = event.record(&stream);
+        assert!(result.is_ok(), "Event::record() failed: {:?}", result.err());
+
+        // Synchronize should succeed (event is already complete on null stream)
+        let result = event.synchronize();
+        assert!(result.is_ok(), "Event::synchronize() failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_event_query_complete() {
+        // Create event and stream
+        let event = Event::new().expect("Failed to create event");
+        let stream = Stream::null();
+
+        // Record event
+        event.record(&stream).expect("Failed to record event");
+
+        // Synchronize to ensure completion
+        stream.synchronize().expect("Failed to sync stream");
+
+        // Query should return true (complete)
+        let is_complete = event.query().expect("Event::query() failed");
+        assert!(is_complete, "Event should be complete after stream sync");
+    }
+
+    #[test]
+    fn test_stream_null() {
+        // Null stream should work without explicit creation
+        let stream = Stream::null();
+        assert!(stream.is_null(), "Null stream should report is_null()");
+        assert!(stream.handle().is_null(), "Null stream handle should be null");
+
+        // Synchronize should work
+        let result = stream.synchronize();
+        assert!(result.is_ok(), "Null stream sync failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_stream_wait_event() {
+        // Create two streams and an event
+        let stream1 = Stream::null();
+        let stream2 = Stream::null(); // Both null for compatibility
+        let event = Event::new().expect("Failed to create event");
+
+        // Record event on stream1
+        event.record(&stream1).expect("Failed to record event");
+
+        // Make stream2 wait on the event
+        let result = stream2.wait_event(&event);
+        assert!(result.is_ok(), "Stream::wait_event() failed: {:?}", result.err());
+
+        // Both should sync without issue
+        stream1.synchronize().expect("stream1 sync failed");
+        stream2.synchronize().expect("stream2 sync failed");
+    }
+
+    #[test]
+    fn test_event_multiple_records() {
+        // An event can be recorded multiple times (replaces previous record point)
+        let event = Event::new().expect("Failed to create event");
+        let stream = Stream::null();
+
+        // Record multiple times
+        event.record(&stream).expect("First record failed");
+        event.record(&stream).expect("Second record failed");
+        event.record(&stream).expect("Third record failed");
+
+        // Should sync fine
+        event.synchronize().expect("Sync after multiple records failed");
+    }
+
+    #[test]
+    fn test_hip_context_new() {
+        // HipContext::new() should succeed if HIP is available
+        let ctx = HipContext::new();
+        assert!(ctx.is_ok(), "HipContext::new() failed: {:?}", ctx.err());
+
+        let ctx = ctx.unwrap();
+        assert_eq!(ctx.device_id(), 0);
+    }
+
+    #[test]
+    fn test_hip_context_device_properties() {
+        let ctx = HipContext::new().expect("Failed to create HipContext");
+
+        // These should all succeed on a valid HIP device
+        let name = ctx.device_name();
+        assert!(name.is_ok(), "device_name() failed: {:?}", name.err());
+
+        let arch = ctx.gcn_arch_name();
+        assert!(arch.is_ok(), "gcn_arch_name() failed: {:?}", arch.err());
+
+        let mem = ctx.total_memory();
+        assert!(mem.is_ok(), "total_memory() failed: {:?}", mem.err());
+        assert!(mem.unwrap() > 0, "Total memory should be > 0");
+
+        let mps = ctx.multiprocessor_count();
+        assert!(mps.is_ok(), "multiprocessor_count() failed: {:?}", mps.err());
+        assert!(mps.unwrap() > 0, "MP count should be > 0");
+
+        let warp = ctx.warp_size();
+        assert!(warp.is_ok(), "warp_size() failed: {:?}", warp.err());
+        // AMD GPUs typically have warp size 64
+        assert!(warp.unwrap() > 0, "Warp size should be > 0");
+    }
 }
 

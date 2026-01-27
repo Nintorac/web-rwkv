@@ -9,6 +9,7 @@ mod device;
 mod ffi;
 mod kernels;
 mod model;
+mod pinned;
 mod runtime;
 mod scratch;
 mod tensor;
@@ -25,8 +26,10 @@ pub use probe::{HipHook, HipProbeBuilder, HipProbeMap, HipProbeMapRef, ProbeCont
 
 // Re-export FFI types and error handling
 pub use ffi::{
-    HipError, HipStream, HipDeviceProp, HipDeviceArch,
+    HipError, HipStream, HipEvent, HipDeviceProp, HipDeviceArch,
     RocblasHandle, RocblasStatus, ROCBLAS_STATUS_SUCCESS, HIP_SUCCESS,
+    HIP_HOST_MALLOC_DEFAULT, HIP_HOST_MALLOC_PORTABLE, HIP_HOST_MALLOC_MAPPED,
+    HIP_ERROR_NOT_READY,
     error_string, Result, HipErrorKind,
     get_device_count, get_device_properties, get_device_name, get_gcn_arch_name,
     set_device, get_device, get_device_total_memory, get_device_mp_count,
@@ -35,10 +38,13 @@ pub use ffi::{
 };
 
 // Re-export device types
-pub use device::{HipContext, Stream, device_synchronize};
+pub use device::{HipContext, Stream, Event, device_synchronize};
 
 // Re-export buffer types
 pub use buffer::{DeviceBuffer, MemoryType};
+
+// Re-export pinned memory types
+pub use pinned::PinnedBuffer;
 
 // Re-export tensor types
 pub use tensor::{TensorShape, TensorView, TensorHip};
@@ -81,7 +87,7 @@ pub use blas::{
 // Re-export model types
 pub use model::{
     Rwkv7ModelInfo, LayerNormHip, AttentionHip, FfnHip, LayerHip,
-    EmbedHip, HeadHip, Rwkv7Hip, ModelLoadError, HipState,
+    EmbedHip, HeadHip, Rwkv7Hip, ModelLoadError, HipState, ForwardCompletion,
 };
 
 #[cfg(test)]

@@ -408,6 +408,52 @@ impl<T: Copy> TensorHip<T> {
         Ok(result)
     }
 
+    /// Copy tensor data to a pre-allocated host buffer asynchronously.
+    ///
+    /// Unlike `to_vec()`, this method does NOT synchronize the stream before returning.
+    /// The caller must ensure synchronization before reading the data, typically by
+    /// recording an event after this call and waiting on it:
+    ///
+    /// ```ignore
+    /// tensor.copy_to_slice_async(&mut buffer, stream)?;
+    /// let event = Event::new()?;
+    /// event.record(stream)?;
+    /// // ... do other work ...
+    /// event.synchronize()?;  // Now buffer is safe to read
+    /// ```
+    ///
+    /// The tensor must be contiguous and the buffer must have exactly `self.len()` elements.
+    pub fn copy_to_slice_async(&self, dst: &mut [T], stream: &Stream) -> Result<()> {
+        if !self.is_contiguous() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Cannot copy non-contiguous tensor directly".to_string(),
+            });
+        }
+
+        if dst.len() != self.len() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!("Size mismatch: dst {} vs tensor {}", dst.len(), self.len()),
+            });
+        }
+
+        let len = self.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        let size = len * std::mem::size_of::<T>();
+        unsafe {
+            check(hip_memcpy_d2h(
+                dst.as_mut_ptr() as *mut c_void,
+                self.ptr as *const c_void,
+                size,
+                stream.handle(),
+            ))
+        }
+    }
+
     /// Copy data from host to this tensor.
     /// The tensor must be contiguous.
     pub fn copy_from_slice(&mut self, data: &[T], stream: &Stream) -> Result<()> {
@@ -667,3 +713,146 @@ impl<T> Drop for TensorHip<T> {
 // TensorHip is Send + Sync since the GPU pointer is only accessed on GPU
 unsafe impl<T: Send> Send for TensorHip<T> {}
 unsafe impl<T: Sync> Sync for TensorHip<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hip::device::{Stream, Event};
+
+    #[test]
+    fn test_tensor_new_empty() {
+        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::new(0, 1, 1, 1))
+            .expect("Failed to create empty tensor");
+        assert_eq!(tensor.len(), 0);
+        assert!(tensor.is_empty());
+    }
+
+    #[test]
+    fn test_tensor_new_1d() {
+        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::from_slice(&[100]))
+            .expect("Failed to create 1D tensor");
+        assert_eq!(tensor.shape().dim(0), 100);
+        assert_eq!(tensor.len(), 100);
+        assert!(!tensor.is_empty());
+    }
+
+    #[test]
+    fn test_tensor_new_3d() {
+        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::from_slice(&[4, 8, 16]))
+            .expect("Failed to create 3D tensor");
+        assert_eq!(tensor.shape().dim(0), 4);
+        assert_eq!(tensor.shape().dim(1), 8);
+        assert_eq!(tensor.shape().dim(2), 16);
+        assert_eq!(tensor.len(), 4 * 8 * 16);
+    }
+
+    #[test]
+    fn test_tensor_from_slice() {
+        let stream = Stream::null();
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+
+        let tensor = TensorHip::from_slice(&data, TensorShape::new(10, 10, 1, 1), &stream)
+            .expect("Failed to create tensor from slice");
+
+        assert_eq!(tensor.shape().dim(0), 10);
+        assert_eq!(tensor.shape().dim(1), 10);
+        assert_eq!(tensor.len(), 100);
+    }
+
+    #[test]
+    fn test_tensor_to_vec_round_trip() {
+        let stream = Stream::null();
+        let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.5).collect();
+
+        let tensor = TensorHip::from_slice(&data, TensorShape::new(8, 8, 1, 1), &stream)
+            .expect("Failed to create tensor");
+
+        let result = tensor.to_vec(&stream).expect("Failed to read tensor");
+
+        assert_eq!(result.len(), data.len());
+        for (i, (&expected, &actual)) in data.iter().zip(result.iter()).enumerate() {
+            assert!((expected - actual).abs() < 1e-6,
+                "Mismatch at index {}: expected {}, got {}", i, expected, actual);
+        }
+    }
+
+    #[test]
+    fn test_tensor_copy_to_slice_async() {
+        let stream = Stream::null();
+        let data: Vec<f32> = (0..256).map(|i| i as f32 * 0.25).collect();
+
+        // Create tensor and upload data
+        let tensor = TensorHip::from_slice(&data, TensorShape::new(16, 16, 1, 1), &stream)
+            .expect("Failed to create tensor");
+
+        // Create destination buffer
+        let mut dst = vec![0.0f32; 256];
+
+        // Async copy
+        tensor.copy_to_slice_async(&mut dst, &stream)
+            .expect("copy_to_slice_async failed");
+
+        // Record event and sync
+        let event = Event::new().expect("Failed to create event");
+        event.record(&stream).expect("Failed to record event");
+        event.synchronize().expect("Failed to sync event");
+
+        // Verify data
+        for (i, (&expected, &actual)) in data.iter().zip(dst.iter()).enumerate() {
+            assert!((expected - actual).abs() < 1e-6,
+                "Mismatch at index {}: expected {}, got {}", i, expected, actual);
+        }
+    }
+
+    #[test]
+    fn test_tensor_copy_to_slice_async_size_mismatch() {
+        let stream = Stream::null();
+        let data: Vec<f32> = (0..100).map(|i| i as f32).collect();
+
+        let tensor = TensorHip::from_slice(&data, TensorShape::new(10, 10, 1, 1), &stream)
+            .expect("Failed to create tensor");
+
+        // Wrong size buffer
+        let mut dst = vec![0.0f32; 50];
+
+        let result = tensor.copy_to_slice_async(&mut dst, &stream);
+        assert!(result.is_err(), "Should fail with size mismatch");
+    }
+
+    #[test]
+    fn test_tensor_copy_to_slice_async_empty() {
+        let stream = Stream::null();
+        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::new(0, 1, 1, 1))
+            .expect("Failed to create empty tensor");
+
+        let mut dst: Vec<f32> = vec![];
+
+        // Should succeed (no-op for empty)
+        tensor.copy_to_slice_async(&mut dst, &stream)
+            .expect("Empty copy should succeed");
+    }
+
+    #[test]
+    fn test_tensor_is_contiguous() {
+        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::from_slice(&[10, 20, 30]))
+            .expect("Failed to create tensor");
+
+        // Fresh tensor should be contiguous
+        assert!(tensor.is_contiguous(), "New tensor should be contiguous");
+    }
+
+    #[test]
+    fn test_tensor_fill_zero() {
+        let stream = Stream::null();
+        let mut tensor: TensorHip<f32> = TensorHip::new(TensorShape::from_slice(&[100]))
+            .expect("Failed to create tensor");
+
+        // Fill with zeros
+        tensor.fill_zero().expect("Failed to fill tensor");
+
+        let result = tensor.to_vec(&stream).expect("Failed to read tensor");
+        for &v in &result {
+            assert_eq!(v, 0.0, "Value should be 0.0 after fill_zero");
+        }
+    }
+}

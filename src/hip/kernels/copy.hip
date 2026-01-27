@@ -1430,6 +1430,41 @@ hipError_t hip_device_synchronize() {
     return hipDeviceSynchronize();
 }
 
+// Pinned (page-locked) host memory
+hipError_t hip_host_malloc(void** ptr, size_t size, unsigned int flags) {
+    return hipHostMalloc(ptr, size, flags);
+}
+
+hipError_t hip_host_free(void* ptr) {
+    return hipHostFree(ptr);
+}
+
+// Events for async synchronization
+hipError_t hip_event_create(hipEvent_t* event) {
+    return hipEventCreate(event);
+}
+
+hipError_t hip_event_destroy(hipEvent_t event) {
+    return hipEventDestroy(event);
+}
+
+hipError_t hip_event_record(hipEvent_t event, hipStream_t stream) {
+    return hipEventRecord(event, stream);
+}
+
+hipError_t hip_event_synchronize(hipEvent_t event) {
+    return hipEventSynchronize(event);
+}
+
+hipError_t hip_event_query(hipEvent_t event) {
+    return hipEventQuery(event);
+}
+
+// Stream wait on event
+hipError_t hip_stream_wait_event(hipStream_t stream, hipEvent_t event, unsigned int flags) {
+    return hipStreamWaitEvent(stream, event, flags);
+}
+
 // Error string
 const char* hip_get_error_string(hipError_t error) {
     return hipGetErrorString(error);

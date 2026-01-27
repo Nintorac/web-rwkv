@@ -1,10 +1,13 @@
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 
 /// HIP error codes
 pub type HipError = c_int;
 
 /// HIP stream handle (opaque pointer)
 pub type HipStream = *mut c_void;
+
+/// HIP event handle (opaque pointer)
+pub type HipEvent = *mut c_void;
 
 /// HIP device properties structure
 #[repr(C)]
@@ -95,7 +98,19 @@ extern "C" {
     pub fn hip_stream_create(stream: *mut HipStream) -> HipError;
     pub fn hip_stream_destroy(stream: HipStream) -> HipError;
     pub fn hip_stream_synchronize(stream: HipStream) -> HipError;
+    pub fn hip_stream_wait_event(stream: HipStream, event: HipEvent, flags: c_uint) -> HipError;
     pub fn hip_device_synchronize() -> HipError;
+
+    // Pinned (page-locked) host memory
+    pub fn hip_host_malloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> HipError;
+    pub fn hip_host_free(ptr: *mut c_void) -> HipError;
+
+    // Events for async synchronization
+    pub fn hip_event_create(event: *mut HipEvent) -> HipError;
+    pub fn hip_event_destroy(event: HipEvent) -> HipError;
+    pub fn hip_event_record(event: HipEvent, stream: HipStream) -> HipError;
+    pub fn hip_event_synchronize(event: HipEvent) -> HipError;
+    pub fn hip_event_query(event: HipEvent) -> HipError;
     pub fn hip_get_error_string(error: HipError) -> *const c_char;
     pub fn launch_copy_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
@@ -278,6 +293,21 @@ pub const ROCBLAS_STATUS_SUCCESS: RocblasStatus = 0;
 
 /// HIP success error code
 pub const HIP_SUCCESS: HipError = 0;
+
+/// hipHostMalloc flags
+pub const HIP_HOST_MALLOC_DEFAULT: c_uint = 0;
+pub const HIP_HOST_MALLOC_PORTABLE: c_uint = 1;
+pub const HIP_HOST_MALLOC_MAPPED: c_uint = 2;
+pub const HIP_HOST_MALLOC_WRITE_COMBINED: c_uint = 4;
+
+/// hipEventCreate flags (default is blocking sync)
+pub const HIP_EVENT_DEFAULT: c_uint = 0;
+
+/// hipStreamWaitEvent flags
+pub const HIP_STREAM_WAIT_VALUE_EQ: c_uint = 0;
+
+/// hipErrorNotReady - returned by hipEventQuery when event is not complete
+pub const HIP_ERROR_NOT_READY: HipError = 600;
 
 /// Convert a HIP error to a human-readable string
 pub fn error_string(error: HipError) -> String {
