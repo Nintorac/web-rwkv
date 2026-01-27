@@ -425,12 +425,13 @@ class RWKV7FixtureExtractor:
         Returns dict mapping step index to intermediates dict.
         """
         self._reset_state()
+        self._tokens = tokens  # Save for config
 
         all_steps = {}
         for step, token_id in enumerate(tokens):
             print(f"  Step {step}: token {token_id}")
             intermediates = self.forward_token(token_id)
-            all_steps[f'step_{step}_token_{token_id}'] = intermediates
+            all_steps[f'step_{step}'] = intermediates
 
         return all_steps
 
@@ -453,14 +454,16 @@ class RWKV7FixtureExtractor:
             np.savez(output_file, **np_data)
             print(f"Saved {len(np_data)} tensors to {output_file}")
 
-        # Also save config
+        # Also save config including token sequence
         config_file = output_dir / 'config.npz'
         np.savez(config_file,
                  n_embd=self.config.n_embd,
                  n_layer=self.config.n_layer,
                  n_head=self.config.n_head,
                  head_size=self.config.head_size,
-                 vocab_size=self.config.vocab_size)
+                 vocab_size=self.config.vocab_size,
+                 tokens=np.array(self._tokens, dtype=np.int64),
+                 n_steps=len(self._tokens))
         print(f"Saved config to {config_file}")
 
 
@@ -470,7 +473,10 @@ def main():
                         help='Path to model file (.pth or .st)')
     parser.add_argument('--output', type=str, default='tests/fixtures/ground_truth/',
                         help='Output directory for fixtures')
-    parser.add_argument('--tokens', type=str, default='1,510,47,11',
+    # Default: "<|endoftext|>User: what is the capital of France?\nAssistant:"
+    # Token 0 = <|endoftext|> is required per RWKV-7 Goose paper for proper eval
+    parser.add_argument('--tokens', type=str,
+                        default='0,24281,59,32464,4600,22590,51128,4706,44312,64,11,5585,41693,59',
                         help='Comma-separated token IDs to process')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to run on (cuda or cpu)')
