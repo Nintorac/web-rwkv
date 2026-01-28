@@ -30,6 +30,10 @@ pub struct HipRuntimeConfig {
     /// Batch size (number of sequences processed in parallel).
     /// Default: 1
     pub batch_size: usize,
+
+    /// Keep recurrent state resident on device and avoid per-call H2D/D2H transfers.
+    /// Default: false
+    pub resident_state: bool,
 }
 
 impl Default for HipRuntimeConfig {
@@ -37,6 +41,7 @@ impl Default for HipRuntimeConfig {
         Self {
             max_prefill_chunk: 256,
             batch_size: 1,
+            resident_state: false,
         }
     }
 }
@@ -47,6 +52,7 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk,
             batch_size,
+            resident_state: false,
         }
     }
 
@@ -55,6 +61,7 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk: 1,
             batch_size: 1,
+            resident_state: false,
         }
     }
 
@@ -63,6 +70,7 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk: max_chunk,
             batch_size: 1,
+            resident_state: false,
         }
     }
 }
@@ -116,6 +124,11 @@ pub struct HipScratch {
 
     /// LoRA dimensions
     pub lora_dims: LoraDims,
+
+    /// Persistent GPU state (resident on device when enabled)
+    pub att_shift_state_gpu: Vec<TensorHip<f32>>,
+    pub ffn_state_gpu: Vec<TensorHip<f32>>,
+    pub wkv_state_gpu: Vec<TensorHip<f32>>,
 
     // ========== Standard buffers [n_embd, T, B] ==========
 
@@ -256,6 +269,18 @@ impl HipScratch {
         let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, b, 1);
         let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, b, 1);
         let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
+        let state_shape = TensorShape::new(c, b, 1, 1);
+        let wkv_state_shape = TensorShape::new(info.head_size, info.head_size, info.n_head, b);
+
+        let mut att_shift_state_gpu = Vec::with_capacity(info.n_layer);
+        let mut ffn_state_gpu = Vec::with_capacity(info.n_layer);
+        let mut wkv_state_gpu = Vec::with_capacity(info.n_layer);
+
+        for _ in 0..info.n_layer {
+            att_shift_state_gpu.push(TensorHip::zeros(state_shape)?);
+            ffn_state_gpu.push(TensorHip::zeros(state_shape)?);
+            wkv_state_gpu.push(TensorHip::zeros(wkv_state_shape)?);
+        }
 
         Ok(Self {
             config,
@@ -263,6 +288,9 @@ impl HipScratch {
             n_hidden: h,
             n_vocab: v,
             lora_dims,
+            att_shift_state_gpu,
+            ffn_state_gpu,
+            wkv_state_gpu,
 
             // Standard buffers
             x: TensorHip::new(std_shape)?,
@@ -311,6 +339,20 @@ impl HipScratch {
             // Pinned host buffer for async embedding upload [n_embd * T * B]
             emb_staging: PinnedBuffer::new(c * t * b)?,
         })
+    }
+
+    /// Reset resident GPU state to zeros.
+    pub fn reset_state_gpu(&mut self) -> Result<()> {
+        for state in &mut self.att_shift_state_gpu {
+            state.fill_zero()?;
+        }
+        for state in &mut self.ffn_state_gpu {
+            state.fill_zero()?;
+        }
+        for state in &mut self.wkv_state_gpu {
+            state.fill_zero()?;
+        }
+        Ok(())
     }
 
     /// Calculate total GPU memory used by scratch buffers in bytes.

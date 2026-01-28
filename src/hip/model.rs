@@ -995,6 +995,17 @@ impl Rwkv7Hip {
         // Get stream for token staging
         let stream = Stream::null();
 
+        // Fast path: single-token decode (no staging round-trip)
+        if chunk_size == 1 && num_chunks == 1 && lens.iter().all(|&l| l == 1) {
+            let chunk_logits = self.forward_chunk(x, &mut current_state, &lens, scratch)?;
+            for b in 0..batch_size {
+                let offset = b * n_vocab;
+                all_logits[b].extend_from_slice(&chunk_logits[offset..offset + n_vocab]);
+            }
+            let flat_logits: Vec<f32> = all_logits.into_iter().flatten().collect();
+            return Ok((flat_logits, current_state));
+        }
+
         // Process chunks
         for chunk_idx in 0..num_chunks {
             let start = chunk_idx * chunk_size;
@@ -1142,6 +1153,17 @@ impl Rwkv7Hip {
         self.forward_inner(x, state, scratch, lens)
     }
 
+    /// Reset resident GPU state to zeros (when enabled).
+    pub fn reset_resident_state(&self) -> Result<()> {
+        let mut scratch_ref = self.scratch.lock().unwrap();
+        let scratch = scratch_ref.as_mut().ok_or_else(|| HipErrorKind {
+            code: -1,
+            message: "Scratch not initialized - call with_config() first".to_string(),
+        })?;
+        scratch.reset_state_gpu()?;
+        Ok(())
+    }
+
     /// Internal forward pass using scratch buffers and masked WKV.
     fn forward_inner(
         &self,
@@ -1150,6 +1172,7 @@ impl Rwkv7Hip {
         scratch: &mut HipScratch,
         lens: &[usize],
     ) -> Result<Vec<f32>> {
+        let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
         let t = tokens[0].len();
 
@@ -1242,33 +1265,45 @@ impl Rwkv7Hip {
             scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
         }
 
-        // Upload state to GPU using pinned async transfers
-        let mut att_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
-        for s in &state.att_shift_states {
-            let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-            unsafe {
-                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+        let mut att_shift_gpu: Vec<TensorHip<f32>>;
+        let mut ffn_shift_gpu: Vec<TensorHip<f32>>;
+        let mut wkv_state_gpu: Vec<TensorHip<f32>>;
+
+        if use_resident_state {
+            att_shift_gpu = std::mem::take(&mut scratch.att_shift_state_gpu);
+            ffn_shift_gpu = std::mem::take(&mut scratch.ffn_state_gpu);
+            wkv_state_gpu = std::mem::take(&mut scratch.wkv_state_gpu);
+        } else {
+            // Upload state to GPU using pinned async transfers
+            att_shift_gpu = Vec::with_capacity(n_layer);
+            for s in &state.att_shift_states {
+                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                unsafe {
+                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                }
+                att_shift_gpu.push(gpu_tensor);
             }
-            att_shift_gpu.push(gpu_tensor);
+
+            ffn_shift_gpu = Vec::with_capacity(n_layer);
+            for s in &state.ffn_states {
+                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                unsafe {
+                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                }
+                ffn_shift_gpu.push(gpu_tensor);
+            }
+
+            wkv_state_gpu = Vec::with_capacity(n_layer);
+            for s in &state.att_states {
+                let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
+                unsafe {
+                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                }
+                wkv_state_gpu.push(gpu_tensor);
+            }
         }
 
-        let mut ffn_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
-        for s in &state.ffn_states {
-            let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-            unsafe {
-                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
-            }
-            ffn_shift_gpu.push(gpu_tensor);
-        }
-
-        let mut wkv_state_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
-        for s in &state.att_states {
-            let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
-            unsafe {
-                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
-            }
-            wkv_state_gpu.push(gpu_tensor);
-        }
+        let result = (|| {
 
         // Temporary buffers
         let mut new_att_shift = TensorHip::<f32>::new(state_shape)?;
@@ -1460,25 +1495,34 @@ impl Rwkv7Hip {
 
         ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
 
-        // Download state back to host using pinned async transfers
-        for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
-            unsafe {
-                state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            // Download logits and return
+            logits.to_vec(stream)
+        })();
+
+        if use_resident_state {
+            scratch.att_shift_state_gpu = att_shift_gpu;
+            scratch.ffn_state_gpu = ffn_shift_gpu;
+            scratch.wkv_state_gpu = wkv_state_gpu;
+        } else if result.is_ok() {
+            // Download state back to host using pinned async transfers
+            for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
+                unsafe {
+                    state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                }
             }
-        }
-        for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
-            unsafe {
-                state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
+                unsafe {
+                    state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                }
             }
-        }
-        for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
-            unsafe {
-                state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
+                unsafe {
+                    state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                }
             }
         }
 
-        // Download logits and return
-        logits.to_vec(stream)
+        result
     }
 
     /// Internal async forward pass - same as forward_inner but with async logits copy.
@@ -1493,6 +1537,7 @@ impl Rwkv7Hip {
         lens: &[usize],
         logits_dst: &mut PinnedBuffer<f32>,
     ) -> Result<()> {
+        let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
         let t = tokens[0].len();
 
@@ -1585,33 +1630,45 @@ impl Rwkv7Hip {
             scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
         }
 
-        // Upload state to GPU using pinned async transfers
-        let mut att_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
-        for s in &state.att_shift_states {
-            let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-            unsafe {
-                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+        let mut att_shift_gpu: Vec<TensorHip<f32>>;
+        let mut ffn_shift_gpu: Vec<TensorHip<f32>>;
+        let mut wkv_state_gpu: Vec<TensorHip<f32>>;
+
+        if use_resident_state {
+            att_shift_gpu = std::mem::take(&mut scratch.att_shift_state_gpu);
+            ffn_shift_gpu = std::mem::take(&mut scratch.ffn_state_gpu);
+            wkv_state_gpu = std::mem::take(&mut scratch.wkv_state_gpu);
+        } else {
+            // Upload state to GPU using pinned async transfers
+            att_shift_gpu = Vec::with_capacity(n_layer);
+            for s in &state.att_shift_states {
+                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                unsafe {
+                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                }
+                att_shift_gpu.push(gpu_tensor);
             }
-            att_shift_gpu.push(gpu_tensor);
+
+            ffn_shift_gpu = Vec::with_capacity(n_layer);
+            for s in &state.ffn_states {
+                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                unsafe {
+                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                }
+                ffn_shift_gpu.push(gpu_tensor);
+            }
+
+            wkv_state_gpu = Vec::with_capacity(n_layer);
+            for s in &state.att_states {
+                let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
+                unsafe {
+                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                }
+                wkv_state_gpu.push(gpu_tensor);
+            }
         }
 
-        let mut ffn_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
-        for s in &state.ffn_states {
-            let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-            unsafe {
-                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
-            }
-            ffn_shift_gpu.push(gpu_tensor);
-        }
-
-        let mut wkv_state_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
-        for s in &state.att_states {
-            let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
-            unsafe {
-                s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
-            }
-            wkv_state_gpu.push(gpu_tensor);
-        }
+        let result = (|| {
 
         // Temporary buffers
         let mut new_att_shift = TensorHip::<f32>::new(state_shape)?;
@@ -1803,27 +1860,36 @@ impl Rwkv7Hip {
 
         ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
 
-        // Download state back to host using pinned async transfers
-        for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
-            unsafe {
-                state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            // Download logits asynchronously (no sync)
+            logits.copy_to_slice_async(logits_dst.as_slice_mut(), stream)?;
+
+            Ok(())
+        })();
+
+        if use_resident_state {
+            scratch.att_shift_state_gpu = att_shift_gpu;
+            scratch.ffn_state_gpu = ffn_shift_gpu;
+            scratch.wkv_state_gpu = wkv_state_gpu;
+        } else if result.is_ok() {
+            // Download state back to host using pinned async transfers
+            for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
+                unsafe {
+                    state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                }
             }
-        }
-        for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
-            unsafe {
-                state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
+                unsafe {
+                    state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                }
             }
-        }
-        for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
-            unsafe {
-                state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
+                unsafe {
+                    state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                }
             }
         }
 
-        // Download logits asynchronously (no sync)
-        logits.copy_to_slice_async(logits_dst.as_slice_mut(), stream)?;
-
-        Ok(())
+        result
     }
 
     /// Asynchronous forward pass that returns immediately with a completion handle.

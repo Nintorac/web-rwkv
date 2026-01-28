@@ -62,7 +62,7 @@ pub fn softmax_one_cpu(input: TensorCpu<f32>) -> Result<TensorCpu<f32>, TensorEr
 /// runtime interface.
 pub struct HipRuntime {
     model: Rwkv7Hip,
-    state: Mutex<HipState>,
+    state: Mutex<Option<HipState>>,
     num_batch: usize,
     chunk_size: usize,
 }
@@ -80,14 +80,15 @@ impl HipRuntime {
     /// let config = HipRuntimeConfig::new(256, 4);  // chunk_size=256, batch=4
     /// let runtime = HipRuntime::new(model, config)?;
     /// ```
-    pub fn with_config(model: Rwkv7Hip, config: HipRuntimeConfig) -> Result<Self, super::HipErrorKind> {
+    pub fn with_config(model: Rwkv7Hip, mut config: HipRuntimeConfig) -> Result<Self, super::HipErrorKind> {
+        config.resident_state = true;
         let num_batch = config.batch_size;
         let chunk_size = config.max_prefill_chunk;
         let model = model.with_config(config)?;
         let state = HipState::new(&model.info, num_batch)?;
         Ok(Self {
             model,
-            state: Mutex::new(state),
+            state: Mutex::new(Some(state)),
             num_batch,
             chunk_size,
         })
@@ -123,14 +124,25 @@ impl HipRuntime {
 
     /// Reset all state to initial values.
     pub fn reset_state(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.reset();
+        self.model
+            .reset_resident_state()
+            .expect("Failed to reset HIP resident state");
+        let mut state_guard = self.state.lock().unwrap();
+        if let Some(state) = state_guard.as_mut() {
+            state.reset();
+        }
     }
 
     /// Get a snapshot of current state (for testing/debugging).
     pub fn get_state_snapshot(&self) -> HipState {
-        let state = self.state.lock().unwrap();
-        state.clone()
+        let state_guard = self.state.lock().unwrap();
+        state_guard
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| {
+                HipState::new(&self.model.info, self.num_batch)
+                    .expect("Failed to allocate HIP state")
+            })
     }
 
     /// Run inference on a batch of token sequences.
@@ -154,16 +166,19 @@ impl HipRuntime {
         }
 
         // Take state from mutex, run forward, put new state back
-        let mut state_guard = self.state.lock().unwrap();
-        let old_state = std::mem::replace(&mut *state_guard, HipState::new(&self.model.info, self.num_batch)?);
-        drop(state_guard);
+        let old_state = {
+            let mut state_guard = self.state.lock().unwrap();
+            state_guard
+                .take()
+                .unwrap_or_else(|| HipState::new(&self.model.info, self.num_batch).expect("Failed to allocate HIP state"))
+        };
 
         // New forward() handles variable-length sequences automatically
         let (logits, new_state) = self.model.forward(sequences, Some(old_state))?;
 
         // Store the updated state
         let mut state_guard = self.state.lock().unwrap();
-        *state_guard = new_state;
+        *state_guard = Some(new_state);
 
         // Convert to TensorCpu
         // Output is flattened: [batch_0_tokens..., batch_1_tokens..., ...]

@@ -49,6 +49,41 @@ profiles:
     warmup_runs: 0
     repeats: 1
 
+  decode_batch_sweep:
+    description: "Decode-only batch sweep (fast). Single-step decode across large batch sizes."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+    backends:
+      - wgpu
+      - hip
+    scenarios:
+      - decode_only
+    # batch_sizes: [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    batch_sizes: [32, 64, 128, 256, 512, 1024]
+    token_chunk_sizes: [1]
+    decode_steps: [16]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
+  decode_batch_sweep_hip:
+    description: "Decode-only batch sweep (fast, hip only)."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+    backends:
+      - hip
+    scenarios:
+      - decode_only
+    # batch_sizes: [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    batch_sizes: [32, 64, 128, 256, 512, 1024]
+    token_chunk_sizes: [1]
+    decode_steps: [64]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
   full:
     description: "Full benchmark suite (~30+ min). Comprehensive coverage for CI/nightly."
     models:
@@ -82,7 +117,7 @@ models:
       rwkv_version: "v7"
       variant: "g1a"
       ctx: 4096
-    max_batch_size: 64
+    max_batch_size: 65536
     max_token_chunk_size: 4096
     skip: false
 
@@ -94,7 +129,7 @@ models:
       rwkv_version: "v7"
       variant: "g1c"
       ctx: 8192
-    max_batch_size: 16
+    max_batch_size: 65536
     max_token_chunk_size: 4096
     skip: false
 
@@ -304,6 +339,10 @@ skip_conditions:
     - name: "skip_puzzle15_hip"
       description: "Skip puzzle15 model on hip backend (custom ops not supported)"
       condition: "model_name == 'rwkv_puzzle15' and backend_id == 'hip'"
+
+    - name: "skip_wgpu_large_batch"
+      description: "Skip large batch sizes on wgpu to avoid buffer size limits"
+      condition: "backend_id == 'wgpu' and batch_size > 256"
 
 # =============================================================================
 # LIMITS
