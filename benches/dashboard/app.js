@@ -2815,28 +2815,47 @@
         tooltip.className = 'line-chart-tooltip';
         tooltip.innerHTML = `
             <div class="tooltip-header">${escapeHtml(buildSeriesLabelFull(series, config))}</div>
+            <div class="tooltip-row"><strong>Scenario:</strong> ${escapeHtml(config.scenario)}</div>
             <div class="tooltip-row"><strong>${escapeHtml(config.xLabel)}:</strong> ${formatLineChartXValue(point.x, config)}</div>
             <div class="tooltip-row"><strong>${escapeHtml(config.yLabel)}:</strong> ${formatMetricValue(point.value, config)}</div>
+            <div class="tooltip-row"><strong>Batch:</strong> ${series.batch_size ?? '--'}</div>
+            <div class="tooltip-row"><strong>Chunk:</strong> ${series.token_chunk_size ?? '--'}</div>
+            <div class="tooltip-row"><strong>Backend:</strong> ${escapeHtml(series.backend_id || '--')}</div>
+            <div class="tooltip-row"><strong>Run ID:</strong> ${escapeHtml(series.run_id || '--')}</div>
+            <div class="tooltip-row"><strong>Time:</strong> ${series.run_started_at ? formatRunTimestamp(series.run_started_at) : '--'}</div>
             <div class="tooltip-row"><strong>Samples:</strong> ${point.count}</div>
         `;
 
         document.body.appendChild(tooltip);
 
         // Position tooltip
+        // Force a layout read after insertion to get accurate size
         const tooltipRect = tooltip.getBoundingClientRect();
-        let left = event.pageX + 12;
-        let top = event.pageY - 10;
+        const mouseX = event.clientX;
+        const mouseY = event.clientY;
 
-        // Keep tooltip in viewport
-        if (left + tooltipRect.width > window.innerWidth) {
-            left = event.pageX - tooltipRect.width - 12;
+        const offset = 12;
+        let left = mouseX + offset;
+        let top = mouseY + offset;
+
+        // Decide above/below based on available space
+        const viewportTop = 0;
+        const viewportBottom = window.innerHeight;
+        const spaceBelow = viewportBottom - (mouseY + offset);
+        const spaceAbove = mouseY - (viewportTop + offset);
+        if (spaceBelow < tooltipRect.height && spaceAbove >= tooltipRect.height) {
+            top = mouseY - tooltipRect.height - offset;
         }
-        if (top + tooltipRect.height > window.innerHeight) {
-            top = event.pageY - tooltipRect.height - 10;
-        }
-        if (top < 0) {
-            top = 10;
-        }
+
+        // Clamp horizontally
+        const maxLeft = window.innerWidth - tooltipRect.width - offset;
+        if (left > maxLeft) left = maxLeft;
+        if (left < offset) left = offset;
+
+        // Clamp vertically
+        const maxTop = window.innerHeight - tooltipRect.height - offset;
+        if (top > maxTop) top = maxTop;
+        if (top < viewportTop + offset) top = viewportTop + offset;
 
         tooltip.style.left = left + 'px';
         tooltip.style.top = top + 'px';
