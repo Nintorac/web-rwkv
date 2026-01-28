@@ -9,6 +9,7 @@
 //! - Environment/build metadata collection for benchmark run headers
 //! - Sweep execution engine for cartesian expansion and case lifecycle management
 //! - JSONL writer for benchmark output with append-only semantics
+//! - Prefill-uniform scenario with length sets and TTFT tracking
 //! - Prefill-mixed named case patterns for mixed-batch benchmarks
 //!
 //! # Sweep Execution
@@ -43,6 +44,21 @@
 //! let summary = executor.finish();
 //! ```
 //!
+//! # Prefill-Uniform Scenario
+//!
+//! The `prefill_uniform` module provides utilities for measuring prompt processing performance:
+//!
+//! ```rust
+//! use web_rwkv_bench::prefill_uniform::{canonical_length_list, target_mode_lengths};
+//!
+//! // Get canonical lengths for chunk size 128
+//! let lengths = canonical_length_list(128);
+//! // Returns [1, 32, 64, 127, 128, 129, 256, 512, 1024]
+//!
+//! // Get lengths for total-token target mode
+//! let lengths = target_mode_lengths(128, 4); // chunk=128, batch=4
+//! ```
+//!
 //! # Prefill-Mixed Patterns
 //!
 //! The `prefill_mixed` module provides deterministic length vector generation for
@@ -60,6 +76,7 @@ pub mod config;
 pub mod jsonl;
 pub mod metadata;
 pub mod prefill_mixed;
+pub mod prefill_uniform;
 pub mod skip;
 pub mod sweep;
 
@@ -74,6 +91,11 @@ pub use metadata::{collect_run_metadata, BuildInfo, GitInfo, GpuInfo, HostInfo, 
 pub use prefill_mixed::{
     all_mixed_case_ids, generate_lengths, generate_lengths_from_str, total_tokens, MixedCaseError,
     MixedCaseId, MixedCaseResult,
+};
+pub use prefill_uniform::{
+    all_prefill_lengths, canonical_length_list, seq_len_from_total_tokens, target_mode_lengths,
+    total_token_targets, LengthMetadata, LengthMode, PrefillResult, PrefillUniformConfig,
+    TokenGenerator, TtftTracker,
 };
 pub use skip::{LimitsTracker, SkipReason};
 pub use sweep::{CaseParams, ExpandedCase, Hooks, SweepConfig, SweepEngine, SweepSummary};
