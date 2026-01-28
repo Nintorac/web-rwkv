@@ -585,6 +585,14 @@ body {
     padding-bottom: var(--space-xs);
 }
 
+.line-chart-controls {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-md);
+    margin-bottom: var(--space-md);
+}
+
 .line-subtab-btn {
     padding: var(--space-xs) var(--space-sm);
     font-size: 12px;
@@ -604,6 +612,23 @@ body {
 .line-subtab-btn.active {
     color: var(--accent);
     border-bottom-color: var(--accent);
+}
+
+.line-axis-picker {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.line-axis-select {
+    padding: 4px 8px;
+    font-size: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
 }
 
 /* View container */

@@ -1374,7 +1374,12 @@
     };
 
     const lineChartState = {
-        scenario: 'prefill_uniform'
+        scenario: 'prefill_uniform',
+        xAxis: {
+            prefill_uniform: 'seq_len',
+            prefill_mixed: 'mixed_case_id',
+            decode_only: 'decode_steps'
+        }
     };
 
     /**
@@ -2223,6 +2228,9 @@
         const container = document.createElement('div');
         container.className = 'line-chart-container';
 
+        const controls = document.createElement('div');
+        controls.className = 'line-chart-controls';
+
         const tabs = document.createElement('div');
         tabs.className = 'line-subtabs';
 
@@ -2244,25 +2252,91 @@
             tabs.appendChild(btn);
         });
 
+        const axisPicker = document.createElement('div');
+        axisPicker.className = 'line-axis-picker';
+        axisPicker.innerHTML = `
+            <label for="line-axis-select">X-axis</label>
+            <select id="line-axis-select" class="line-axis-select"></select>
+        `;
+
+        controls.appendChild(tabs);
+        controls.appendChild(axisPicker);
+
         const chartContainer = document.createElement('div');
         chartContainer.className = 'line-chart-view';
 
-        container.appendChild(tabs);
+        container.appendChild(controls);
         container.appendChild(chartContainer);
         elements.viewContainer.appendChild(container);
 
+        updateLineAxisOptions();
         renderLineChartPlot(chartContainer, lineChartState.scenario);
     }
 
+    function getLineChartAxisOptions(scenario) {
+        switch (scenario) {
+            case 'decode_only':
+                return [
+                    { key: 'decode_steps', label: 'Decode Steps', type: 'numeric' },
+                    { key: 'batch_size', label: 'Batch Size', type: 'numeric' },
+                    { key: 'token_chunk_size', label: 'Chunk Size', type: 'numeric' }
+                ];
+            case 'prefill_mixed':
+                return [
+                    { key: 'mixed_case_id', label: 'Mixed Case', type: 'categorical' },
+                    { key: 'batch_size', label: 'Batch Size', type: 'numeric' },
+                    { key: 'token_chunk_size', label: 'Chunk Size', type: 'numeric' }
+                ];
+            default:
+                return [
+                    { key: 'seq_len', label: 'Seq Length', type: 'numeric' },
+                    { key: 'batch_size', label: 'Batch Size', type: 'numeric' },
+                    { key: 'token_chunk_size', label: 'Chunk Size', type: 'numeric' }
+                ];
+        }
+    }
+
+    function updateLineAxisOptions() {
+        const select = document.getElementById('line-axis-select');
+        if (!select) return;
+
+        const scenario = lineChartState.scenario;
+        const options = getLineChartAxisOptions(scenario);
+        const preferred = lineChartState.xAxis[scenario];
+        const selectedKey = options.some(o => o.key === preferred) ? preferred : options[0].key;
+
+        select.innerHTML = '';
+        options.forEach(option => {
+            const opt = document.createElement('option');
+            opt.value = option.key;
+            opt.textContent = option.label;
+            if (option.key === selectedKey) {
+                opt.selected = true;
+            }
+            select.appendChild(opt);
+        });
+
+        lineChartState.xAxis[scenario] = selectedKey;
+
+        select.onchange = () => {
+            lineChartState.xAxis[scenario] = select.value;
+            renderLineChart();
+        };
+    }
+
     function getLineChartConfig(scenario) {
+        const axisKey = lineChartState.xAxis[scenario] || getLineChartAxisOptions(scenario)[0].key;
+        const axisOptions = getLineChartAxisOptions(scenario);
+        const axis = axisOptions.find(opt => opt.key === axisKey) || axisOptions[0];
+
         switch (scenario) {
             case 'decode_only':
                 return {
                     scenario,
                     title: 'Decode Throughput vs Steps',
-                    xKey: 'decode_steps',
-                    xLabel: 'Decode Steps',
-                    xType: 'numeric',
+                    xKey: axis.key,
+                    xLabel: axis.label,
+                    xType: axis.type,
                     yKey: 'decode_tok_per_s',
                     yLabel: 'Decode tok/s',
                     yUnit: 'tok/s'
@@ -2271,9 +2345,9 @@
                 return {
                     scenario,
                     title: 'Prefill Mixed Throughput by Case',
-                    xKey: 'mixed_case_id',
-                    xLabel: 'Mixed Case',
-                    xType: 'categorical',
+                    xKey: axis.key,
+                    xLabel: axis.label,
+                    xType: axis.type,
                     yKey: 'prefill_tok_per_s',
                     yLabel: 'Prefill tok/s',
                     yUnit: 'tok/s'
@@ -2282,13 +2356,13 @@
                 return {
                     scenario: 'prefill_uniform',
                     title: 'Prefill Throughput vs Sequence Length',
-                    xKey: 'seq_len',
-                    xLabel: 'Seq Length',
-                    xType: 'numeric',
+                    xKey: axis.key,
+                    xLabel: axis.label,
+                    xType: axis.type,
                     yKey: 'prefill_tok_per_s',
                     yLabel: 'Prefill tok/s',
                     yUnit: 'tok/s',
-                    xFormatter: formatSeqLen
+                    xFormatter: axis.key === 'seq_len' ? formatSeqLen : null
                 };
         }
     }
@@ -2329,7 +2403,13 @@
             if (xValue == null || yValue == null) return;
 
             const chunkSize = m.token_chunk_size_effective || m.token_chunk_size_requested || m.token_chunk_size;
-            const seriesKey = `${m.batch_size || '?'}|${m.model_name || '?'}|${m.backend_id || '?'}|${chunkSize || '?'}`;
+            const seriesKeyParts = [
+                config.xKey !== 'batch_size' ? (m.batch_size || '?') : null,
+                m.model_name || '?',
+                m.backend_id || '?',
+                config.xKey !== 'token_chunk_size' ? (chunkSize || '?') : null
+            ].filter(part => part !== null);
+            const seriesKey = seriesKeyParts.join('|');
 
             if (!seriesMap.has(seriesKey)) {
                 seriesMap.set(seriesKey, {
@@ -2339,6 +2419,7 @@
                     model_size: m.model_size,
                     backend_id: m.backend_id,
                     token_chunk_size: chunkSize,
+                    xKey: config.xKey,
                     points: new Map()  // xKey -> [values]
                 });
             }
@@ -2374,6 +2455,7 @@
                     model_size: series.model_size,
                     backend_id: series.backend_id,
                     token_chunk_size: series.token_chunk_size,
+                    xKey: series.xKey,
                     points: points
                 });
             }
@@ -2566,7 +2648,7 @@
             .text(config.title);
 
         // Legend
-        renderLineChartLegend(svg, seriesData, colorScale, width + margin.left + 20, margin.top);
+        renderLineChartLegend(svg, seriesData, colorScale, width + margin.left + 20, margin.top, config);
 
         console.log(`[dashboard] Line chart rendered with ${seriesData.length} series`);
     }
@@ -2602,7 +2684,7 @@
     /**
      * Render legend for line chart
      */
-    function renderLineChartLegend(svg, seriesData, colorScale, x, y) {
+    function renderLineChartLegend(svg, seriesData, colorScale, x, y, config) {
         const legendGroup = svg.append('g')
             .attr('class', 'line-chart-legend')
             .attr('transform', `translate(${x},${y})`);
@@ -2626,14 +2708,14 @@
                 .attr('fill', colorScale(series.key));
 
             // Label - abbreviated for space
-            const label = buildSeriesLabel(series);
+            const label = buildSeriesLabel(series, config);
             itemGroup.append('text')
                 .attr('x', 20)
                 .attr('y', 11)
                 .attr('class', 'legend-text')
                 .text(label.length > 25 ? label.substring(0, 22) + '...' : label)
                 .append('title')
-                .text(buildSeriesLabelFull(series));
+                .text(buildSeriesLabelFull(series, config));
         });
 
         // Show "and N more" if truncated
@@ -2649,30 +2731,38 @@
     /**
      * Build abbreviated series label for legend
      */
-    function buildSeriesLabel(series) {
+    function buildSeriesLabel(series, config) {
         const parts = [];
         if (series.model_size) parts.push(series.model_size);
-        if (series.batch_size != null) parts.push(`bs=${series.batch_size}`);
+        if (series.batch_size != null && config?.xKey !== 'batch_size') {
+            parts.push(`bs=${series.batch_size}`);
+        }
         if (series.backend_id) {
             const shortBackend = series.backend_id.length > 8
                 ? series.backend_id.substring(0, 6) + '..'
                 : series.backend_id;
             parts.push(shortBackend);
         }
-        if (series.token_chunk_size != null) parts.push(`c=${series.token_chunk_size}`);
+        if (series.token_chunk_size != null && config?.xKey !== 'token_chunk_size') {
+            parts.push(`c=${series.token_chunk_size}`);
+        }
         return parts.join(' ');
     }
 
     /**
      * Build full series label for tooltip
      */
-    function buildSeriesLabelFull(series) {
+    function buildSeriesLabelFull(series, config) {
         const parts = [];
         if (series.model_name) parts.push(`Model: ${series.model_name}`);
         if (series.model_size) parts.push(`Size: ${series.model_size}`);
         if (series.backend_id) parts.push(`Backend: ${series.backend_id}`);
-        if (series.batch_size != null) parts.push(`Batch: ${series.batch_size}`);
-        if (series.token_chunk_size != null) parts.push(`Chunk: ${series.token_chunk_size}`);
+        if (series.batch_size != null && config?.xKey !== 'batch_size') {
+            parts.push(`Batch: ${series.batch_size}`);
+        }
+        if (series.token_chunk_size != null && config?.xKey !== 'token_chunk_size') {
+            parts.push(`Chunk: ${series.token_chunk_size}`);
+        }
         return parts.join(', ');
     }
 
@@ -2686,7 +2776,7 @@
         const tooltip = document.createElement('div');
         tooltip.className = 'line-chart-tooltip';
         tooltip.innerHTML = `
-            <div class="tooltip-header">${escapeHtml(buildSeriesLabelFull(series))}</div>
+            <div class="tooltip-header">${escapeHtml(buildSeriesLabelFull(series, config))}</div>
             <div class="tooltip-row"><strong>${escapeHtml(config.xLabel)}:</strong> ${formatLineChartXValue(point.x, config)}</div>
             <div class="tooltip-row"><strong>${escapeHtml(config.yLabel)}:</strong> ${formatMetricValue(point.value, config)}</div>
             <div class="tooltip-row"><strong>Samples:</strong> ${point.count}</div>
