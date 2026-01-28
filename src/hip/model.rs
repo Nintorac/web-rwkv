@@ -20,6 +20,7 @@ use super::kernels::{
 };
 use super::blas::HipBlasContext;
 use super::scratch::HipScratch;
+use super::HipProf;
 
 #[cfg(feature = "hip-probes")]
 use crate::hip_probe;
@@ -1175,6 +1176,7 @@ impl Rwkv7Hip {
         let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
         let t = tokens[0].len();
+        let mut prof = HipProf::new("forward_inner");
 
         // Create BLAS context for all GEMM operations
         let ctx = HipBlasContext::with_null_stream()?;
@@ -1192,7 +1194,7 @@ impl Rwkv7Hip {
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
         let lens_shape = TensorShape::new(b, 1, 1, 1);
         let mut lens_gpu = scratch.lens_gpu.resized_view_mut(lens_shape)?;
-        lens_gpu.copy_from_slice(&lens_i32, stream)?;
+        prof.time("lens_upload", || lens_gpu.copy_from_slice(&lens_i32, stream))?;
 
         // Shapes for this forward pass
         let std_shape = TensorShape::new(n_embd, t, b, 1);
@@ -1251,62 +1253,66 @@ impl Rwkv7Hip {
         // Output buffer
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
 
-        // Embedding lookup: tokens[b][t] -> x[c, t, b]
-        // Embedding table is kept on CPU - use pinned staging buffer for async upload
-        let emb_data = &self.embed.w;
-        let emb_stride = self.embed.n_embd;
-        let x_host = scratch.emb_staging.as_slice_mut();
-        for batch_idx in 0..b {
-            for time_idx in 0..t {
-                let token = tokens[batch_idx][time_idx] as usize;
-                let src_offset = token * emb_stride;
-                let dst_offset = batch_idx * t * n_embd + time_idx * n_embd;
-                x_host[dst_offset..dst_offset + n_embd]
-                    .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
+        prof.time("embedding", || {
+            // Embedding lookup: tokens[b][t] -> x[c, t, b]
+            // Embedding table is kept on CPU - use pinned staging buffer for async upload
+            let emb_data = &self.embed.w;
+            let emb_stride = self.embed.n_embd;
+            let x_host = scratch.emb_staging.as_slice_mut();
+            for batch_idx in 0..b {
+                for time_idx in 0..t {
+                    let token = tokens[batch_idx][time_idx] as usize;
+                    let src_offset = token * emb_stride;
+                    let dst_offset = batch_idx * t * n_embd + time_idx * n_embd;
+                    x_host[dst_offset..dst_offset + n_embd]
+                        .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
+                }
             }
-        }
-        // Async copy from pinned host memory to GPU (truly non-blocking)
-        unsafe {
-            scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
-        }
+            // Async copy from pinned host memory to GPU (truly non-blocking)
+            unsafe {
+                scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
+            }
+            Ok(())
+        })?;
 
-        let mut att_shift_gpu: Vec<TensorHip<f32>>;
-        let mut ffn_shift_gpu: Vec<TensorHip<f32>>;
-        let mut wkv_state_gpu: Vec<TensorHip<f32>>;
-
-        if use_resident_state {
-            att_shift_gpu = std::mem::take(&mut scratch.att_shift_state_gpu);
-            ffn_shift_gpu = std::mem::take(&mut scratch.ffn_state_gpu);
-            wkv_state_gpu = std::mem::take(&mut scratch.wkv_state_gpu);
+        let (mut att_shift_gpu, mut ffn_shift_gpu, mut wkv_state_gpu) = if use_resident_state {
+            (
+                std::mem::take(&mut scratch.att_shift_state_gpu),
+                std::mem::take(&mut scratch.ffn_state_gpu),
+                std::mem::take(&mut scratch.wkv_state_gpu),
+            )
         } else {
-            // Upload state to GPU using pinned async transfers
-            att_shift_gpu = Vec::with_capacity(n_layer);
-            for s in &state.att_shift_states {
-                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-                unsafe {
-                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+            prof.time("state_upload", || {
+                // Upload state to GPU using pinned async transfers
+                let mut att_shift_gpu = Vec::with_capacity(n_layer);
+                for s in &state.att_shift_states {
+                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    unsafe {
+                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                    }
+                    att_shift_gpu.push(gpu_tensor);
                 }
-                att_shift_gpu.push(gpu_tensor);
-            }
 
-            ffn_shift_gpu = Vec::with_capacity(n_layer);
-            for s in &state.ffn_states {
-                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-                unsafe {
-                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                let mut ffn_shift_gpu = Vec::with_capacity(n_layer);
+                for s in &state.ffn_states {
+                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    unsafe {
+                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                    }
+                    ffn_shift_gpu.push(gpu_tensor);
                 }
-                ffn_shift_gpu.push(gpu_tensor);
-            }
 
-            wkv_state_gpu = Vec::with_capacity(n_layer);
-            for s in &state.att_states {
-                let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
-                unsafe {
-                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                let mut wkv_state_gpu = Vec::with_capacity(n_layer);
+                for s in &state.att_states {
+                    let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
+                    unsafe {
+                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                    }
+                    wkv_state_gpu.push(gpu_tensor);
                 }
-                wkv_state_gpu.push(gpu_tensor);
-            }
-        }
+                Ok((att_shift_gpu, ffn_shift_gpu, wkv_state_gpu))
+            })?
+        };
 
         let result = (|| {
 
@@ -1323,101 +1329,134 @@ impl Rwkv7Hip {
 
             // Apply ln0 for layer 0
             if layer_idx == 0 {
-                layer_norm_f32(
-                    &x, &self.embed.ln.weight, &self.embed.ln.bias,
-                    &mut x_ln, 1e-5, stream
-                )?;
-                copy_tensor_f32(&x_ln, &mut x, stream)?;
+                prof.time("ln0", || {
+                    layer_norm_f32(
+                        &x, &self.embed.ln.weight, &self.embed.ln.bias,
+                        &mut x_ln, 1e-5, stream
+                    )?;
+                    copy_tensor_f32(&x_ln, &mut x, stream)?;
+                    Ok(())
+                })?;
             }
 
             // ==== Time-Mix (Attention) ====
-            layer_norm_f32(
-                &x, &layer.att_ln.weight, &layer.att_ln.bias,
-                &mut x_ln, 1e-5, stream
-            )?;
+            prof.time("att_ln", || {
+                layer_norm_f32(
+                    &x, &layer.att_ln.weight, &layer.att_ln.bias,
+                    &mut x_ln, 1e-5, stream
+                )?;
+                Ok(())
+            })?;
 
             // Token shifts for attention - use masked kernel for x_r to get correct state
             // The masked kernel extracts state at lengths[b]-1 instead of T-1
-            channel_mix_state_f32_masked(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
-                &mut att_xr, &mut new_att_shift, &lens_gpu, stream
-            )?;
-            // Remaining shifts use regular kernel (we only need outputs, not state)
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
-                &mut att_xw, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_k,
-                &mut att_xk, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_v,
-                &mut att_xv, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_a,
-                &mut att_xa, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
-                &mut att_xg, &mut temp1, stream
-            )?;
+            prof.time("att_shift", || {
+                channel_mix_state_f32_masked(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
+                    &mut att_xr, &mut new_att_shift, &lens_gpu, stream
+                )?;
+                // Remaining shifts use regular kernel (we only need outputs, not state)
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
+                    &mut att_xw, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_k,
+                    &mut att_xk, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_v,
+                    &mut att_xv, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_a,
+                    &mut att_xa, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
+                    &mut att_xg, &mut temp1, stream
+                )?;
+                Ok(())
+            })?;
 
             // Update shift state - new_att_shift has correct state from masked kernel
             std::mem::swap(&mut new_att_shift, &mut att_shift_gpu[layer_idx]);
 
             // Linear projections: r, k, v
-            ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
-            ctx.sgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
-            ctx.sgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+            prof.time("att_proj", || {
+                ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
+                ctx.sgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
+                ctx.sgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+                Ok(())
+            })?;
 
             // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
-            ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
-            tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
-            ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
-            broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
-            softplus_decay_f32(&temp1, &mut att_w, stream)?;
+            prof.time("att_decay", || {
+                ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
+                tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
+                ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
+                broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
+                softplus_decay_f32(&temp1, &mut att_w, stream)?;
+                Ok(())
+            })?;
 
             // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
-            ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
-            ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
-            broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
-            sigmoid_f32(&temp1, &mut att_a, stream)?;
+            prof.time("att_adapt", || {
+                ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
+                ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
+                broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
+                sigmoid_f32(&temp1, &mut att_a, stream)?;
+                Ok(())
+            })?;
 
             // Gate: g = sigmoid(xg @ g1) @ g2
-            ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
-            sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
-            ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+            prof.time("att_gate", || {
+                ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
+                sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
+                ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+                Ok(())
+            })?;
 
             // Value residual (layers > 0)
             if layer_idx > 0 {
                 if let (Some(v0), Some(v1), Some(v2)) =
                     (&layer.att.v0, &layer.att.v1, &layer.att.v2) {
-                    ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
-                    ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
-                    broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
-                    sigmoid_f32(&temp1, &mut temp2, stream)?;
-                    lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
-                    copy_tensor_f32(&temp1, &mut att_v, stream)?;
+                    prof.time("att_vres", || {
+                        ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
+                        ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
+                        broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
+                        sigmoid_f32(&temp1, &mut temp2, stream)?;
+                        lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
+                        copy_tensor_f32(&temp1, &mut att_v, stream)?;
+                        Ok(())
+                    })?;
                 }
             } else {
                 copy_tensor_f32(&att_v, &mut v_first, stream)?;
             }
 
             // L2 normalize k
-            broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
-            l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
+            prof.time("att_norm_k", || {
+                broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
+                l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
+                Ok(())
+            })?;
 
             // Control K
-            control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
+            prof.time("att_ctrl_k", || {
+                control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
+                Ok(())
+            })?;
 
             // WKV inputs
-            negate_f32(&att_kk, &mut wkv_a, stream)?;
-            mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
-            // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
-            // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
-            decay_exp_f32(&att_w, &mut w_decay, stream)?;
+            prof.time("att_wkv_in", || {
+                negate_f32(&att_kk, &mut wkv_a, stream)?;
+                mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
+                // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
+                // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
+                decay_exp_f32(&att_w, &mut w_decay, stream)?;
+                Ok(())
+            })?;
 
             // Reshape for WKV
             let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;
@@ -1429,72 +1468,111 @@ impl Rwkv7Hip {
             let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
             // Run masked WKV7 (skips state updates for padding positions)
-            wkv7_f32_masked(
-                &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
-                &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
-                &lens_gpu, stream
-            )?;
+            prof.time("wkv", || {
+                wkv7_f32_masked(
+                    &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
+                    &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
+                    &lens_gpu, stream
+                )?;
+                Ok(())
+            })?;
             std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
 
             // Group norm on WKV output
-            group_norm_f32(
-                &wkv_out, &layer.att.gn.weight, &layer.att.gn.bias,
-                &mut wkv_normed, n_head, 64e-5, stream
-            )?;
+            prof.time("wkv_norm", || {
+                group_norm_f32(
+                    &wkv_out, &layer.att.gn.weight, &layer.att.gn.bias,
+                    &mut wkv_normed, n_head, 64e-5, stream
+                )?;
+                Ok(())
+            })?;
 
             // WKV bonus
             let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
             let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
             let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
-            wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
+            prof.time("wkv_bonus", || {
+                wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
+                Ok(())
+            })?;
 
             // Combine and gate
-            add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
-            mul_f32(&temp1, &att_g, &mut temp2, stream)?;
+            prof.time("att_gate_out", || {
+                add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
+                mul_f32(&temp1, &att_g, &mut temp2, stream)?;
+                Ok(())
+            })?;
 
             // Output projection
-            ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+            prof.time("att_out", || {
+                ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+                Ok(())
+            })?;
 
             // Residual
-            add_f32(&x, &att_out, &mut temp1, stream)?;
-            copy_tensor_f32(&temp1, &mut x, stream)?;
+            prof.time("att_resid", || {
+                add_f32(&x, &att_out, &mut temp1, stream)?;
+                copy_tensor_f32(&temp1, &mut x, stream)?;
+                Ok(())
+            })?;
 
             // ==== Channel-Mix (FFN) ====
-            layer_norm_f32(
-                &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
-                &mut x_ln, 1e-5, stream
-            )?;
+            prof.time("ffn_ln", || {
+                layer_norm_f32(
+                    &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
+                    &mut x_ln, 1e-5, stream
+                )?;
+                Ok(())
+            })?;
 
             // Token shift for FFN - use masked kernel for correct state extraction
-            channel_mix_state_f32_masked(
-                &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
-                &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
-            )?;
+            prof.time("ffn_shift", || {
+                channel_mix_state_f32_masked(
+                    &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
+                    &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
+                )?;
+                Ok(())
+            })?;
 
             // Update FFN shift state - new_ffn_shift has correct state from masked kernel
             std::mem::swap(&mut new_ffn_shift, &mut ffn_shift_gpu[layer_idx]);
 
             // Key projection
-            ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+            prof.time("ffn_k", || {
+                ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+                Ok(())
+            })?;
 
             // Squared ReLU
-            squared_relu_f32(&ffn_k, &mut ffn_k_sq, stream)?;
+            prof.time("ffn_relu2", || {
+                squared_relu_f32(&ffn_k, &mut ffn_k_sq, stream)?;
+                Ok(())
+            })?;
 
             // Value projection
-            ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+            prof.time("ffn_v", || {
+                ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+                Ok(())
+            })?;
 
             // Residual
-            add_f32(&x, &ffn_out, &mut temp1, stream)?;
-            copy_tensor_f32(&temp1, &mut x, stream)?;
+            prof.time("ffn_resid", || {
+                add_f32(&x, &ffn_out, &mut temp1, stream)?;
+                copy_tensor_f32(&temp1, &mut x, stream)?;
+                Ok(())
+            })?;
         }
 
-        // ==== Output Head ====
-        layer_norm_f32(
-            &x, &self.head.ln.weight, &self.head.ln.bias,
-            &mut x_ln, 1e-5, stream
-        )?;
+        prof.time("head", || {
+            // ==== Output Head ====
+            layer_norm_f32(
+                &x, &self.head.ln.weight, &self.head.ln.bias,
+                &mut x_ln, 1e-5, stream
+            )?;
 
-        ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            Ok(())
+        })?;
 
             // Download logits and return
             logits.to_vec(stream)
@@ -1505,23 +1583,29 @@ impl Rwkv7Hip {
             scratch.ffn_state_gpu = ffn_shift_gpu;
             scratch.wkv_state_gpu = wkv_state_gpu;
         } else if result.is_ok() {
-            // Download state back to host using pinned async transfers
-            for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
-                unsafe {
-                    state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            prof.time("state_download", || {
+                // Download state back to host using pinned async transfers
+                for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
+                    unsafe {
+                        state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                    }
                 }
-            }
-            for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
-                unsafe {
-                    state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
+                    unsafe {
+                        state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                    }
                 }
-            }
-            for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
-                unsafe {
-                    state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
+                    unsafe {
+                        state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                    }
                 }
-            }
+                Ok(())
+            })?;
         }
+
+        #[cfg(feature = "hip-prof")]
+        prof.print(&format!("b={b} t={t} layers={n_layer}"));
 
         result
     }
@@ -1541,6 +1625,7 @@ impl Rwkv7Hip {
         let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
         let t = tokens[0].len();
+        let mut prof = HipProf::new("forward_inner_async");
 
         // Create BLAS context for all GEMM operations
         let ctx = HipBlasContext::with_null_stream()?;
@@ -1558,7 +1643,7 @@ impl Rwkv7Hip {
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
         let lens_shape = TensorShape::new(b, 1, 1, 1);
         let mut lens_gpu = scratch.lens_gpu.resized_view_mut(lens_shape)?;
-        lens_gpu.copy_from_slice(&lens_i32, stream)?;
+        prof.time("lens_upload", || lens_gpu.copy_from_slice(&lens_i32, stream))?;
 
         // Shapes for this forward pass
         let std_shape = TensorShape::new(n_embd, t, b, 1);
@@ -1617,62 +1702,66 @@ impl Rwkv7Hip {
         // Output buffer
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
 
-        // Embedding lookup: tokens[b][t] -> x[c, t, b]
-        // Embedding table is kept on CPU - use pinned staging buffer for async upload
-        let emb_data = &self.embed.w;
-        let emb_stride = self.embed.n_embd;
-        let x_host = scratch.emb_staging.as_slice_mut();
-        for batch_idx in 0..b {
-            for time_idx in 0..t {
-                let token = tokens[batch_idx][time_idx] as usize;
-                let src_offset = token * emb_stride;
-                let dst_offset = batch_idx * t * n_embd + time_idx * n_embd;
-                x_host[dst_offset..dst_offset + n_embd]
-                    .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
+        prof.time("embedding", || {
+            // Embedding lookup: tokens[b][t] -> x[c, t, b]
+            // Embedding table is kept on CPU - use pinned staging buffer for async upload
+            let emb_data = &self.embed.w;
+            let emb_stride = self.embed.n_embd;
+            let x_host = scratch.emb_staging.as_slice_mut();
+            for batch_idx in 0..b {
+                for time_idx in 0..t {
+                    let token = tokens[batch_idx][time_idx] as usize;
+                    let src_offset = token * emb_stride;
+                    let dst_offset = batch_idx * t * n_embd + time_idx * n_embd;
+                    x_host[dst_offset..dst_offset + n_embd]
+                        .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
+                }
             }
-        }
-        // Async copy from pinned host memory to GPU (truly non-blocking)
-        unsafe {
-            scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
-        }
+            // Async copy from pinned host memory to GPU (truly non-blocking)
+            unsafe {
+                scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
+            }
+            Ok(())
+        })?;
 
-        let mut att_shift_gpu: Vec<TensorHip<f32>>;
-        let mut ffn_shift_gpu: Vec<TensorHip<f32>>;
-        let mut wkv_state_gpu: Vec<TensorHip<f32>>;
-
-        if use_resident_state {
-            att_shift_gpu = std::mem::take(&mut scratch.att_shift_state_gpu);
-            ffn_shift_gpu = std::mem::take(&mut scratch.ffn_state_gpu);
-            wkv_state_gpu = std::mem::take(&mut scratch.wkv_state_gpu);
+        let (mut att_shift_gpu, mut ffn_shift_gpu, mut wkv_state_gpu) = if use_resident_state {
+            (
+                std::mem::take(&mut scratch.att_shift_state_gpu),
+                std::mem::take(&mut scratch.ffn_state_gpu),
+                std::mem::take(&mut scratch.wkv_state_gpu),
+            )
         } else {
-            // Upload state to GPU using pinned async transfers
-            att_shift_gpu = Vec::with_capacity(n_layer);
-            for s in &state.att_shift_states {
-                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-                unsafe {
-                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+            prof.time("state_upload", || {
+                // Upload state to GPU using pinned async transfers
+                let mut att_shift_gpu = Vec::with_capacity(n_layer);
+                for s in &state.att_shift_states {
+                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    unsafe {
+                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                    }
+                    att_shift_gpu.push(gpu_tensor);
                 }
-                att_shift_gpu.push(gpu_tensor);
-            }
 
-            ffn_shift_gpu = Vec::with_capacity(n_layer);
-            for s in &state.ffn_states {
-                let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
-                unsafe {
-                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                let mut ffn_shift_gpu = Vec::with_capacity(n_layer);
+                for s in &state.ffn_states {
+                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    unsafe {
+                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                    }
+                    ffn_shift_gpu.push(gpu_tensor);
                 }
-                ffn_shift_gpu.push(gpu_tensor);
-            }
 
-            wkv_state_gpu = Vec::with_capacity(n_layer);
-            for s in &state.att_states {
-                let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
-                unsafe {
-                    s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                let mut wkv_state_gpu = Vec::with_capacity(n_layer);
+                for s in &state.att_states {
+                    let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
+                    unsafe {
+                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
+                    }
+                    wkv_state_gpu.push(gpu_tensor);
                 }
-                wkv_state_gpu.push(gpu_tensor);
-            }
-        }
+                Ok((att_shift_gpu, ffn_shift_gpu, wkv_state_gpu))
+            })?
+        };
 
         let result = (|| {
 
@@ -1689,101 +1778,134 @@ impl Rwkv7Hip {
 
             // Apply ln0 for layer 0
             if layer_idx == 0 {
-                layer_norm_f32(
-                    &x, &self.embed.ln.weight, &self.embed.ln.bias,
-                    &mut x_ln, 1e-5, stream
-                )?;
-                copy_tensor_f32(&x_ln, &mut x, stream)?;
+                prof.time("ln0", || {
+                    layer_norm_f32(
+                        &x, &self.embed.ln.weight, &self.embed.ln.bias,
+                        &mut x_ln, 1e-5, stream
+                    )?;
+                    copy_tensor_f32(&x_ln, &mut x, stream)?;
+                    Ok(())
+                })?;
             }
 
             // ==== Time-Mix (Attention) ====
-            layer_norm_f32(
-                &x, &layer.att_ln.weight, &layer.att_ln.bias,
-                &mut x_ln, 1e-5, stream
-            )?;
+            prof.time("att_ln", || {
+                layer_norm_f32(
+                    &x, &layer.att_ln.weight, &layer.att_ln.bias,
+                    &mut x_ln, 1e-5, stream
+                )?;
+                Ok(())
+            })?;
 
             // Token shifts for attention - use masked kernel for x_r to get correct state
             // The masked kernel extracts state at lengths[b]-1 instead of T-1
-            channel_mix_state_f32_masked(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
-                &mut att_xr, &mut new_att_shift, &lens_gpu, stream
-            )?;
-            // Remaining shifts use regular kernel (we only need outputs, not state)
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
-                &mut att_xw, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_k,
-                &mut att_xk, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_v,
-                &mut att_xv, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_a,
-                &mut att_xa, &mut temp1, stream
-            )?;
-            channel_mix_state_f32(
-                &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
-                &mut att_xg, &mut temp1, stream
-            )?;
+            prof.time("att_shift", || {
+                channel_mix_state_f32_masked(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
+                    &mut att_xr, &mut new_att_shift, &lens_gpu, stream
+                )?;
+                // Remaining shifts use regular kernel (we only need outputs, not state)
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
+                    &mut att_xw, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_k,
+                    &mut att_xk, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_v,
+                    &mut att_xv, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_a,
+                    &mut att_xa, &mut temp1, stream
+                )?;
+                channel_mix_state_f32(
+                    &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
+                    &mut att_xg, &mut temp1, stream
+                )?;
+                Ok(())
+            })?;
 
             // Update shift state - new_att_shift has correct state from masked kernel
             std::mem::swap(&mut new_att_shift, &mut att_shift_gpu[layer_idx]);
 
             // Linear projections: r, k, v
-            ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
-            ctx.sgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
-            ctx.sgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+            prof.time("att_proj", || {
+                ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
+                ctx.sgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
+                ctx.sgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+                Ok(())
+            })?;
 
             // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
-            ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
-            tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
-            ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
-            broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
-            softplus_decay_f32(&temp1, &mut att_w, stream)?;
+            prof.time("att_decay", || {
+                ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
+                tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
+                ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
+                broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
+                softplus_decay_f32(&temp1, &mut att_w, stream)?;
+                Ok(())
+            })?;
 
             // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
-            ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
-            ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
-            broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
-            sigmoid_f32(&temp1, &mut att_a, stream)?;
+            prof.time("att_adapt", || {
+                ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
+                ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
+                broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
+                sigmoid_f32(&temp1, &mut att_a, stream)?;
+                Ok(())
+            })?;
 
             // Gate: g = sigmoid(xg @ g1) @ g2
-            ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
-            sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
-            ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+            prof.time("att_gate", || {
+                ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
+                sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
+                ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+                Ok(())
+            })?;
 
             // Value residual (layers > 0)
             if layer_idx > 0 {
                 if let (Some(v0), Some(v1), Some(v2)) =
                     (&layer.att.v0, &layer.att.v1, &layer.att.v2) {
-                    ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
-                    ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
-                    broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
-                    sigmoid_f32(&temp1, &mut temp2, stream)?;
-                    lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
-                    copy_tensor_f32(&temp1, &mut att_v, stream)?;
+                    prof.time("att_vres", || {
+                        ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
+                        ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
+                        broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
+                        sigmoid_f32(&temp1, &mut temp2, stream)?;
+                        lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
+                        copy_tensor_f32(&temp1, &mut att_v, stream)?;
+                        Ok(())
+                    })?;
                 }
             } else {
                 copy_tensor_f32(&att_v, &mut v_first, stream)?;
             }
 
             // L2 normalize k
-            broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
-            l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
+            prof.time("att_norm_k", || {
+                broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
+                l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
+                Ok(())
+            })?;
 
             // Control K
-            control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
+            prof.time("att_ctrl_k", || {
+                control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
+                Ok(())
+            })?;
 
             // WKV inputs
-            negate_f32(&att_kk, &mut wkv_a, stream)?;
-            mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
-            // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
-            // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
-            decay_exp_f32(&att_w, &mut w_decay, stream)?;
+            prof.time("att_wkv_in", || {
+                negate_f32(&att_kk, &mut wkv_a, stream)?;
+                mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
+                // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
+                // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
+                decay_exp_f32(&att_w, &mut w_decay, stream)?;
+                Ok(())
+            })?;
 
             // Reshape for WKV
             let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;
@@ -1795,75 +1917,117 @@ impl Rwkv7Hip {
             let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
             // Run masked WKV7 (skips state updates for padding positions)
-            wkv7_f32_masked(
-                &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
-                &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
-                &lens_gpu, stream
-            )?;
+            prof.time("wkv", || {
+                wkv7_f32_masked(
+                    &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
+                    &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
+                    &lens_gpu, stream
+                )?;
+                Ok(())
+            })?;
             std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
 
             // Group norm on WKV output
-            group_norm_f32(
-                &wkv_out, &layer.att.gn.weight, &layer.att.gn.bias,
-                &mut wkv_normed, n_head, 64e-5, stream
-            )?;
+            prof.time("wkv_norm", || {
+                group_norm_f32(
+                    &wkv_out, &layer.att.gn.weight, &layer.att.gn.bias,
+                    &mut wkv_normed, n_head, 64e-5, stream
+                )?;
+                Ok(())
+            })?;
 
             // WKV bonus
             let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
             let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
             let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
-            wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
+            prof.time("wkv_bonus", || {
+                wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
+                Ok(())
+            })?;
 
             // Combine and gate
-            add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
-            mul_f32(&temp1, &att_g, &mut temp2, stream)?;
+            prof.time("att_gate_out", || {
+                add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
+                mul_f32(&temp1, &att_g, &mut temp2, stream)?;
+                Ok(())
+            })?;
 
             // Output projection
-            ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+            prof.time("att_out", || {
+                ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+                Ok(())
+            })?;
 
             // Residual
-            add_f32(&x, &att_out, &mut temp1, stream)?;
-            copy_tensor_f32(&temp1, &mut x, stream)?;
+            prof.time("att_resid", || {
+                add_f32(&x, &att_out, &mut temp1, stream)?;
+                copy_tensor_f32(&temp1, &mut x, stream)?;
+                Ok(())
+            })?;
 
             // ==== Channel-Mix (FFN) ====
-            layer_norm_f32(
-                &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
-                &mut x_ln, 1e-5, stream
-            )?;
+            prof.time("ffn_ln", || {
+                layer_norm_f32(
+                    &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
+                    &mut x_ln, 1e-5, stream
+                )?;
+                Ok(())
+            })?;
 
             // Token shift for FFN - use masked kernel for correct state extraction
-            channel_mix_state_f32_masked(
-                &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
-                &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
-            )?;
+            prof.time("ffn_shift", || {
+                channel_mix_state_f32_masked(
+                    &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
+                    &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
+                )?;
+                Ok(())
+            })?;
 
             // Update FFN shift state - new_ffn_shift has correct state from masked kernel
             std::mem::swap(&mut new_ffn_shift, &mut ffn_shift_gpu[layer_idx]);
 
             // Key projection
-            ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+            prof.time("ffn_k", || {
+                ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+                Ok(())
+            })?;
 
             // Squared ReLU
-            squared_relu_f32(&ffn_k, &mut ffn_k_sq, stream)?;
+            prof.time("ffn_relu2", || {
+                squared_relu_f32(&ffn_k, &mut ffn_k_sq, stream)?;
+                Ok(())
+            })?;
 
             // Value projection
-            ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+            prof.time("ffn_v", || {
+                ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+                Ok(())
+            })?;
 
             // Residual
-            add_f32(&x, &ffn_out, &mut temp1, stream)?;
-            copy_tensor_f32(&temp1, &mut x, stream)?;
+            prof.time("ffn_resid", || {
+                add_f32(&x, &ffn_out, &mut temp1, stream)?;
+                copy_tensor_f32(&temp1, &mut x, stream)?;
+                Ok(())
+            })?;
         }
 
-        // ==== Output Head ====
-        layer_norm_f32(
-            &x, &self.head.ln.weight, &self.head.ln.bias,
-            &mut x_ln, 1e-5, stream
-        )?;
+        prof.time("head", || {
+            // ==== Output Head ====
+            layer_norm_f32(
+                &x, &self.head.ln.weight, &self.head.ln.bias,
+                &mut x_ln, 1e-5, stream
+            )?;
 
-        ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            Ok(())
+        })?;
 
-            // Download logits asynchronously (no sync)
-            logits.copy_to_slice_async(logits_dst.as_slice_mut(), stream)?;
+            prof.time("logits_download", || {
+                // Download logits asynchronously (no sync)
+                logits.copy_to_slice_async(logits_dst.as_slice_mut(), stream)?;
+                Ok(())
+            })?;
 
             Ok(())
         })();
@@ -1873,23 +2037,29 @@ impl Rwkv7Hip {
             scratch.ffn_state_gpu = ffn_shift_gpu;
             scratch.wkv_state_gpu = wkv_state_gpu;
         } else if result.is_ok() {
-            // Download state back to host using pinned async transfers
-            for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
-                unsafe {
-                    state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+            prof.time("state_download", || {
+                // Download state back to host using pinned async transfers
+                for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
+                    unsafe {
+                        state.att_shift_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                    }
                 }
-            }
-            for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
-                unsafe {
-                    state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
+                    unsafe {
+                        state.ffn_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                    }
                 }
-            }
-            for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
-                unsafe {
-                    state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
+                    unsafe {
+                        state.att_states[i].copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
+                    }
                 }
-            }
+                Ok(())
+            })?;
         }
+
+        #[cfg(feature = "hip-prof")]
+        prof.print(&format!("b={b} t={t} layers={n_layer}"));
 
         result
     }

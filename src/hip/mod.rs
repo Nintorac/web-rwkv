@@ -10,6 +10,7 @@ mod ffi;
 mod kernels;
 mod model;
 mod pinned;
+mod prof;
 mod runtime;
 mod scratch;
 mod tensor;
@@ -45,6 +46,7 @@ pub use buffer::{DeviceBuffer, MemoryType};
 
 // Re-export pinned memory types
 pub use pinned::PinnedBuffer;
+pub use prof::HipProf;
 
 // Re-export tensor types
 pub use tensor::{TensorShape, TensorView, TensorHip};

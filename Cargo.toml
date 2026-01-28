@@ -105,3 +105,5 @@ backtrace = []
 hip = []
 ## Enable HIP intermediate value probing for validation against ground truth fixtures.
 hip-probes = ["hip"]
+## Enable HIP profiling timers (guarded by feature flag).
+hip-prof = ["hip"]
