@@ -1373,6 +1373,10 @@
         sortDirection: 'desc'  // Sort by largest regressions first
     };
 
+    const lineChartState = {
+        scenario: 'prefill_uniform'
+    };
+
     /**
      * Render summary table view
      */
@@ -1520,15 +1524,33 @@
      * Sort table data by column
      */
     function sortTableData(data, column, direction) {
+        const numericColumns = new Set([
+            'batch_size',
+            'token_chunk_size',
+            'decode_steps',
+            'seq_len',
+            'decode_tok_per_s',
+            'prefill_tok_per_s',
+            'ttft_p50_ms',
+            'repeat_count',
+            'decode_total_ms',
+            'prefill_total_ms'
+        ]);
+
         const sorted = [...data];
 
         sorted.sort((a, b) => {
             let aVal = a[column];
             let bVal = b[column];
 
+            if (numericColumns.has(column)) {
+                aVal = aVal !== null && aVal !== undefined ? Number(aVal) : NaN;
+                bVal = bVal !== null && bVal !== undefined ? Number(bVal) : NaN;
+            }
+
             // Handle nulls
-            if (aVal === null || aVal === undefined) aVal = -Infinity;
-            if (bVal === null || bVal === undefined) bVal = -Infinity;
+            if (aVal === null || aVal === undefined || Number.isNaN(aVal)) aVal = -Infinity;
+            if (bVal === null || bVal === undefined || Number.isNaN(bVal)) bVal = -Infinity;
 
             // Numeric comparison for numbers, string for others
             let cmp;
@@ -2190,33 +2212,110 @@
 
     /**
      * Render line chart view using D3
-     * Displays tok/s vs seq_len for prefill-uniform data with multiple series
-     * Series are grouped by: batch_size + model_name + backend_id + token_chunk_size
+     * Displays scenario-specific line charts with series grouped by:
+     * batch_size + model_name + backend_id + token_chunk_size
      */
     function renderLineChart() {
         console.log('[dashboard] renderLineChart()');
 
-        // Get filtered data and filter to prefill_uniform scenario only
+        elements.viewContainer.innerHTML = '';
+
+        const container = document.createElement('div');
+        container.className = 'line-chart-container';
+
+        const tabs = document.createElement('div');
+        tabs.className = 'line-subtabs';
+
+        const scenarios = [
+            { id: 'prefill_uniform', label: 'Prefill' },
+            { id: 'prefill_mixed', label: 'Prefill Mixed' },
+            { id: 'decode_only', label: 'Decode' }
+        ];
+
+        scenarios.forEach(scenario => {
+            const btn = document.createElement('button');
+            btn.className = `line-subtab-btn ${lineChartState.scenario === scenario.id ? 'active' : ''}`;
+            btn.textContent = scenario.label;
+            btn.addEventListener('click', () => {
+                if (lineChartState.scenario === scenario.id) return;
+                lineChartState.scenario = scenario.id;
+                renderLineChart();
+            });
+            tabs.appendChild(btn);
+        });
+
+        const chartContainer = document.createElement('div');
+        chartContainer.className = 'line-chart-view';
+
+        container.appendChild(tabs);
+        container.appendChild(chartContainer);
+        elements.viewContainer.appendChild(container);
+
+        renderLineChartPlot(chartContainer, lineChartState.scenario);
+    }
+
+    function getLineChartConfig(scenario) {
+        switch (scenario) {
+            case 'decode_only':
+                return {
+                    scenario,
+                    title: 'Decode Throughput vs Steps',
+                    xKey: 'decode_steps',
+                    xLabel: 'Decode Steps',
+                    xType: 'numeric',
+                    yKey: 'decode_tok_per_s',
+                    yLabel: 'Decode tok/s',
+                    yUnit: 'tok/s'
+                };
+            case 'prefill_mixed':
+                return {
+                    scenario,
+                    title: 'Prefill Mixed Throughput by Case',
+                    xKey: 'mixed_case_id',
+                    xLabel: 'Mixed Case',
+                    xType: 'categorical',
+                    yKey: 'prefill_tok_per_s',
+                    yLabel: 'Prefill tok/s',
+                    yUnit: 'tok/s'
+                };
+            default:
+                return {
+                    scenario: 'prefill_uniform',
+                    title: 'Prefill Throughput vs Sequence Length',
+                    xKey: 'seq_len',
+                    xLabel: 'Seq Length',
+                    xType: 'numeric',
+                    yKey: 'prefill_tok_per_s',
+                    yLabel: 'Prefill tok/s',
+                    yUnit: 'tok/s',
+                    xFormatter: formatSeqLen
+                };
+        }
+    }
+
+    function renderLineChartPlot(container, scenario) {
+        const config = getLineChartConfig(scenario);
+
+        // Get filtered data and filter to target scenario only
         const allFiltered = applyFilters();
-        const filtered = allFiltered.filter(m => m.scenario === 'prefill_uniform');
+        const filtered = allFiltered.filter(m => m.scenario === config.scenario);
 
         if (filtered.length === 0) {
-            elements.viewContainer.innerHTML = `
+            container.innerHTML = `
                 <div class="empty-state">
-                    <p>No prefill-uniform data available</p>
-                    <p class="empty-hint">Load benchmark data with prefill_uniform scenario or adjust filters</p>
+                    <p>No ${config.scenario.replace('_', ' ')} data available</p>
+                    <p class="empty-hint">Load benchmark data for this scenario or adjust filters</p>
                 </div>
             `;
             return;
         }
 
-        // Check if we have seq_len data
-        const seqLens = [...new Set(filtered.map(m => m.seq_len))].filter(v => v != null).sort((a, b) => a - b);
-        if (seqLens.length === 0) {
-            elements.viewContainer.innerHTML = `
+        const xValues = [...new Set(filtered.map(m => m[config.xKey]).filter(v => v != null))];
+        if (xValues.length === 0) {
+            container.innerHTML = `
                 <div class="empty-state">
                     <p>Insufficient data for line chart</p>
-                    <p class="empty-hint">Need seq_len values in data</p>
+                    <p class="empty-hint">Need ${config.xKey} values in data</p>
                 </div>
             `;
             return;
@@ -2225,7 +2324,9 @@
         // Group data by series key: batch_size + model_name + backend_id + chunk_size
         const seriesMap = new Map();
         filtered.forEach(m => {
-            if (m.seq_len == null || m.prefill_tok_per_s == null) return;
+            const xValue = m[config.xKey];
+            const yValue = m[config.yKey];
+            if (xValue == null || yValue == null) return;
 
             const chunkSize = m.token_chunk_size_effective || m.token_chunk_size_requested || m.token_chunk_size;
             const seriesKey = `${m.batch_size || '?'}|${m.model_name || '?'}|${m.backend_id || '?'}|${chunkSize || '?'}`;
@@ -2235,36 +2336,42 @@
                     key: seriesKey,
                     batch_size: m.batch_size,
                     model_name: m.model_name,
+                    model_size: m.model_size,
                     backend_id: m.backend_id,
                     token_chunk_size: chunkSize,
-                    points: new Map()  // seq_len -> [values]
+                    points: new Map()  // xKey -> [values]
                 });
             }
 
             const series = seriesMap.get(seriesKey);
-            if (!series.points.has(m.seq_len)) {
-                series.points.set(m.seq_len, []);
+            if (!series.points.has(xValue)) {
+                series.points.set(xValue, []);
             }
-            series.points.get(m.seq_len).push(m.prefill_tok_per_s);
+            series.points.get(xValue).push(yValue);
         });
 
         // Convert to array format with averaged points
         const seriesData = [];
         seriesMap.forEach((series, key) => {
             const points = [];
-            series.points.forEach((values, seq_len) => {
+            series.points.forEach((values, xValue) => {
                 const avg = values.reduce((a, b) => a + b, 0) / values.length;
-                points.push({ seq_len, value: avg, count: values.length });
+                points.push({ x: xValue, value: avg, count: values.length });
             });
 
-            // Sort points by seq_len for proper line drawing
-            points.sort((a, b) => a.seq_len - b.seq_len);
+            // Sort points for proper line drawing
+            if (config.xType === 'numeric') {
+                points.sort((a, b) => a.x - b.x);
+            } else {
+                points.sort((a, b) => String(a.x).localeCompare(String(b.x)));
+            }
 
             if (points.length > 0) {
                 seriesData.push({
                     key: key,
                     batch_size: series.batch_size,
                     model_name: series.model_name,
+                    model_size: series.model_size,
                     backend_id: series.backend_id,
                     token_chunk_size: series.token_chunk_size,
                     points: points
@@ -2273,34 +2380,37 @@
         });
 
         if (seriesData.length === 0) {
-            elements.viewContainer.innerHTML = `
+            container.innerHTML = `
                 <div class="empty-state">
                     <p>No valid data points for line chart</p>
-                    <p class="empty-hint">Check that data has seq_len and prefill_tok_per_s values</p>
+                    <p class="empty-hint">Check that data has ${config.xKey} and ${config.yKey} values</p>
                 </div>
             `;
             return;
         }
 
-        // Render the line chart
-        renderLineChartSVG(seriesData, seqLens);
+        const orderedX = config.xType === 'numeric'
+            ? xValues.sort((a, b) => a - b)
+            : xValues.sort((a, b) => String(a).localeCompare(String(b)));
+
+        renderLineChartSVG(container, seriesData, orderedX, config);
     }
 
     /**
      * Render line chart SVG using D3
      */
-    function renderLineChartSVG(seriesData, allSeqLens) {
+    function renderLineChartSVG(container, seriesData, xValues, config) {
         // Clear container
-        elements.viewContainer.innerHTML = '';
+        container.innerHTML = '';
 
         // Create wrapper div
         const wrapper = document.createElement('div');
         wrapper.className = 'line-chart-wrapper';
-        elements.viewContainer.appendChild(wrapper);
+        container.appendChild(wrapper);
 
         // Dimensions
         const margin = { top: 40, right: 200, bottom: 60, left: 80 };
-        const containerWidth = elements.viewContainer.clientWidth || 900;
+        const containerWidth = container.clientWidth || 900;
         const width = Math.max(500, containerWidth - margin.left - margin.right);
         const height = 400;
 
@@ -2320,8 +2430,10 @@
 
         seriesData.forEach(series => {
             series.points.forEach(pt => {
-                if (pt.seq_len < minSeqLen) minSeqLen = pt.seq_len;
-                if (pt.seq_len > maxSeqLen) maxSeqLen = pt.seq_len;
+                if (config.xType === 'numeric') {
+                    if (pt.x < minSeqLen) minSeqLen = pt.x;
+                    if (pt.x > maxSeqLen) maxSeqLen = pt.x;
+                }
                 if (pt.value < minValue) minValue = pt.value;
                 if (pt.value > maxValue) maxValue = pt.value;
             });
@@ -2333,9 +2445,14 @@
         maxValue = maxValue + valuePadding;
 
         // X scale (seq_len) - linear scale
-        const xScale = d3.scaleLinear()
-            .domain([minSeqLen, maxSeqLen])
-            .range([0, width]);
+        const xScale = config.xType === 'numeric'
+            ? d3.scaleLinear()
+                .domain([minSeqLen, maxSeqLen])
+                .range([0, width])
+            : d3.scalePoint()
+                .domain(xValues)
+                .range([0, width])
+                .padding(0.5);
 
         // Y scale (tok/s) - linear scale
         const yScale = d3.scaleLinear()
@@ -2364,7 +2481,7 @@
 
         // Line generator
         const lineGenerator = d3.line()
-            .x(d => xScale(d.seq_len))
+            .x(d => xScale(d.x))
             .y(d => yScale(d.value))
             .defined(d => d.value != null);
 
@@ -2387,14 +2504,14 @@
                 .enter()
                 .append('circle')
                 .attr('class', `line-chart-point line-chart-point-${idx}`)
-                .attr('cx', d => xScale(d.seq_len))
+                .attr('cx', d => xScale(d.x))
                 .attr('cy', d => yScale(d.value))
                 .attr('r', 4)
                 .attr('fill', color)
                 .attr('stroke', 'var(--bg-secondary)')
                 .attr('stroke-width', 1.5)
                 .on('mouseover', function(event, d) {
-                    showLineChartTooltip(event, d, series);
+                    showLineChartTooltip(event, d, series, config);
                     d3.select(this).attr('r', 6);
                 })
                 .on('mouseout', function() {
@@ -2404,13 +2521,16 @@
         });
 
         // X axis
+        const xAxisBuilder = config.xType === 'numeric'
+            ? d3.axisBottom(xScale)
+                .tickValues(xValues)
+                .tickFormat(config.xFormatter || (d => d.toString()))
+            : d3.axisBottom(xScale);
+
         const xAxis = g.append('g')
             .attr('class', 'axis x-axis')
             .attr('transform', `translate(0,${height})`)
-            .call(d3.axisBottom(xScale)
-                .ticks(8)
-                .tickFormat(d => formatSeqLen(d))
-            );
+            .call(xAxisBuilder);
 
         // X axis label
         g.append('text')
@@ -2418,14 +2538,14 @@
             .attr('x', width / 2)
             .attr('y', height + 45)
             .attr('text-anchor', 'middle')
-            .text('Sequence Length');
+            .text(config.xLabel);
 
         // Y axis
         const yAxis = g.append('g')
             .attr('class', 'axis y-axis')
             .call(d3.axisLeft(yScale)
                 .ticks(6)
-                .tickFormat(d => formatThroughput(d))
+                .tickFormat(d => formatMetricValue(d, config))
             );
 
         // Y axis label
@@ -2435,7 +2555,7 @@
             .attr('x', -height / 2)
             .attr('y', -55)
             .attr('text-anchor', 'middle')
-            .text('Throughput (tok/s)');
+            .text(config.yLabel);
 
         // Title
         svg.append('text')
@@ -2443,7 +2563,7 @@
             .attr('x', margin.left + width / 2)
             .attr('y', 20)
             .attr('text-anchor', 'middle')
-            .text('Prefill Throughput vs Sequence Length');
+            .text(config.title);
 
         // Legend
         renderLineChartLegend(svg, seriesData, colorScale, width + margin.left + 20, margin.top);
@@ -2457,6 +2577,24 @@
     function formatSeqLen(value) {
         if (value >= 1000) {
             return (value / 1000).toFixed(value % 1000 === 0 ? 0 : 1) + 'K';
+        }
+        return value.toString();
+    }
+
+    function formatLineChartXValue(value, config) {
+        if (config.xFormatter && config.xType === 'numeric') {
+            return config.xFormatter(value);
+        }
+        return value != null ? value.toString() : '--';
+    }
+
+    function formatMetricValue(value, config) {
+        if (value == null) return '--';
+        if (config.yUnit === 'tok/s') {
+            return formatThroughput(value);
+        }
+        if (config.yUnit === 'ms') {
+            return `${value.toFixed(2)} ms`;
         }
         return value.toString();
     }
@@ -2513,6 +2651,7 @@
      */
     function buildSeriesLabel(series) {
         const parts = [];
+        if (series.model_size) parts.push(series.model_size);
         if (series.batch_size != null) parts.push(`bs=${series.batch_size}`);
         if (series.backend_id) {
             const shortBackend = series.backend_id.length > 8
@@ -2530,6 +2669,7 @@
     function buildSeriesLabelFull(series) {
         const parts = [];
         if (series.model_name) parts.push(`Model: ${series.model_name}`);
+        if (series.model_size) parts.push(`Size: ${series.model_size}`);
         if (series.backend_id) parts.push(`Backend: ${series.backend_id}`);
         if (series.batch_size != null) parts.push(`Batch: ${series.batch_size}`);
         if (series.token_chunk_size != null) parts.push(`Chunk: ${series.token_chunk_size}`);
@@ -2539,7 +2679,7 @@
     /**
      * Show tooltip for line chart point
      */
-    function showLineChartTooltip(event, point, series) {
+    function showLineChartTooltip(event, point, series, config) {
         // Remove existing tooltip
         hideLineChartTooltip();
 
@@ -2547,8 +2687,8 @@
         tooltip.className = 'line-chart-tooltip';
         tooltip.innerHTML = `
             <div class="tooltip-header">${escapeHtml(buildSeriesLabelFull(series))}</div>
-            <div class="tooltip-row"><strong>Seq Length:</strong> ${formatSeqLen(point.seq_len)}</div>
-            <div class="tooltip-row"><strong>Throughput:</strong> ${formatThroughput(point.value)} tok/s</div>
+            <div class="tooltip-row"><strong>${escapeHtml(config.xLabel)}:</strong> ${formatLineChartXValue(point.x, config)}</div>
+            <div class="tooltip-row"><strong>${escapeHtml(config.yLabel)}:</strong> ${formatMetricValue(point.value, config)}</div>
             <div class="tooltip-row"><strong>Samples:</strong> ${point.count}</div>
         `;
 
