@@ -859,6 +859,291 @@ body {
     font-family: var(--font-mono);
 }
 
+/* ==============================================
+   Run Comparison View Styles
+   ============================================== */
+
+/* Compare controls container */
+.compare-controls {
+    margin-bottom: var(--space-lg);
+    padding: var(--space-md);
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+}
+
+/* Run selectors row */
+.compare-selectors {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-lg);
+    margin-bottom: var(--space-md);
+}
+
+.compare-selector {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    flex: 1;
+    min-width: 200px;
+}
+
+.compare-selector label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.compare-select {
+    padding: var(--space-sm) var(--space-md);
+    font-size: 13px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    background-color: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.compare-select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-subtle);
+}
+
+.compare-arrow {
+    font-size: 24px;
+    color: var(--text-muted);
+    padding-bottom: var(--space-sm);
+}
+
+/* Compare options row */
+.compare-options {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+}
+
+.threshold-control {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.threshold-control label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+
+.threshold-input {
+    width: 60px;
+    padding: var(--space-xs) var(--space-sm);
+    font-size: 13px;
+    font-family: var(--font-mono);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    background-color: var(--bg-secondary);
+    text-align: right;
+}
+
+.threshold-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+/* Compare legend */
+.compare-legend {
+    display: flex;
+    gap: var(--space-md);
+    font-size: 12px;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    color: var(--text-secondary);
+}
+
+.regression-legend {
+    color: var(--error);
+}
+
+.improvement-legend {
+    color: var(--success);
+}
+
+.unchanged-legend {
+    color: var(--text-muted);
+}
+
+/* Compare placeholder */
+.compare-placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 200px;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+/* Compare summary stats */
+.compare-summary {
+    display: flex;
+    gap: var(--space-lg);
+    padding: var(--space-md);
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    margin-bottom: var(--space-lg);
+}
+
+.summary-stat {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+}
+
+.summary-stat .summary-label {
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+}
+
+.summary-stat .summary-value {
+    font-size: 18px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+}
+
+.summary-stat.regression .summary-value {
+    color: var(--error);
+}
+
+.summary-stat.improvement .summary-value {
+    color: var(--success);
+}
+
+.summary-stat .summary-value.regression {
+    color: var(--error);
+}
+
+.summary-stat .summary-value.improvement {
+    color: var(--success);
+}
+
+/* Compare section */
+.compare-section {
+    margin-bottom: var(--space-lg);
+}
+
+.compare-section h3 {
+    margin: 0 0 var(--space-md);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Compare table specific styles */
+.compare-table {
+    min-width: 800px;
+}
+
+.compare-table th.sort-active {
+    background-color: var(--accent-subtle);
+    color: var(--accent);
+}
+
+/* Row highlighting for regressions and improvements */
+.compare-table tbody tr.row-regression {
+    background-color: rgba(220, 38, 38, 0.05);
+}
+
+.compare-table tbody tr.row-regression:hover {
+    background-color: rgba(220, 38, 38, 0.1);
+}
+
+.compare-table tbody tr.row-improvement {
+    background-color: rgba(22, 163, 74, 0.05);
+}
+
+.compare-table tbody tr.row-improvement:hover {
+    background-color: rgba(22, 163, 74, 0.1);
+}
+
+/* Delta cell styling */
+.delta-regression {
+    color: var(--error);
+    font-weight: 600;
+}
+
+.delta-improvement {
+    color: var(--success);
+    font-weight: 600;
+}
+
+.delta-unchanged {
+    color: var(--text-muted);
+}
+
+.change-indicator {
+    margin-right: var(--space-xs);
+}
+
+/* Unmatched cases section */
+.compare-unmatched {
+    display: flex;
+    gap: var(--space-lg);
+    flex-wrap: wrap;
+    margin-top: var(--space-lg);
+}
+
+.unmatched-section {
+    flex: 1;
+    min-width: 250px;
+    padding: var(--space-md);
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+}
+
+.unmatched-section h4 {
+    margin: 0 0 var(--space-sm);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.unmatched-list {
+    margin: 0;
+    padding: 0 0 0 var(--space-md);
+    font-size: 12px;
+    color: var(--text-secondary);
+    list-style-type: disc;
+}
+
+.unmatched-item {
+    padding: var(--space-xs) 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    word-break: break-all;
+}
+
+.unmatched-more {
+    padding: var(--space-xs) 0;
+    color: var(--text-muted);
+    font-style: italic;
+    list-style-type: none;
+}
+
 /* Responsive adjustments */
 @media (max-width: 768px) {
     .main-container {
@@ -876,5 +1161,25 @@ body {
 
     .view-tabs {
         overflow-x: auto;
+    }
+
+    .compare-selectors {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .compare-arrow {
+        text-align: center;
+        transform: rotate(90deg);
+        padding: var(--space-xs) 0;
+    }
+
+    .compare-summary {
+        flex-wrap: wrap;
+        gap: var(--space-md);
+    }
+
+    .compare-unmatched {
+        flex-direction: column;
     }
 }
