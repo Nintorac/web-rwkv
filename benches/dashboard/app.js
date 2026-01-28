@@ -71,6 +71,7 @@
         // Set up event listeners
         setupDropZone();
         setupTabs();
+        setupExportButton();
 
         console.log('[dashboard] Initialization complete');
     }
@@ -90,7 +91,8 @@
                 cases: document.getElementById('stat-cases'),
                 backends: document.getElementById('stat-backends'),
                 models: document.getElementById('stat-models')
-            }
+            },
+            exportBtn: document.getElementById('export-btn')
         };
     }
 
@@ -157,6 +159,102 @@
         });
 
         console.log('[dashboard] View tabs configured');
+    }
+
+    /**
+     * Set up export button
+     */
+    function setupExportButton() {
+        const exportBtn = elements.exportBtn;
+        if (!exportBtn) {
+            console.warn('[dashboard] Export button not found');
+            return;
+        }
+
+        exportBtn.addEventListener('click', () => {
+            exportToJsonl();
+        });
+
+        console.log('[dashboard] Export button configured');
+    }
+
+    /**
+     * Export filtered data as JSONL file
+     * Format: run headers first (deduplicated), then measure records
+     */
+    function exportToJsonl() {
+        console.log('[dashboard] Exporting filtered data to JSONL');
+
+        // Get filtered measures
+        const filteredMeasures = applyFilters();
+
+        if (filteredMeasures.length === 0) {
+            console.warn('[dashboard] No data to export');
+            alert('No data to export. Adjust filters or load benchmark data first.');
+            return;
+        }
+
+        // Collect unique run_ids from filtered measures
+        const runIds = new Set(filteredMeasures.map(m => m.run_id).filter(Boolean));
+
+        // Get corresponding run headers (deduplicated)
+        const runHeaders = state.data.runs.filter(run => runIds.has(run.run_id));
+
+        // Build JSONL content: run headers first, then measures
+        const lines = [];
+
+        // Add run headers (without internal tracking fields)
+        runHeaders.forEach(run => {
+            // Create a clean copy without internal fields
+            const cleanRun = { ...run };
+            lines.push(JSON.stringify(cleanRun));
+        });
+
+        // Add measure records (without internal tracking fields)
+        filteredMeasures.forEach(measure => {
+            // Create a clean copy without internal fields (e.g., _sourceFile)
+            const cleanMeasure = {};
+            for (const [key, value] of Object.entries(measure)) {
+                if (!key.startsWith('_')) {
+                    cleanMeasure[key] = value;
+                }
+            }
+            lines.push(JSON.stringify(cleanMeasure));
+        });
+
+        const jsonlContent = lines.join('\n') + '\n';
+
+        // Generate filename with timestamp
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const filename = `export-${timestamp}.jsonl`;
+
+        // Trigger download
+        downloadFile(jsonlContent, filename, 'application/x-ndjson');
+
+        console.log(`[dashboard] Exported ${runHeaders.length} run headers and ${filteredMeasures.length} measures to ${filename}`);
+    }
+
+    /**
+     * Trigger browser download of a file
+     * @param {string} content - File content
+     * @param {string} filename - Suggested filename
+     * @param {string} mimeType - MIME type of the file
+     */
+    function downloadFile(content, filename, mimeType) {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+
+        document.body.appendChild(a);
+        a.click();
+
+        // Cleanup
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
     }
 
     /**
@@ -942,6 +1040,9 @@
             case 'line':
                 renderLineChart();
                 break;
+            case 'distribution':
+                renderDistribution();
+                break;
             case 'compare':
                 renderCompare();
                 break;
@@ -979,6 +1080,11 @@
         elements.stats.backends.textContent = uniqueBackends.size;
         elements.stats.models.textContent = uniqueModels.size;
 
+        // Enable/disable export button based on data availability
+        if (elements.exportBtn) {
+            elements.exportBtn.disabled = measures.length === 0;
+        }
+
         console.log(`[dashboard] Stats updated: ${runs.length} runs, ${measures.length} cases, ${uniqueBackends.size} backends, ${uniqueModels.size} models`);
     }
 
@@ -987,6 +1093,15 @@
         sortColumn: 'decode_tok_per_s',  // Default sort by throughput
         sortDirection: 'desc',            // desc = highest first
         selectedRow: null                 // Currently selected row for detail view
+    };
+
+    // Compare view state
+    const compareState = {
+        baseRun: null,         // run_id of the baseline run (older)
+        compareRun: null,      // run_id of the run to compare (newer)
+        threshold: 5,          // Regression threshold percentage (highlight regressions >= this)
+        sortColumn: 'delta_pct',
+        sortDirection: 'desc'  // Sort by largest regressions first
     };
 
     /**
@@ -1871,6 +1986,8 @@
             onFiltersChanged();
         },
         clearAllFilters: clearAllFilters,
+        // Export API
+        exportToJsonl: exportToJsonl,
         version: '0.1'
     };
 

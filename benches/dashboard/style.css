@@ -372,6 +372,41 @@ body {
     color: var(--text-primary);
 }
 
+/* Export button in stats bar */
+.stat-item-export {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+}
+
+.export-btn {
+    padding: var(--space-sm) var(--space-md);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.export-btn:hover:not(:disabled) {
+    background-color: var(--accent-subtle);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.export-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.export-btn:active:not(:disabled) {
+    background-color: var(--accent);
+    color: white;
+}
+
 /* View tabs */
 .view-tabs {
     display: flex;
