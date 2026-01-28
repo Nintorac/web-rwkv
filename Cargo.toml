@@ -78,6 +78,7 @@ memmap2 = "0.9"
 ndarray = "0.16"
 ndarray-npy = "0.9"
 ratatui = { version = "0.30", features = ["all-widgets"] }
+serde_yaml = "0.9"
 simple_logger = { version = "5.1", features = ["stderr"] }
 tokio = { version = "1.41", features = ["full"] }
 
