@@ -763,9 +763,38 @@ impl<'a> SweepExecutor<'a> {
     }
 
     /// Record that a case resulted in an error.
+    ///
+    /// This increments the error counter in both the summary and the limits tracker.
+    /// Use this when a benchmark case fails and you want to continue with the sweep.
+    ///
+    /// Note: This method only updates counters. To write an error record to JSONL,
+    /// use the JSONL writer directly.
     pub fn record_error(&mut self) {
         self.summary.error_cases += 1;
         self.engine.limits_tracker_mut().record_error();
+    }
+
+    /// Record that a case was executed and resulted in an error.
+    ///
+    /// This is a convenience method that combines `record_executed` and `record_error`.
+    /// It also marks the case as executed (for total count) before recording the error.
+    ///
+    /// Use this when:
+    /// 1. You attempted to run a case
+    /// 2. It failed with an error
+    /// 3. You want to continue with the next case (continue-on-error policy)
+    ///
+    /// # Usage
+    ///
+    /// In a typical benchmark loop:
+    /// 1. Call `next_case()` to get the next case
+    /// 2. Attempt to run the benchmark
+    /// 3. On success: write success record, call `record_executed()`
+    /// 4. On error: classify error, write error record, call `record_executed_error()`
+    /// 5. Loop continues to next case (continue-on-error policy)
+    pub fn record_executed_error(&mut self) {
+        self.record_executed();
+        self.record_error();
     }
 
     /// Check if execution should stop due to limits.

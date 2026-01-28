@@ -11,6 +11,7 @@
 //! - JSONL writer for benchmark output with append-only semantics
 //! - Prefill-uniform scenario with length sets and TTFT tracking
 //! - Prefill-mixed named case patterns for mixed-batch benchmarks
+//! - Error classification for continue-on-error policy
 //!
 //! # Sweep Execution
 //!
@@ -59,6 +60,21 @@
 //! let lengths = target_mode_lengths(128, 4); // chunk=128, batch=4
 //! ```
 //!
+//! # Error Handling
+//!
+//! The benchmark runner uses a continue-on-error policy by default:
+//!
+//! ```rust,ignore
+//! use web_rwkv_bench::error::{BenchError, classify_error, ErrorContext};
+//! use web_rwkv_bench::jsonl::{ErrorKind, Status};
+//!
+//! // When a benchmark case fails, classify the error
+//! let error = BenchError::OutOfMemory { message: "allocation failed".to_string() };
+//! let (kind, message) = classify_error(&error);
+//!
+//! // Write a status=error record to JSONL (see jsonl module for full example)
+//! ```
+//!
 //! # Prefill-Mixed Patterns
 //!
 //! The `prefill_mixed` module provides deterministic length vector generation for
@@ -73,6 +89,7 @@
 //! ```
 
 pub mod config;
+pub mod error;
 pub mod jsonl;
 pub mod metadata;
 pub mod prefill_mixed;
@@ -81,6 +98,7 @@ pub mod skip;
 pub mod sweep;
 
 pub use config::{CustomRule, Limits, SkipConditions};
+pub use error::{classify_error, classify_error_message, BenchError, BenchResult, ErrorContext};
 pub use jsonl::{
     generate_case_id, generate_run_id, generate_timestamp_utc, round_chunk_size,
     CaseIdParams, CaseIdentity, DecodeMetrics, ErrorKind, GpuInfo as JsonlGpuInfo,

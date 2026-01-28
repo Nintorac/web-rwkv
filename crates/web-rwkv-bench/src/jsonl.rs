@@ -682,6 +682,48 @@ impl JsonlWriter {
         Ok(())
     }
 
+    /// Write an error record for a failed benchmark case.
+    ///
+    /// This is a convenience method that creates a MeasureRecord with status=error
+    /// and the appropriate error_kind and error_message fields.
+    ///
+    /// # Arguments
+    ///
+    /// * `run_id` - The run identifier (should match the run header)
+    /// * `case_id` - The case identifier
+    /// * `repeat_index` - Which repeat attempt this is (0-indexed)
+    /// * `scenario` - The benchmark scenario type
+    /// * `case_identity` - Model/backend configuration details
+    /// * `scenario_params` - Scenario-specific parameters
+    /// * `error_kind` - The classified error type
+    /// * `error_message` - Human-readable error description
+    pub fn write_error(
+        &mut self,
+        run_id: &str,
+        case_id: &str,
+        repeat_index: u32,
+        scenario: Scenario,
+        case_identity: CaseIdentity,
+        scenario_params: ScenarioParams,
+        error_kind: ErrorKind,
+        error_message: String,
+    ) -> JsonlResult<()> {
+        let record = MeasureRecord {
+            run_id: run_id.to_string(),
+            case_id: case_id.to_string(),
+            repeat_index,
+            scenario,
+            status: Status::Error,
+            error_kind: Some(error_kind),
+            error_message: Some(error_message),
+            case_identity,
+            scenario_params,
+            metrics: None,
+        };
+
+        self.write_measure(&record)
+    }
+
     /// Get the number of records written so far.
     pub fn records_written(&self) -> u64 {
         self.records_written
