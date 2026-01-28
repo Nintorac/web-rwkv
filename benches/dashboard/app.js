@@ -2316,17 +2316,945 @@
     }
 
     /**
+     * Render distribution view (box plots) for prefill-mixed TTFT data
+     * Shows TTFT distribution per mixed_case_id with min, p50 (median), max
+     */
+    function renderDistribution() {
+        console.log('[dashboard] renderDistribution()');
+
+        // Get filtered data and filter to prefill_mixed scenario only
+        const allFiltered = applyFilters();
+        const filtered = allFiltered.filter(m => m.scenario === 'prefill_mixed');
+
+        if (filtered.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>No prefill-mixed data available</p>
+                    <p class="empty-hint">Load benchmark data with prefill_mixed scenario or adjust filters</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Group data by mixed_case_id and collect TTFT arrays
+        const distributionData = aggregateDistributionData(filtered);
+
+        if (distributionData.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>No TTFT distribution data available</p>
+                    <p class="empty-hint">Data must include ttft_ms_local arrays or TTFT summary stats</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Render the box plot chart
+        renderDistributionSVG(distributionData);
+    }
+
+    /**
+     * Aggregate distribution data from prefill_mixed measures
+     * Groups by mixed_case_id and collects all TTFT values
+     * @param {Array} measures - Filtered prefill_mixed measures
+     * @returns {Array} Array of distribution data objects per mixed_case_id
+     */
+    function aggregateDistributionData(measures) {
+        // Group by mixed_case_id
+        const byCase = new Map();
+
+        measures.forEach(m => {
+            const caseId = m.mixed_case_id;
+            if (!caseId) return;
+
+            if (!byCase.has(caseId)) {
+                byCase.set(caseId, {
+                    mixed_case_id: caseId,
+                    ttft_values: [],
+                    model_name: m.model_name,
+                    backend_id: m.backend_id,
+                    batch_size: m.batch_size,
+                    token_chunk_size: m.token_chunk_size_effective || m.token_chunk_size_requested,
+                    count: 0
+                });
+            }
+
+            const entry = byCase.get(caseId);
+            entry.count++;
+
+            // Collect TTFT values from the array if present
+            if (Array.isArray(m.ttft_ms_local)) {
+                entry.ttft_values.push(...m.ttft_ms_local);
+            } else if (m.ttft_min_ms != null && m.ttft_p50_ms != null && m.ttft_max_ms != null) {
+                // If we don't have the raw array, use the summary stats
+                // This is a fallback - we'll reconstruct approximate values
+                entry.ttft_values.push(m.ttft_min_ms, m.ttft_p50_ms, m.ttft_max_ms);
+            }
+        });
+
+        // Compute statistics for each case
+        const distributionData = [];
+        byCase.forEach((entry, caseId) => {
+            if (entry.ttft_values.length === 0) return;
+
+            // Sort values for percentile calculations
+            const sorted = [...entry.ttft_values].sort((a, b) => a - b);
+
+            // Compute statistics
+            const stats = {
+                mixed_case_id: caseId,
+                model_name: entry.model_name,
+                backend_id: entry.backend_id,
+                batch_size: entry.batch_size,
+                token_chunk_size: entry.token_chunk_size,
+                count: entry.count,
+                n_values: sorted.length,
+                min: sorted[0],
+                q1: calcPercentile(sorted, 25),
+                median: calcPercentile(sorted, 50),
+                q3: calcPercentile(sorted, 75),
+                max: sorted[sorted.length - 1],
+                values: sorted  // Keep for potential violin/jitter
+            };
+
+            distributionData.push(stats);
+        });
+
+        // Sort by mixed_case_id for consistent ordering
+        distributionData.sort((a, b) => a.mixed_case_id.localeCompare(b.mixed_case_id));
+
+        console.log(`[dashboard] Distribution data: ${distributionData.length} cases with TTFT data`);
+        return distributionData;
+    }
+
+    /**
+     * Calculate percentile from sorted array
+     * @param {Array} sorted - Sorted array of numbers
+     * @param {number} p - Percentile (0-100)
+     * @returns {number} Percentile value
+     */
+    function calcPercentile(sorted, p) {
+        if (sorted.length === 0) return 0;
+        if (sorted.length === 1) return sorted[0];
+
+        const index = (p / 100) * (sorted.length - 1);
+        const lower = Math.floor(index);
+        const upper = Math.ceil(index);
+        const fraction = index - lower;
+
+        if (lower === upper) {
+            return sorted[lower];
+        }
+
+        return sorted[lower] * (1 - fraction) + sorted[upper] * fraction;
+    }
+
+    /**
+     * Render distribution box plots using D3
+     * @param {Array} data - Distribution data objects
+     */
+    function renderDistributionSVG(data) {
+        // Clear container
+        elements.viewContainer.innerHTML = '';
+
+        // Create wrapper div
+        const wrapper = document.createElement('div');
+        wrapper.className = 'distribution-wrapper';
+        elements.viewContainer.appendChild(wrapper);
+
+        // Dimensions
+        const margin = { top: 50, right: 40, bottom: 100, left: 80 };
+        const containerWidth = elements.viewContainer.clientWidth || 800;
+        const width = Math.min(containerWidth - margin.left - margin.right, 900);
+        const boxWidth = Math.min(60, Math.max(20, (width - 40) / data.length - 10));
+        const height = 400;
+
+        // Create SVG
+        const svg = d3.select(wrapper)
+            .append('svg')
+            .attr('width', width + margin.left + margin.right)
+            .attr('height', height + margin.top + margin.bottom)
+            .attr('class', 'distribution-svg');
+
+        const g = svg.append('g')
+            .attr('transform', `translate(${margin.left},${margin.top})`);
+
+        // X scale (categorical: mixed_case_id)
+        const xScale = d3.scaleBand()
+            .domain(data.map(d => d.mixed_case_id))
+            .range([0, width])
+            .padding(0.3);
+
+        // Y scale (TTFT ms)
+        const allValues = data.flatMap(d => [d.min, d.max]);
+        const yMin = Math.min(...allValues) * 0.9;
+        const yMax = Math.max(...allValues) * 1.1;
+
+        const yScale = d3.scaleLinear()
+            .domain([yMin, yMax])
+            .range([height, 0])
+            .nice();
+
+        // Draw box plots
+        data.forEach(d => {
+            const x = xScale(d.mixed_case_id) + xScale.bandwidth() / 2;
+            const boxHalfWidth = boxWidth / 2;
+
+            // Vertical line (whisker) from min to max
+            g.append('line')
+                .attr('class', 'boxplot-whisker')
+                .attr('x1', x)
+                .attr('x2', x)
+                .attr('y1', yScale(d.min))
+                .attr('y2', yScale(d.max))
+                .attr('stroke', 'var(--text-secondary)')
+                .attr('stroke-width', 1);
+
+            // Min whisker cap
+            g.append('line')
+                .attr('class', 'boxplot-cap')
+                .attr('x1', x - boxHalfWidth * 0.5)
+                .attr('x2', x + boxHalfWidth * 0.5)
+                .attr('y1', yScale(d.min))
+                .attr('y2', yScale(d.min))
+                .attr('stroke', 'var(--text-secondary)')
+                .attr('stroke-width', 1);
+
+            // Max whisker cap
+            g.append('line')
+                .attr('class', 'boxplot-cap')
+                .attr('x1', x - boxHalfWidth * 0.5)
+                .attr('x2', x + boxHalfWidth * 0.5)
+                .attr('y1', yScale(d.max))
+                .attr('y2', yScale(d.max))
+                .attr('stroke', 'var(--text-secondary)')
+                .attr('stroke-width', 1);
+
+            // Box (Q1 to Q3)
+            const boxTop = yScale(d.q3);
+            const boxBottom = yScale(d.q1);
+            const boxHeight = boxBottom - boxTop;
+
+            g.append('rect')
+                .attr('class', 'boxplot-box')
+                .attr('x', x - boxHalfWidth)
+                .attr('y', boxTop)
+                .attr('width', boxWidth)
+                .attr('height', Math.max(1, boxHeight))
+                .attr('fill', 'var(--accent-subtle)')
+                .attr('stroke', 'var(--accent)')
+                .attr('stroke-width', 1.5)
+                .on('mouseover', function(event) {
+                    showDistributionTooltip(event, d);
+                })
+                .on('mouseout', hideDistributionTooltip);
+
+            // Median line
+            g.append('line')
+                .attr('class', 'boxplot-median')
+                .attr('x1', x - boxHalfWidth)
+                .attr('x2', x + boxHalfWidth)
+                .attr('y1', yScale(d.median))
+                .attr('y2', yScale(d.median))
+                .attr('stroke', 'var(--accent)')
+                .attr('stroke-width', 2);
+        });
+
+        // X axis
+        const xAxis = g.append('g')
+            .attr('class', 'axis x-axis')
+            .attr('transform', `translate(0,${height})`)
+            .call(d3.axisBottom(xScale));
+
+        // Rotate x-axis labels for readability
+        xAxis.selectAll('text')
+            .attr('transform', 'rotate(-45)')
+            .style('text-anchor', 'end')
+            .attr('dx', '-0.8em')
+            .attr('dy', '0.15em');
+
+        // X axis label
+        g.append('text')
+            .attr('class', 'axis-label')
+            .attr('x', width / 2)
+            .attr('y', height + 80)
+            .attr('text-anchor', 'middle')
+            .text('Mixed Case ID');
+
+        // Y axis
+        g.append('g')
+            .attr('class', 'axis y-axis')
+            .call(d3.axisLeft(yScale)
+                .tickFormat(d => formatMs(d)));
+
+        // Y axis label
+        g.append('text')
+            .attr('class', 'axis-label')
+            .attr('transform', 'rotate(-90)')
+            .attr('x', -height / 2)
+            .attr('y', -60)
+            .attr('text-anchor', 'middle')
+            .text('TTFT (ms)');
+
+        // Title
+        svg.append('text')
+            .attr('class', 'chart-title')
+            .attr('x', margin.left + width / 2)
+            .attr('y', 25)
+            .attr('text-anchor', 'middle')
+            .text('TTFT Distribution by Mixed Case (Prefill-Mixed)');
+
+        // Legend
+        renderDistributionLegend(svg, margin.left + width - 150, margin.top + 10);
+
+        console.log(`[dashboard] Distribution chart rendered with ${data.length} box plots`);
+    }
+
+    /**
+     * Format milliseconds for display
+     * @param {number} ms - Milliseconds value
+     * @returns {string} Formatted string
+     */
+    function formatMs(ms) {
+        if (ms >= 1000) {
+            return (ms / 1000).toFixed(1) + 's';
+        } else if (ms >= 1) {
+            return ms.toFixed(1) + 'ms';
+        } else {
+            return ms.toFixed(2) + 'ms';
+        }
+    }
+
+    /**
+     * Render legend for distribution chart
+     */
+    function renderDistributionLegend(svg, x, y) {
+        const legendGroup = svg.append('g')
+            .attr('class', 'distribution-legend')
+            .attr('transform', `translate(${x},${y})`);
+
+        // Box legend item
+        legendGroup.append('rect')
+            .attr('x', 0)
+            .attr('y', 0)
+            .attr('width', 16)
+            .attr('height', 16)
+            .attr('fill', 'var(--accent-subtle)')
+            .attr('stroke', 'var(--accent)')
+            .attr('stroke-width', 1);
+
+        legendGroup.append('text')
+            .attr('x', 22)
+            .attr('y', 12)
+            .attr('class', 'legend-text')
+            .text('Q1-Q3 (IQR)');
+
+        // Median legend item
+        legendGroup.append('line')
+            .attr('x1', 0)
+            .attr('x2', 16)
+            .attr('y1', 30)
+            .attr('y2', 30)
+            .attr('stroke', 'var(--accent)')
+            .attr('stroke-width', 2);
+
+        legendGroup.append('text')
+            .attr('x', 22)
+            .attr('y', 34)
+            .attr('class', 'legend-text')
+            .text('Median (p50)');
+
+        // Whisker legend item
+        legendGroup.append('line')
+            .attr('x1', 8)
+            .attr('x2', 8)
+            .attr('y1', 45)
+            .attr('y2', 60)
+            .attr('stroke', 'var(--text-secondary)')
+            .attr('stroke-width', 1);
+
+        legendGroup.append('text')
+            .attr('x', 22)
+            .attr('y', 56)
+            .attr('class', 'legend-text')
+            .text('Min-Max');
+    }
+
+    /**
+     * Show tooltip for distribution box plot
+     * @param {Event} event - Mouse event
+     * @param {Object} d - Distribution data object
+     */
+    function showDistributionTooltip(event, d) {
+        // Remove existing tooltip
+        hideDistributionTooltip();
+
+        const tooltip = document.createElement('div');
+        tooltip.className = 'distribution-tooltip';
+        tooltip.innerHTML = `
+            <div class="tooltip-header"><strong>${escapeHtml(d.mixed_case_id)}</strong></div>
+            <div class="tooltip-row"><strong>Min:</strong> ${formatMs(d.min)}</div>
+            <div class="tooltip-row"><strong>Q1 (25%):</strong> ${formatMs(d.q1)}</div>
+            <div class="tooltip-row"><strong>Median (50%):</strong> ${formatMs(d.median)}</div>
+            <div class="tooltip-row"><strong>Q3 (75%):</strong> ${formatMs(d.q3)}</div>
+            <div class="tooltip-row"><strong>Max:</strong> ${formatMs(d.max)}</div>
+            <div class="tooltip-divider"></div>
+            <div class="tooltip-row"><strong>Samples:</strong> ${d.n_values}</div>
+            <div class="tooltip-row"><strong>Batch:</strong> ${d.batch_size}</div>
+            <div class="tooltip-row"><strong>Chunk:</strong> ${d.token_chunk_size}</div>
+        `;
+
+        document.body.appendChild(tooltip);
+
+        // Position tooltip
+        const tooltipRect = tooltip.getBoundingClientRect();
+        let left = event.pageX + 10;
+        let top = event.pageY + 10;
+
+        // Keep tooltip in viewport
+        if (left + tooltipRect.width > window.innerWidth) {
+            left = event.pageX - tooltipRect.width - 10;
+        }
+        if (top + tooltipRect.height > window.innerHeight) {
+            top = event.pageY - tooltipRect.height - 10;
+        }
+
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+    }
+
+    /**
+     * Hide distribution tooltip
+     */
+    function hideDistributionTooltip() {
+        const existing = document.querySelector('.distribution-tooltip');
+        if (existing) {
+            existing.remove();
+        }
+    }
+
+    /**
      * Render run comparison view
+     * Allows selecting two runs and displays % deltas for matched case_ids
      */
     function renderCompare() {
-        // Placeholder: will be implemented in later tickets
-        console.log('[dashboard] renderCompare() - Not yet implemented');
-        elements.viewContainer.innerHTML = `
-            <div class="empty-state">
-                <p>Run comparison view</p>
-                <p class="empty-hint">Coming soon</p>
+        console.log('[dashboard] renderCompare()');
+
+        const runs = state.data.runs;
+        const measures = state.data.measures;
+
+        // Check if we have enough data
+        if (runs.length < 2) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>Need at least two runs to compare</p>
+                    <p class="empty-hint">Load benchmark data from multiple runs</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Build the run selectors and comparison content
+        let html = buildCompareUI(runs);
+
+        // If both runs are selected, compute and display the comparison
+        if (compareState.baseRun && compareState.compareRun) {
+            const comparisonData = computeRunComparison(compareState.baseRun, compareState.compareRun, measures);
+            html += buildComparisonTable(comparisonData);
+        } else {
+            html += `
+                <div class="compare-placeholder">
+                    <p>Select two runs above to compare their performance</p>
+                </div>
+            `;
+        }
+
+        elements.viewContainer.innerHTML = html;
+
+        // Attach event listeners
+        attachCompareListeners();
+
+        console.log(`[dashboard] Compare view rendered with ${runs.length} runs available`);
+    }
+
+    /**
+     * Build the run selector UI for comparison
+     */
+    function buildCompareUI(runs) {
+        // Sort runs by timestamp (most recent first) if available
+        const sortedRuns = [...runs].sort((a, b) => {
+            const aTime = a.started_at_utc || a.timestamp || '';
+            const bTime = b.started_at_utc || b.timestamp || '';
+            return bTime.localeCompare(aTime);
+        });
+
+        // Build run options
+        const runOptions = sortedRuns.map(run => {
+            const timestamp = run.started_at_utc || run.timestamp || 'unknown time';
+            const shortId = run.run_id.length > 20 ? run.run_id.substring(0, 17) + '...' : run.run_id;
+            const gitInfo = run.git_sha ? ` (${run.git_sha.substring(0, 7)})` : '';
+            const label = `${shortId}${gitInfo} - ${formatTimestamp(timestamp)}`;
+            return { id: run.run_id, label: label };
+        }).map(opt =>
+            `<option value="${escapeHtml(opt.id)}">${escapeHtml(opt.label)}</option>`
+        ).join('');
+
+        const baseSelected = compareState.baseRun || '';
+        const compareSelected = compareState.compareRun || '';
+
+        return `
+            <div class="compare-controls">
+                <div class="compare-selectors">
+                    <div class="compare-selector">
+                        <label for="base-run-select">Baseline Run (older)</label>
+                        <select id="base-run-select" class="compare-select">
+                            <option value="">Select baseline run...</option>
+                            ${runOptions}
+                        </select>
+                    </div>
+                    <div class="compare-arrow">&#8594;</div>
+                    <div class="compare-selector">
+                        <label for="compare-run-select">Compare Run (newer)</label>
+                        <select id="compare-run-select" class="compare-select">
+                            <option value="">Select comparison run...</option>
+                            ${runOptions}
+                        </select>
+                    </div>
+                </div>
+                <div class="compare-options">
+                    <div class="threshold-control">
+                        <label for="threshold-input">Regression Threshold (%)</label>
+                        <input type="number" id="threshold-input" class="threshold-input"
+                               value="${compareState.threshold}" min="0" max="100" step="1">
+                    </div>
+                    <div class="compare-legend">
+                        <span class="legend-item regression-legend">&#9660; Regression</span>
+                        <span class="legend-item improvement-legend">&#9650; Improvement</span>
+                        <span class="legend-item unchanged-legend">&#8212; Unchanged</span>
+                    </div>
+                </div>
             </div>
         `;
+    }
+
+    /**
+     * Format timestamp for display
+     */
+    function formatTimestamp(timestamp) {
+        if (!timestamp || timestamp === 'unknown time') return 'unknown time';
+        try {
+            const date = new Date(timestamp);
+            return date.toLocaleString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        } catch {
+            return timestamp;
+        }
+    }
+
+    /**
+     * Compute comparison data between two runs
+     * @param {string} baseRunId - The baseline run ID
+     * @param {string} compareRunId - The comparison run ID
+     * @param {Array} measures - All measure records
+     * @returns {Object} Comparison results
+     */
+    function computeRunComparison(baseRunId, compareRunId, measures) {
+        // Filter measures by run
+        const baseMeasures = measures.filter(m => m.run_id === baseRunId && m.status === 'ok');
+        const compareMeasures = measures.filter(m => m.run_id === compareRunId && m.status === 'ok');
+
+        // Aggregate measures by case_id
+        const baseByCase = aggregateMeasuresByCase(baseMeasures);
+        const compareByCase = aggregateMeasuresByCase(compareMeasures);
+
+        // Get all unique case_ids
+        const allCaseIds = new Set([...baseByCase.keys(), ...compareByCase.keys()]);
+
+        // Compute deltas
+        const matched = [];
+        const baseOnly = [];
+        const compareOnly = [];
+
+        allCaseIds.forEach(caseId => {
+            const baseData = baseByCase.get(caseId);
+            const compareData = compareByCase.get(caseId);
+
+            if (baseData && compareData) {
+                // Matched case - compute deltas
+                const comparison = computeCaseDeltas(caseId, baseData, compareData);
+                matched.push(comparison);
+            } else if (baseData && !compareData) {
+                // Only in base run
+                baseOnly.push({ case_id: caseId, ...baseData });
+            } else if (!baseData && compareData) {
+                // Only in compare run
+                compareOnly.push({ case_id: caseId, ...compareData });
+            }
+        });
+
+        // Sort matched results
+        const sorted = sortComparisonData(matched, compareState.sortColumn, compareState.sortDirection);
+
+        // Compute summary statistics
+        const regressions = matched.filter(m => m.delta_pct < -compareState.threshold);
+        const improvements = matched.filter(m => m.delta_pct > compareState.threshold);
+        const unchanged = matched.filter(m => Math.abs(m.delta_pct) <= compareState.threshold);
+
+        return {
+            matched: sorted,
+            baseOnly,
+            compareOnly,
+            summary: {
+                totalMatched: matched.length,
+                regressions: regressions.length,
+                improvements: improvements.length,
+                unchanged: unchanged.length,
+                avgDelta: matched.length > 0
+                    ? matched.reduce((sum, m) => sum + m.delta_pct, 0) / matched.length
+                    : 0
+            }
+        };
+    }
+
+    /**
+     * Aggregate measures by case_id, computing averages
+     */
+    function aggregateMeasuresByCase(measures) {
+        const byCase = new Map();
+
+        measures.forEach(m => {
+            const caseId = m.case_id || generateCaseId(m);
+            if (!byCase.has(caseId)) {
+                byCase.set(caseId, {
+                    records: [],
+                    scenario: m.scenario,
+                    model_name: m.model_name,
+                    model_size: m.model_size,
+                    backend_id: m.backend_id,
+                    wgpu_backend: m.wgpu_backend,
+                    batch_size: m.batch_size,
+                    token_chunk_size: m.token_chunk_size_effective || m.token_chunk_size_requested,
+                    seq_len: m.seq_len,
+                    decode_steps: m.decode_steps,
+                    mixed_case_id: m.mixed_case_id
+                });
+            }
+            byCase.get(caseId).records.push(m);
+        });
+
+        // Compute averages for each case
+        byCase.forEach((caseData, caseId) => {
+            const records = caseData.records;
+
+            // Get primary throughput metric based on scenario
+            if (caseData.scenario === 'decode_only') {
+                caseData.throughput = average(records, 'decode_tok_per_s');
+                caseData.metric_name = 'decode_tok_per_s';
+            } else if (caseData.scenario === 'prefill_uniform' || caseData.scenario === 'prefill_mixed') {
+                caseData.throughput = average(records, 'prefill_tok_per_s');
+                caseData.metric_name = 'prefill_tok_per_s';
+            }
+
+            caseData.repeat_count = records.length;
+        });
+
+        return byCase;
+    }
+
+    /**
+     * Compute deltas between base and compare case data
+     */
+    function computeCaseDeltas(caseId, baseData, compareData) {
+        const baseThroughput = baseData.throughput || 0;
+        const compareThroughput = compareData.throughput || 0;
+
+        // Compute percentage change: ((new - old) / old) * 100
+        // Positive = improvement (faster), Negative = regression (slower)
+        let delta_pct = 0;
+        if (baseThroughput !== 0) {
+            delta_pct = ((compareThroughput - baseThroughput) / baseThroughput) * 100;
+        }
+
+        return {
+            case_id: caseId,
+            scenario: baseData.scenario,
+            model_name: baseData.model_name,
+            model_size: baseData.model_size,
+            backend_id: baseData.backend_id,
+            wgpu_backend: baseData.wgpu_backend,
+            batch_size: baseData.batch_size,
+            token_chunk_size: baseData.token_chunk_size,
+            seq_len: baseData.seq_len,
+            decode_steps: baseData.decode_steps,
+            mixed_case_id: baseData.mixed_case_id,
+            metric_name: baseData.metric_name,
+            base_value: baseThroughput,
+            compare_value: compareThroughput,
+            delta_pct: delta_pct,
+            base_repeats: baseData.repeat_count,
+            compare_repeats: compareData.repeat_count
+        };
+    }
+
+    /**
+     * Sort comparison data
+     */
+    function sortComparisonData(data, column, direction) {
+        const sorted = [...data];
+
+        sorted.sort((a, b) => {
+            let aVal = a[column];
+            let bVal = b[column];
+
+            // Handle nulls
+            if (aVal === null || aVal === undefined) aVal = -Infinity;
+            if (bVal === null || bVal === undefined) bVal = -Infinity;
+
+            let cmp;
+            if (typeof aVal === 'number' && typeof bVal === 'number') {
+                cmp = aVal - bVal;
+            } else {
+                cmp = String(aVal).localeCompare(String(bVal));
+            }
+
+            return direction === 'asc' ? cmp : -cmp;
+        });
+
+        return sorted;
+    }
+
+    /**
+     * Build the comparison results table
+     */
+    function buildComparisonTable(comparisonData) {
+        const { matched, baseOnly, compareOnly, summary } = comparisonData;
+
+        // Build summary stats
+        const summaryHtml = `
+            <div class="compare-summary">
+                <div class="summary-stat">
+                    <span class="summary-label">Matched Cases</span>
+                    <span class="summary-value">${summary.totalMatched}</span>
+                </div>
+                <div class="summary-stat regression">
+                    <span class="summary-label">Regressions</span>
+                    <span class="summary-value">${summary.regressions}</span>
+                </div>
+                <div class="summary-stat improvement">
+                    <span class="summary-label">Improvements</span>
+                    <span class="summary-value">${summary.improvements}</span>
+                </div>
+                <div class="summary-stat">
+                    <span class="summary-label">Unchanged</span>
+                    <span class="summary-value">${summary.unchanged}</span>
+                </div>
+                <div class="summary-stat">
+                    <span class="summary-label">Avg Change</span>
+                    <span class="summary-value ${summary.avgDelta < 0 ? 'regression' : (summary.avgDelta > 0 ? 'improvement' : '')}">${formatDeltaPercent(summary.avgDelta)}</span>
+                </div>
+            </div>
+        `;
+
+        // Build matched results table
+        let matchedTableHtml = '';
+        if (matched.length > 0) {
+            const headerHtml = buildCompareTableHeader();
+            const bodyHtml = matched.map(row => buildCompareTableRow(row)).join('');
+
+            matchedTableHtml = `
+                <div class="compare-section">
+                    <h3>Comparison Results</h3>
+                    <div class="table-wrapper">
+                        <table class="data-table compare-table">
+                            <thead>${headerHtml}</thead>
+                            <tbody>${bodyHtml}</tbody>
+                        </table>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Build unmatched sections
+        let unmatchedHtml = '';
+
+        if (baseOnly.length > 0 || compareOnly.length > 0) {
+            unmatchedHtml = '<div class="compare-unmatched">';
+
+            if (baseOnly.length > 0) {
+                unmatchedHtml += `
+                    <div class="unmatched-section">
+                        <h4>Only in Baseline (${baseOnly.length} cases)</h4>
+                        <ul class="unmatched-list">
+                            ${baseOnly.slice(0, 10).map(c => `<li class="unmatched-item">${escapeHtml(c.case_id)}</li>`).join('')}
+                            ${baseOnly.length > 10 ? `<li class="unmatched-more">... and ${baseOnly.length - 10} more</li>` : ''}
+                        </ul>
+                    </div>
+                `;
+            }
+
+            if (compareOnly.length > 0) {
+                unmatchedHtml += `
+                    <div class="unmatched-section">
+                        <h4>Only in Compare Run (${compareOnly.length} cases)</h4>
+                        <ul class="unmatched-list">
+                            ${compareOnly.slice(0, 10).map(c => `<li class="unmatched-item">${escapeHtml(c.case_id)}</li>`).join('')}
+                            ${compareOnly.length > 10 ? `<li class="unmatched-more">... and ${compareOnly.length - 10} more</li>` : ''}
+                        </ul>
+                    </div>
+                `;
+            }
+
+            unmatchedHtml += '</div>';
+        }
+
+        return summaryHtml + matchedTableHtml + unmatchedHtml;
+    }
+
+    /**
+     * Build compare table header
+     */
+    function buildCompareTableHeader() {
+        const columns = [
+            { key: 'scenario', label: 'Scenario', sortable: true },
+            { key: 'model_name', label: 'Model', sortable: true },
+            { key: 'backend_id', label: 'Backend', sortable: true },
+            { key: 'batch_size', label: 'Batch', sortable: true, numeric: true },
+            { key: 'token_chunk_size', label: 'Chunk', sortable: true, numeric: true },
+            { key: 'base_value', label: 'Base (tok/s)', sortable: true, numeric: true },
+            { key: 'compare_value', label: 'Compare (tok/s)', sortable: true, numeric: true },
+            { key: 'delta_pct', label: 'Change %', sortable: true, numeric: true }
+        ];
+
+        let headerHtml = '<tr>';
+        columns.forEach(col => {
+            const sortClass = col.sortable ? 'sortable' : '';
+            const activeClass = col.key === compareState.sortColumn ? 'sort-active' : '';
+            const dirClass = col.key === compareState.sortColumn ? `sort-${compareState.sortDirection}` : '';
+            const numericClass = col.numeric ? 'numeric' : '';
+            const sortIndicator = col.key === compareState.sortColumn
+                ? (compareState.sortDirection === 'asc' ? ' &#9650;' : ' &#9660;')
+                : '';
+
+            headerHtml += `<th class="${sortClass} ${activeClass} ${dirClass} ${numericClass}" data-column="${col.key}">${col.label}${sortIndicator}</th>`;
+        });
+        headerHtml += '</tr>';
+
+        return headerHtml;
+    }
+
+    /**
+     * Build compare table row
+     */
+    function buildCompareTableRow(row) {
+        const threshold = compareState.threshold;
+        const isRegression = row.delta_pct < -threshold;
+        const isImprovement = row.delta_pct > threshold;
+
+        const rowClass = isRegression ? 'row-regression' : (isImprovement ? 'row-improvement' : '');
+
+        // Format the change indicator
+        const changeIndicator = isRegression ? '&#9660;' : (isImprovement ? '&#9650;' : '&#8212;');
+        const changeClass = isRegression ? 'delta-regression' : (isImprovement ? 'delta-improvement' : 'delta-unchanged');
+
+        // Truncate long model names
+        const modelDisplay = row.model_name && row.model_name.length > 20
+            ? `<span title="${escapeHtml(row.model_name)}">${escapeHtml(row.model_name.substring(0, 17))}...</span>`
+            : escapeHtml(row.model_name || '--');
+
+        return `
+            <tr class="${rowClass}">
+                <td>${escapeHtml(row.scenario || '--')}</td>
+                <td>${modelDisplay}</td>
+                <td>${escapeHtml(row.backend_id || '--')}${row.wgpu_backend ? '/' + escapeHtml(row.wgpu_backend) : ''}</td>
+                <td class="numeric">${row.batch_size != null ? row.batch_size : '--'}</td>
+                <td class="numeric">${row.token_chunk_size != null ? row.token_chunk_size : '--'}</td>
+                <td class="numeric">${formatThroughput(row.base_value)}</td>
+                <td class="numeric">${formatThroughput(row.compare_value)}</td>
+                <td class="numeric ${changeClass}">
+                    <span class="change-indicator">${changeIndicator}</span>
+                    ${formatDeltaPercent(row.delta_pct)}
+                </td>
+            </tr>
+        `;
+    }
+
+    /**
+     * Format delta percentage for display
+     */
+    function formatDeltaPercent(value) {
+        if (value === null || value === undefined || isNaN(value)) {
+            return '--';
+        }
+        const sign = value > 0 ? '+' : '';
+        return `${sign}${value.toFixed(2)}%`;
+    }
+
+    /**
+     * Attach event listeners for compare view
+     */
+    function attachCompareListeners() {
+        // Base run selector
+        const baseSelect = document.getElementById('base-run-select');
+        if (baseSelect) {
+            // Set initial value
+            if (compareState.baseRun) {
+                baseSelect.value = compareState.baseRun;
+            }
+
+            baseSelect.addEventListener('change', (e) => {
+                compareState.baseRun = e.target.value || null;
+                renderCompare();
+            });
+        }
+
+        // Compare run selector
+        const compareSelect = document.getElementById('compare-run-select');
+        if (compareSelect) {
+            // Set initial value
+            if (compareState.compareRun) {
+                compareSelect.value = compareState.compareRun;
+            }
+
+            compareSelect.addEventListener('change', (e) => {
+                compareState.compareRun = e.target.value || null;
+                renderCompare();
+            });
+        }
+
+        // Threshold input
+        const thresholdInput = document.getElementById('threshold-input');
+        if (thresholdInput) {
+            thresholdInput.addEventListener('change', (e) => {
+                const value = parseFloat(e.target.value);
+                if (!isNaN(value) && value >= 0 && value <= 100) {
+                    compareState.threshold = value;
+                    renderCompare();
+                }
+            });
+        }
+
+        // Sortable column headers
+        document.querySelectorAll('.compare-table th.sortable').forEach(th => {
+            th.addEventListener('click', () => {
+                const column = th.dataset.column;
+
+                if (compareState.sortColumn === column) {
+                    compareState.sortDirection = compareState.sortDirection === 'asc' ? 'desc' : 'asc';
+                } else {
+                    compareState.sortColumn = column;
+                    // Default to desc for numeric columns
+                    const isNumeric = ['batch_size', 'token_chunk_size', 'base_value', 'compare_value', 'delta_pct'].includes(column);
+                    compareState.sortDirection = isNumeric ? 'desc' : 'asc';
+                }
+
+                renderCompare();
+            });
+        });
     }
 
     // Initialize on DOM ready

@@ -1237,6 +1237,107 @@ body {
     list-style-type: none;
 }
 
+/* ==============================================
+   Distribution View Styles (Box Plots)
+   ============================================== */
+
+/* Distribution wrapper */
+.distribution-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.distribution-svg {
+    font-family: var(--font-sans);
+}
+
+.distribution-svg .axis text {
+    font-size: 11px;
+    fill: var(--text-secondary);
+}
+
+.distribution-svg .axis line,
+.distribution-svg .axis path {
+    stroke: var(--border-color);
+}
+
+.distribution-svg .axis-label {
+    font-size: 12px;
+    font-weight: 500;
+    fill: var(--text-secondary);
+}
+
+.distribution-svg .chart-title {
+    font-size: 13px;
+    font-weight: 600;
+    fill: var(--text-primary);
+}
+
+/* Box plot elements */
+.boxplot-box {
+    cursor: pointer;
+    transition: opacity 0.1s ease;
+}
+
+.boxplot-box:hover {
+    opacity: 0.85;
+}
+
+.boxplot-whisker,
+.boxplot-cap {
+    pointer-events: none;
+}
+
+.boxplot-median {
+    pointer-events: none;
+}
+
+/* Distribution legend */
+.distribution-legend .legend-text {
+    font-size: 11px;
+    fill: var(--text-primary);
+}
+
+/* Distribution tooltip */
+.distribution-tooltip {
+    position: fixed;
+    z-index: 1000;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: var(--space-sm) var(--space-md);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    pointer-events: none;
+    font-size: 12px;
+    min-width: 180px;
+    max-width: 300px;
+}
+
+.distribution-tooltip .tooltip-header {
+    font-weight: 500;
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--border-subtle);
+    padding-bottom: var(--space-xs);
+    margin-bottom: var(--space-xs);
+    word-wrap: break-word;
+}
+
+.distribution-tooltip .tooltip-row {
+    padding: 2px 0;
+    color: var(--text-primary);
+}
+
+.distribution-tooltip .tooltip-row strong {
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.distribution-tooltip .tooltip-divider {
+    height: 1px;
+    background-color: var(--border-subtle);
+    margin: var(--space-xs) 0;
+}
+
 /* Responsive adjustments */
 @media (max-width: 768px) {
     .main-container {
