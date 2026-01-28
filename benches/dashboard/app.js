@@ -591,13 +591,21 @@
         }
 
         // Extract from measures
+        // Note: token_chunk_size uses token_chunk_size_effective (or token_chunk_size_requested as fallback)
         const measureFields = ['scenario', 'model_name', 'model_size', 'backend_id', 'wgpu_backend',
                                'batch_size', 'token_chunk_size', 'seq_len', 'mixed_case_id'];
         measureFields.forEach(field => {
             const values = new Set();
             measures.forEach(m => {
-                if (m[field] !== undefined && m[field] !== null) {
-                    values.add(m[field]);
+                // Special handling for token_chunk_size - check effective then requested
+                let value;
+                if (field === 'token_chunk_size') {
+                    value = m.token_chunk_size_effective ?? m.token_chunk_size_requested ?? m.token_chunk_size;
+                } else {
+                    value = m[field];
+                }
+                if (value !== undefined && value !== null) {
+                    values.add(value);
                 }
             });
             state.filterOptions[field] = Array.from(values).sort((a, b) => {
@@ -610,17 +618,22 @@
         });
 
         // Extract from runs
-        const runFields = ['run_id', 'git_sha', 'timestamp'];
-        runFields.forEach(field => {
+        // Note: timestamp filter uses started_at_utc field from the data
+        const runFieldMappings = [
+            { filterKey: 'run_id', dataKey: 'run_id' },
+            { filterKey: 'git_sha', dataKey: 'git_sha' },
+            { filterKey: 'timestamp', dataKey: 'started_at_utc' }  // Map timestamp filter to started_at_utc field
+        ];
+        runFieldMappings.forEach(({ filterKey, dataKey }) => {
             const values = new Set();
             runs.forEach(r => {
-                if (r[field] !== undefined && r[field] !== null) {
-                    values.add(r[field]);
+                if (r[dataKey] !== undefined && r[dataKey] !== null) {
+                    values.add(r[dataKey]);
                 }
             });
-            state.filterOptions[field] = Array.from(values).sort((a, b) => {
+            state.filterOptions[filterKey] = Array.from(values).sort((a, b) => {
                 // Reverse sort for timestamps (most recent first)
-                if (field === 'timestamp') {
+                if (filterKey === 'timestamp') {
                     return String(b).localeCompare(String(a));
                 }
                 return String(a).localeCompare(String(b));
@@ -963,16 +976,29 @@
         state.data.runs.forEach(run => runsMap.set(run.run_id, run));
 
         // Apply each filter
+        // Note: token_chunk_size uses token_chunk_size_effective (or token_chunk_size_requested as fallback)
         const measureFilters = ['scenario', 'model_name', 'model_size', 'backend_id', 'wgpu_backend',
                                 'batch_size', 'token_chunk_size', 'seq_len', 'mixed_case_id'];
-        const runFilters = ['run_id', 'git_sha', 'timestamp'];
+
+        // Map filter keys to run data field names
+        const runFilterMappings = [
+            { filterKey: 'run_id', dataKey: 'run_id' },
+            { filterKey: 'git_sha', dataKey: 'git_sha' },
+            { filterKey: 'timestamp', dataKey: 'started_at_utc' }  // Map timestamp filter to started_at_utc field
+        ];
 
         // Apply measure-level filters
         measureFilters.forEach(key => {
             const filterValue = state.filters[key];
             if (filterValue !== null && filterValue instanceof Set) {
                 filtered = filtered.filter(m => {
-                    const value = m[key];
+                    // Special handling for token_chunk_size - check effective then requested
+                    let value;
+                    if (key === 'token_chunk_size') {
+                        value = m.token_chunk_size_effective ?? m.token_chunk_size_requested ?? m.token_chunk_size;
+                    } else {
+                        value = m[key];
+                    }
                     if (value === undefined || value === null) {
                         return false;  // Exclude records without the field if filter is active
                     }
@@ -982,19 +1008,19 @@
         });
 
         // Apply run-level filters (filter measures by their associated run)
-        runFilters.forEach(key => {
-            const filterValue = state.filters[key];
+        runFilterMappings.forEach(({ filterKey, dataKey }) => {
+            const filterValue = state.filters[filterKey];
             if (filterValue !== null && filterValue instanceof Set) {
                 filtered = filtered.filter(m => {
                     const run = runsMap.get(m.run_id);
                     if (!run) {
                         // If we can't find the run, check if the measure has run_id directly
-                        if (key === 'run_id') {
+                        if (filterKey === 'run_id') {
                             return filterValue.has(m.run_id);
                         }
                         return false;
                     }
-                    const value = run[key];
+                    const value = run[dataKey];
                     if (value === undefined || value === null) {
                         return false;
                     }
