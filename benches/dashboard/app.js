@@ -982,18 +982,506 @@
         console.log(`[dashboard] Stats updated: ${runs.length} runs, ${measures.length} cases, ${uniqueBackends.size} backends, ${uniqueModels.size} models`);
     }
 
+    // Table sorting state
+    const tableState = {
+        sortColumn: 'decode_tok_per_s',  // Default sort by throughput
+        sortDirection: 'desc',            // desc = highest first
+        selectedRow: null                 // Currently selected row for detail view
+    };
+
     /**
      * Render summary table view
      */
     function renderTable() {
-        // Placeholder: will be implemented in later tickets
-        console.log('[dashboard] renderTable() - Not yet implemented');
-        elements.viewContainer.innerHTML = `
-            <div class="empty-state">
-                <p>Summary table view</p>
-                <p class="empty-hint">Coming soon</p>
+        console.log('[dashboard] renderTable()');
+
+        // Get filtered data
+        const measures = applyFilters();
+
+        if (measures.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>No data matches the current filters</p>
+                    <p class="empty-hint">Try adjusting your filter selections</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Aggregate measures by case_id (average across repeats)
+        const aggregated = aggregateMeasures(measures);
+
+        // Sort the data
+        const sorted = sortTableData(aggregated, tableState.sortColumn, tableState.sortDirection);
+
+        // Build table HTML
+        const tableHtml = buildTableHtml(sorted);
+
+        elements.viewContainer.innerHTML = tableHtml;
+
+        // Attach event listeners for sorting and row selection
+        attachTableListeners();
+
+        console.log(`[dashboard] Table rendered with ${sorted.length} aggregated cases`);
+    }
+
+    /**
+     * Aggregate measures by case_id, computing averages across repeats
+     * @param {Array} measures - Raw measure records
+     * @returns {Array} Aggregated records (one per case)
+     */
+    function aggregateMeasures(measures) {
+        // Group by case_id
+        const byCase = new Map();
+
+        measures.forEach(m => {
+            const caseId = m.case_id || generateCaseId(m);
+            if (!byCase.has(caseId)) {
+                byCase.set(caseId, []);
+            }
+            byCase.get(caseId).push(m);
+        });
+
+        // Aggregate each group
+        const aggregated = [];
+
+        byCase.forEach((records, caseId) => {
+            // Use first record as template for non-metric fields
+            const template = records[0];
+
+            // Compute averages for metric fields
+            const agg = {
+                case_id: caseId,
+                scenario: template.scenario,
+                model_name: template.model_name,
+                model_size: template.model_size,
+                backend_id: template.backend_id,
+                wgpu_backend: template.wgpu_backend,
+                batch_size: template.batch_size,
+                token_chunk_size: template.token_chunk_size_effective || template.token_chunk_size_requested,
+                seq_len: template.seq_len,
+                mixed_case_id: template.mixed_case_id,
+                decode_steps: template.decode_steps,
+                status: template.status,
+                repeat_count: records.length,
+                // Store raw records for drilldown
+                _records: records
+            };
+
+            // Filter to only successful records for metric averaging
+            const okRecords = records.filter(r => r.status === 'ok');
+
+            if (okRecords.length > 0) {
+                // Decode metrics
+                if (template.scenario === 'decode_only') {
+                    agg.decode_total_ms = average(okRecords, 'decode_total_ms');
+                    agg.decode_tokens = okRecords[0].decode_tokens;  // Same for all repeats
+                    agg.decode_tok_per_s = average(okRecords, 'decode_tok_per_s');
+                    agg.decode_step_ms_p50 = average(okRecords, 'decode_step_ms_p50');
+                    agg.decode_step_ms_p95 = average(okRecords, 'decode_step_ms_p95');
+                }
+
+                // Prefill metrics
+                if (template.scenario === 'prefill_uniform' || template.scenario === 'prefill_mixed') {
+                    agg.prefill_total_ms = average(okRecords, 'prefill_total_ms');
+                    agg.total_prompt_tokens = okRecords[0].total_prompt_tokens;
+                    agg.prefill_tok_per_s = average(okRecords, 'prefill_tok_per_s');
+                    agg.num_infer_calls = okRecords[0].num_infer_calls;
+                    agg.ttft_min_ms = average(okRecords, 'ttft_min_ms');
+                    agg.ttft_p50_ms = average(okRecords, 'ttft_p50_ms');
+                    agg.ttft_max_ms = average(okRecords, 'ttft_max_ms');
+                }
+            }
+
+            aggregated.push(agg);
+        });
+
+        return aggregated;
+    }
+
+    /**
+     * Generate a case_id from record fields if not present
+     */
+    function generateCaseId(m) {
+        const parts = [
+            m.scenario,
+            m.model_name,
+            m.backend_id,
+            m.wgpu_backend,
+            `bs${m.batch_size}`,
+            `c${m.token_chunk_size_effective || m.token_chunk_size_requested}`
+        ];
+
+        if (m.scenario === 'decode_only') {
+            parts.push(`steps${m.decode_steps}`);
+        } else if (m.scenario === 'prefill_uniform') {
+            parts.push(`len${m.seq_len}`);
+        } else if (m.scenario === 'prefill_mixed') {
+            parts.push(m.mixed_case_id);
+        }
+
+        return parts.join(':');
+    }
+
+    /**
+     * Compute average of a field across records
+     */
+    function average(records, field) {
+        const values = records.map(r => r[field]).filter(v => v !== undefined && v !== null && !isNaN(v));
+        if (values.length === 0) return null;
+        return values.reduce((a, b) => a + b, 0) / values.length;
+    }
+
+    /**
+     * Sort table data by column
+     */
+    function sortTableData(data, column, direction) {
+        const sorted = [...data];
+
+        sorted.sort((a, b) => {
+            let aVal = a[column];
+            let bVal = b[column];
+
+            // Handle nulls
+            if (aVal === null || aVal === undefined) aVal = -Infinity;
+            if (bVal === null || bVal === undefined) bVal = -Infinity;
+
+            // Numeric comparison for numbers, string for others
+            let cmp;
+            if (typeof aVal === 'number' && typeof bVal === 'number') {
+                cmp = aVal - bVal;
+            } else {
+                cmp = String(aVal).localeCompare(String(bVal));
+            }
+
+            return direction === 'asc' ? cmp : -cmp;
+        });
+
+        return sorted;
+    }
+
+    /**
+     * Build HTML for the summary table
+     */
+    function buildTableHtml(data) {
+        // Define columns based on what data is available
+        const hasDecodeData = data.some(d => d.scenario === 'decode_only');
+        const hasPrefillData = data.some(d => d.scenario === 'prefill_uniform' || d.scenario === 'prefill_mixed');
+
+        // Base columns always shown
+        const columns = [
+            { key: 'scenario', label: 'Scenario', sortable: true },
+            { key: 'model_name', label: 'Model', sortable: true },
+            { key: 'model_size', label: 'Size', sortable: true },
+            { key: 'backend_id', label: 'Backend', sortable: true },
+            { key: 'batch_size', label: 'Batch', sortable: true, numeric: true },
+            { key: 'token_chunk_size', label: 'Chunk', sortable: true, numeric: true }
+        ];
+
+        // Add scenario-specific columns
+        if (hasDecodeData) {
+            columns.push(
+                { key: 'decode_steps', label: 'Steps', sortable: true, numeric: true },
+                { key: 'decode_tok_per_s', label: 'Decode tok/s', sortable: true, numeric: true, metric: true }
+            );
+        }
+
+        if (hasPrefillData) {
+            columns.push(
+                { key: 'seq_len', label: 'Seq Len', sortable: true, numeric: true },
+                { key: 'prefill_tok_per_s', label: 'Prefill tok/s', sortable: true, numeric: true, metric: true },
+                { key: 'ttft_p50_ms', label: 'TTFT p50 (ms)', sortable: true, numeric: true, metric: true }
+            );
+        }
+
+        // Status and repeat count
+        columns.push(
+            { key: 'status', label: 'Status', sortable: true },
+            { key: 'repeat_count', label: 'Reps', sortable: true, numeric: true }
+        );
+
+        // Build header
+        let headerHtml = '<tr>';
+        columns.forEach(col => {
+            const sortClass = col.sortable ? 'sortable' : '';
+            const activeClass = col.key === tableState.sortColumn ? 'sort-active' : '';
+            const dirClass = col.key === tableState.sortColumn ? `sort-${tableState.sortDirection}` : '';
+            const numericClass = col.numeric ? 'numeric' : '';
+            const sortIndicator = col.key === tableState.sortColumn
+                ? (tableState.sortDirection === 'asc' ? ' &#9650;' : ' &#9660;')
+                : '';
+
+            headerHtml += `<th class="${sortClass} ${activeClass} ${dirClass} ${numericClass}" data-column="${col.key}">${col.label}${sortIndicator}</th>`;
+        });
+        headerHtml += '</tr>';
+
+        // Build rows
+        let bodyHtml = '';
+        data.forEach((row, idx) => {
+            const statusClass = row.status === 'ok' ? '' : (row.status === 'error' ? 'status-error' : 'status-skipped');
+            const selectedClass = tableState.selectedRow === idx ? 'selected' : '';
+
+            bodyHtml += `<tr class="${statusClass} ${selectedClass} table-row-clickable" data-row-index="${idx}">`;
+
+            columns.forEach(col => {
+                const value = row[col.key];
+                const numericClass = col.numeric ? 'numeric' : '';
+                const formatted = formatCellValue(col.key, value, col.metric);
+
+                bodyHtml += `<td class="${numericClass}">${formatted}</td>`;
+            });
+
+            bodyHtml += '</tr>';
+        });
+
+        // Build detail panel (shown below table when row selected)
+        const detailHtml = tableState.selectedRow !== null
+            ? buildDetailPanel(data[tableState.selectedRow])
+            : '';
+
+        return `
+            <div class="table-wrapper">
+                <table class="data-table summary-table">
+                    <thead>${headerHtml}</thead>
+                    <tbody>${bodyHtml}</tbody>
+                </table>
+            </div>
+            ${detailHtml}
+        `;
+    }
+
+    /**
+     * Format a cell value for display
+     */
+    function formatCellValue(key, value, isMetric) {
+        if (value === null || value === undefined) {
+            return '<span class="cell-empty">--</span>';
+        }
+
+        // Format numbers
+        if (typeof value === 'number') {
+            if (isMetric) {
+                // Metrics: show with appropriate precision
+                if (value >= 1000) {
+                    return value.toLocaleString(undefined, { maximumFractionDigits: 1 });
+                } else if (value >= 1) {
+                    return value.toFixed(2);
+                } else {
+                    return value.toFixed(3);
+                }
+            } else {
+                // Non-metric numbers (batch size, etc.)
+                return value.toLocaleString();
+            }
+        }
+
+        // Status badges
+        if (key === 'status') {
+            const statusClass = value === 'ok' ? 'status-ok' : (value === 'error' ? 'status-error' : 'status-skipped');
+            return `<span class="status-badge ${statusClass}">${value}</span>`;
+        }
+
+        // Truncate long model names
+        if (key === 'model_name' && value.length > 30) {
+            return `<span title="${escapeHtml(value)}">${escapeHtml(value.substring(0, 27))}...</span>`;
+        }
+
+        return escapeHtml(String(value));
+    }
+
+    /**
+     * Build detail panel for selected row
+     */
+    function buildDetailPanel(row) {
+        if (!row) return '';
+
+        const records = row._records || [];
+
+        let metricsHtml = '';
+
+        // Show all metrics for the case
+        if (row.scenario === 'decode_only') {
+            metricsHtml = `
+                <div class="detail-metrics">
+                    <div class="detail-metric">
+                        <span class="metric-label">Decode Steps</span>
+                        <span class="metric-value">${row.decode_steps || '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Total Tokens</span>
+                        <span class="metric-value">${row.decode_tokens || '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Throughput (tok/s)</span>
+                        <span class="metric-value metric-primary">${row.decode_tok_per_s ? row.decode_tok_per_s.toFixed(1) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Total Time (ms)</span>
+                        <span class="metric-value">${row.decode_total_ms ? row.decode_total_ms.toFixed(2) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Step p50 (ms)</span>
+                        <span class="metric-value">${row.decode_step_ms_p50 ? row.decode_step_ms_p50.toFixed(3) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Step p95 (ms)</span>
+                        <span class="metric-value">${row.decode_step_ms_p95 ? row.decode_step_ms_p95.toFixed(3) : '--'}</span>
+                    </div>
+                </div>
+            `;
+        } else if (row.scenario === 'prefill_uniform' || row.scenario === 'prefill_mixed') {
+            metricsHtml = `
+                <div class="detail-metrics">
+                    <div class="detail-metric">
+                        <span class="metric-label">Seq Length</span>
+                        <span class="metric-value">${row.seq_len || row.mixed_case_id || '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Total Tokens</span>
+                        <span class="metric-value">${row.total_prompt_tokens || '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Throughput (tok/s)</span>
+                        <span class="metric-value metric-primary">${row.prefill_tok_per_s ? row.prefill_tok_per_s.toFixed(1) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Total Time (ms)</span>
+                        <span class="metric-value">${row.prefill_total_ms ? row.prefill_total_ms.toFixed(2) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">TTFT Min (ms)</span>
+                        <span class="metric-value">${row.ttft_min_ms ? row.ttft_min_ms.toFixed(2) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">TTFT p50 (ms)</span>
+                        <span class="metric-value">${row.ttft_p50_ms ? row.ttft_p50_ms.toFixed(2) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">TTFT Max (ms)</span>
+                        <span class="metric-value">${row.ttft_max_ms ? row.ttft_max_ms.toFixed(2) : '--'}</span>
+                    </div>
+                    <div class="detail-metric">
+                        <span class="metric-label">Infer Calls</span>
+                        <span class="metric-value">${row.num_infer_calls || '--'}</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        // Build repeat table if multiple repeats
+        let repeatsHtml = '';
+        if (records.length > 1) {
+            const repeatRows = records.map((r, i) => {
+                const throughput = r.decode_tok_per_s || r.prefill_tok_per_s;
+                const time = r.decode_total_ms || r.prefill_total_ms;
+                return `
+                    <tr>
+                        <td class="numeric">${r.repeat_index}</td>
+                        <td class="numeric">${throughput ? throughput.toFixed(1) : '--'}</td>
+                        <td class="numeric">${time ? time.toFixed(2) : '--'}</td>
+                        <td>${r.status}</td>
+                    </tr>
+                `;
+            }).join('');
+
+            repeatsHtml = `
+                <div class="detail-repeats">
+                    <h4>Individual Repeats</h4>
+                    <table class="data-table repeats-table">
+                        <thead>
+                            <tr>
+                                <th class="numeric">#</th>
+                                <th class="numeric">tok/s</th>
+                                <th class="numeric">Time (ms)</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>${repeatRows}</tbody>
+                    </table>
+                </div>
+            `;
+        }
+
+        return `
+            <div class="detail-panel" id="detail-panel">
+                <div class="detail-header">
+                    <h3>Case Details</h3>
+                    <button class="detail-close-btn" id="detail-close-btn" title="Close details">&#10005;</button>
+                </div>
+                <div class="detail-info">
+                    <div class="detail-info-row">
+                        <span class="info-label">Case ID:</span>
+                        <span class="info-value monospace">${escapeHtml(row.case_id || '--')}</span>
+                    </div>
+                    <div class="detail-info-row">
+                        <span class="info-label">Model:</span>
+                        <span class="info-value">${escapeHtml(row.model_name || '--')}</span>
+                    </div>
+                    <div class="detail-info-row">
+                        <span class="info-label">Backend:</span>
+                        <span class="info-value">${row.backend_id} / ${row.wgpu_backend}</span>
+                    </div>
+                    <div class="detail-info-row">
+                        <span class="info-label">Configuration:</span>
+                        <span class="info-value">batch=${row.batch_size}, chunk=${row.token_chunk_size}</span>
+                    </div>
+                </div>
+                ${metricsHtml}
+                ${repeatsHtml}
             </div>
         `;
+    }
+
+    /**
+     * Attach event listeners for table interactions
+     */
+    function attachTableListeners() {
+        // Sortable column headers
+        document.querySelectorAll('.summary-table th.sortable').forEach(th => {
+            th.addEventListener('click', () => {
+                const column = th.dataset.column;
+
+                // Toggle direction if same column, otherwise default to desc for metrics
+                if (tableState.sortColumn === column) {
+                    tableState.sortDirection = tableState.sortDirection === 'asc' ? 'desc' : 'asc';
+                } else {
+                    tableState.sortColumn = column;
+                    // Default to desc for numeric/metric columns, asc for text
+                    const isNumeric = ['batch_size', 'token_chunk_size', 'decode_steps', 'seq_len',
+                                      'decode_tok_per_s', 'prefill_tok_per_s', 'ttft_p50_ms',
+                                      'repeat_count', 'decode_total_ms', 'prefill_total_ms'].includes(column);
+                    tableState.sortDirection = isNumeric ? 'desc' : 'asc';
+                }
+
+                renderTable();
+            });
+        });
+
+        // Row click for detail view
+        document.querySelectorAll('.summary-table tbody tr').forEach(tr => {
+            tr.addEventListener('click', () => {
+                const rowIndex = parseInt(tr.dataset.rowIndex, 10);
+
+                // Toggle selection
+                if (tableState.selectedRow === rowIndex) {
+                    tableState.selectedRow = null;
+                } else {
+                    tableState.selectedRow = rowIndex;
+                }
+
+                renderTable();
+            });
+        });
+
+        // Close button for detail panel
+        const closeBtn = document.getElementById('detail-close-btn');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                tableState.selectedRow = null;
+                renderTable();
+            });
+        }
     }
 
     /**

@@ -608,6 +608,208 @@ body {
     color: var(--accent);
 }
 
+/* Summary Table Styles */
+.table-wrapper {
+    overflow-x: auto;
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+.summary-table {
+    min-width: 900px;
+}
+
+.summary-table th.sort-active {
+    background-color: var(--accent-subtle);
+    color: var(--accent);
+}
+
+.summary-table tbody tr.table-row-clickable {
+    cursor: pointer;
+}
+
+.summary-table tbody tr.selected {
+    background-color: var(--accent-subtle) !important;
+}
+
+.summary-table tbody tr.status-error {
+    background-color: rgba(220, 38, 38, 0.05);
+}
+
+.summary-table tbody tr.status-skipped {
+    background-color: rgba(202, 138, 4, 0.05);
+}
+
+/* Status badges */
+.status-badge {
+    display: inline-block;
+    padding: 2px var(--space-sm);
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.status-badge.status-ok {
+    background-color: rgba(22, 163, 74, 0.1);
+    color: var(--success);
+}
+
+.status-badge.status-error {
+    background-color: rgba(220, 38, 38, 0.1);
+    color: var(--error);
+}
+
+.status-badge.status-skipped {
+    background-color: rgba(202, 138, 4, 0.1);
+    color: var(--warning);
+}
+
+/* Empty cell placeholder */
+.cell-empty {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* Detail panel */
+.detail-panel {
+    margin-top: var(--space-lg);
+    padding: var(--space-lg);
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+}
+
+.detail-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: var(--space-md);
+}
+
+.detail-header h3 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.detail-close-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 14px;
+    transition: all 0.15s ease;
+}
+
+.detail-close-btn:hover {
+    background-color: var(--bg-secondary);
+    border-color: var(--text-muted);
+    color: var(--text-primary);
+}
+
+.detail-info {
+    margin-bottom: var(--space-lg);
+}
+
+.detail-info-row {
+    display: flex;
+    gap: var(--space-sm);
+    padding: var(--space-xs) 0;
+    font-size: 13px;
+}
+
+.detail-info-row .info-label {
+    color: var(--text-secondary);
+    font-weight: 500;
+    min-width: 100px;
+}
+
+.detail-info-row .info-value {
+    color: var(--text-primary);
+}
+
+.detail-info-row .info-value.monospace {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    word-break: break-all;
+}
+
+/* Detail metrics grid */
+.detail-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: var(--space-md);
+    margin-bottom: var(--space-lg);
+}
+
+.detail-metric {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-xs);
+    padding: var(--space-sm);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--border-radius);
+}
+
+.detail-metric .metric-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.detail-metric .metric-value {
+    font-size: 16px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    color: var(--text-primary);
+}
+
+.detail-metric .metric-value.metric-primary {
+    color: var(--accent);
+    font-size: 18px;
+}
+
+/* Detail repeats table */
+.detail-repeats {
+    margin-top: var(--space-md);
+}
+
+.detail-repeats h4 {
+    margin: 0 0 var(--space-sm);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+}
+
+.repeats-table {
+    max-width: 400px;
+    font-size: 12px;
+}
+
+.repeats-table th,
+.repeats-table td {
+    padding: var(--space-xs) var(--space-sm);
+}
+
+.repeats-table th {
+    background-color: var(--bg-secondary);
+}
+
 /* Utility classes */
 .hidden {
     display: none !important;
@@ -616,6 +818,10 @@ body {
 .loading {
     opacity: 0.5;
     pointer-events: none;
+}
+
+.monospace {
+    font-family: var(--font-mono);
 }
 
 /* Responsive adjustments */
