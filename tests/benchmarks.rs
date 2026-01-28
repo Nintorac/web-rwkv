@@ -55,7 +55,8 @@ use web_rwkv_bench::{
     collect_run_metadata, generate_case_id, generate_run_id, generate_timestamp_utc,
     round_chunk_size, CaseIdParams, CaseIdentity, DecodeConfig, DecodeResults,
     JsonlGpuInfo, JsonlHostInfo as HostInfo, JsonlWriter, MeasureRecord, Metrics,
-    RunHeader, Scenario, ScenarioParams, Status,
+    PrefillMetrics, PrefillResult, PrefillUniformConfig, RunHeader, Scenario,
+    ScenarioParams, Status, TokenGenerator,
 };
 
 /// Default config file path
@@ -886,6 +887,130 @@ async fn run_decode_benchmark(
     })
 }
 
+/// Results from a prefill benchmark run across multiple repeats.
+#[derive(Debug)]
+struct PrefillBenchResults {
+    /// Configuration used for this prefill run
+    pub config: PrefillUniformConfig,
+    /// Results for each repeat
+    pub repeats: Vec<PrefillResult>,
+    /// Median throughput across repeats
+    pub median_tok_per_s: f64,
+    /// Mean throughput across repeats
+    pub mean_tok_per_s: f64,
+    /// Min throughput across repeats
+    pub min_tok_per_s: f64,
+    /// Max throughput across repeats
+    pub max_tok_per_s: f64,
+}
+
+/// Run a prefill-uniform benchmark case
+///
+/// For prefill, we run ONE inference call with `seq_len` tokens per batch slot.
+/// This measures how long it takes to process the full prompt.
+async fn run_prefill_benchmark(
+    loaded: &LoadedModel,
+    batch_size: u32,
+    token_chunk_size: usize,
+    seq_len: u32,
+    warmup_runs: u32,
+    repeats: u32,
+) -> anyhow::Result<PrefillBenchResults> {
+    use std::time::{Duration, Instant};
+
+    let vocab_size = loaded.vocab_size;
+    let runtime = &loaded.runtime;
+    let settle_ms = 50u64;
+
+    // Create config for deterministic token generation
+    let config = PrefillUniformConfig::new(batch_size, seq_len, token_chunk_size as u32)
+        .with_seed(42)
+        .with_vocab_size(vocab_size);
+
+    let mut results = Vec::with_capacity(repeats as usize);
+
+    // === Warmup Phase ===
+    for _ in 0..warmup_runs {
+        let mut gen = TokenGenerator::new(42, vocab_size);
+        let batch_tokens = gen.generate_batch(batch_size, seq_len);
+
+        // Build input: each batch element has seq_len tokens
+        let batches: Vec<RnnInputBatch> = batch_tokens
+            .iter()
+            .map(|tokens| {
+                let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+                RnnInputBatch::new(tokens_u32, RnnOption::Last)
+            })
+            .collect();
+
+        let input = RnnInput::new(batches, token_chunk_size);
+        let _ = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    }
+
+    // === Measurement Phase ===
+    for repeat_idx in 0..repeats {
+        // Optional settle delay between repeats
+        if repeat_idx > 0 {
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+        }
+
+        // Generate deterministic tokens (same seed each repeat for reproducibility)
+        let mut gen = TokenGenerator::new(42, vocab_size);
+        let batch_tokens = gen.generate_batch(batch_size, seq_len);
+
+        // Build input: each batch element has seq_len tokens
+        let batches: Vec<RnnInputBatch> = batch_tokens
+            .iter()
+            .map(|tokens| {
+                let tokens_u32: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+                RnnInputBatch::new(tokens_u32, RnnOption::Last)
+            })
+            .collect();
+
+        let input = RnnInput::new(batches, token_chunk_size);
+
+        // Timed prefill call - single inference with full sequence
+        let start = Instant::now();
+        let _ = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        let elapsed = start.elapsed();
+
+        let prefill_total_ms = elapsed.as_secs_f64() * 1000.0;
+        let total_prompt_tokens = batch_size * seq_len;
+        let prefill_tok_per_s = total_prompt_tokens as f64 / elapsed.as_secs_f64();
+
+        // For uniform prefill with single-call, all batches complete at the same time
+        // so TTFT is the same for all batches
+        let ttft_ms_local = vec![prefill_total_ms; batch_size as usize];
+        let num_infer_calls = 1; // Single call for full prefill
+
+        let result = PrefillResult {
+            prefill_total_ms,
+            total_prompt_tokens,
+            prefill_tok_per_s,
+            num_infer_calls,
+            ttft_ms_local,
+            ttft_min_ms: prefill_total_ms,
+            ttft_p50_ms: prefill_total_ms,
+            ttft_max_ms: prefill_total_ms,
+        };
+
+        results.push(result);
+    }
+
+    // Calculate aggregate statistics
+    let throughputs: Vec<f64> = results.iter().map(|r| r.prefill_tok_per_s).collect();
+    let (median, mean, min, max) = calculate_stats(&throughputs);
+
+    Ok(PrefillBenchResults {
+        config,
+        repeats: results,
+        median_tok_per_s: median,
+        mean_tok_per_s: mean,
+        min_tok_per_s: min,
+        max_tok_per_s: max,
+    })
+}
+
 /// Calculate statistics from a slice of values.
 fn calculate_stats(values: &[f64]) -> (f64, f64, f64, f64) {
     if values.is_empty() {
@@ -982,16 +1107,23 @@ async fn bench_smoke_async() {
         }
     };
 
-    // Filter to only decode_only cases for wgpu backend
+    // Filter to decode_only and prefill_uniform cases for wgpu backend
     let decode_cases: Vec<_> = cases
         .iter()
         .filter(|c| c.scenario == "decode_only" && c.backend.backend_id == "wgpu")
         .collect();
 
-    println!("\n[bench] Expanded {} total cases, {} decode_only/wgpu cases", cases.len(), decode_cases.len());
+    let prefill_cases: Vec<_> = cases
+        .iter()
+        .filter(|c| c.scenario == "prefill_uniform" && c.backend.backend_id == "wgpu")
+        .collect();
 
-    if decode_cases.is_empty() {
-        println!("[bench] No decode_only cases to run");
+    println!("\n[bench] Expanded {} total cases", cases.len());
+    println!("[bench]   decode_only/wgpu: {}", decode_cases.len());
+    println!("[bench]   prefill_uniform/wgpu: {}", prefill_cases.len());
+
+    if decode_cases.is_empty() && prefill_cases.is_empty() {
+        println!("[bench] No cases to run");
         return;
     }
 
@@ -1163,6 +1295,136 @@ async fn bench_smoke_async() {
                         },
                         scenario_params: ScenarioParams::Decode { decode_steps },
                         metrics: Some(Metrics::Decode(metrics)),
+                    };
+
+                    if let Err(e) = writer.write_measure(&record) {
+                        eprintln!("[bench] Failed to write measure record: {}", e);
+                        total_errors += 1;
+                    }
+                }
+
+                total_executed += 1;
+            }
+            Err(e) => {
+                eprintln!("[bench]   Error: {}", e);
+                total_errors += 1;
+            }
+        }
+    }
+
+    // =========================================================================
+    // PREFILL_UNIFORM CASES
+    // =========================================================================
+    println!("\n--- Running prefill_uniform cases ---\n");
+
+    // Reset model tracking for prefill cases
+    current_model_path = None;
+    current_batch_size = None;
+    loaded_model = None;
+
+    for case in &prefill_cases {
+        let seq_len = match case.seq_len {
+            Some(len) => len,
+            None => {
+                println!("[bench] Skipping prefill case without seq_len: {}", case.case_id());
+                continue;
+            }
+        };
+
+        // Check if we need to reload the model (different model or batch size)
+        let need_reload = current_model_path.as_ref() != Some(&case.model.path) ||
+                         current_batch_size != Some(case.batch_size);
+
+        if need_reload {
+            println!("\n[bench] Loading model: {} (batch={})", case.model.model_name, case.batch_size);
+
+            // Check model file exists
+            if !Path::new(&case.model.path).exists() {
+                eprintln!("[bench] Model file not found: {}", case.model.path);
+                total_errors += 1;
+                continue;
+            }
+
+            match load_model(&case.model.path, case.batch_size as usize, case.token_chunk_size as usize).await {
+                Ok(model) => {
+                    println!("[bench] Model loaded: {:?}", model.info.version);
+                    current_model_path = Some(case.model.path.clone());
+                    current_batch_size = Some(case.batch_size);
+                    loaded_model = Some(model);
+                }
+                Err(e) => {
+                    eprintln!("[bench] Failed to load model: {}", e);
+                    total_errors += 1;
+                    continue;
+                }
+            }
+        }
+
+        let loaded = match &loaded_model {
+            Some(m) => m,
+            None => {
+                eprintln!("[bench] No model loaded");
+                continue;
+            }
+        };
+
+        // Generate case_id for prefill
+        let effective_chunk_size = round_chunk_size(case.token_chunk_size);
+        let case_id_params = CaseIdParams {
+            scenario: Scenario::PrefillUniform,
+            model_id: &case.model.model_name,
+            backend_id: &case.backend.backend_id,
+            wgpu_backend: "Vulkan", // Default for now
+            batch_size: case.batch_size,
+            token_chunk_size_effective: effective_chunk_size,
+            decode_steps: None,
+            seq_len: Some(seq_len),
+            mixed_case_id: None,
+        };
+        let case_id = generate_case_id(&case_id_params);
+
+        println!("[bench] Running: {} (seq_len={}, warmup={}, repeats={})",
+            case_id, seq_len, case.warmup_runs, case.repeats);
+
+        // Run the prefill benchmark
+        match run_prefill_benchmark(
+            loaded,
+            case.batch_size,
+            case.token_chunk_size as usize,
+            seq_len,
+            case.warmup_runs,
+            case.repeats,
+        ).await {
+            Ok(results) => {
+                println!("[bench]   Median: {:.1} tok/s, Mean: {:.1} tok/s",
+                    results.median_tok_per_s, results.mean_tok_per_s);
+
+                // Write measure records for each repeat
+                for (repeat_idx, repeat) in results.repeats.iter().enumerate() {
+                    let metrics = PrefillMetrics::from(repeat.clone());
+
+                    let record = MeasureRecord {
+                        run_id: run_id.clone(),
+                        case_id: case_id.clone(),
+                        repeat_index: repeat_idx as u32,
+                        scenario: Scenario::PrefillUniform,
+                        status: Status::Ok,
+                        error_kind: None,
+                        error_message: None,
+                        case_identity: CaseIdentity {
+                            model_id: case.model.model_id.clone(),
+                            model_name: case.model.model_name.clone(),
+                            model_path: case.model.path.clone(),
+                            model_size: case.model.model_size.clone(),
+                            rwkv_version: rwkv_version_str(loaded.info.version).to_string(),
+                            backend_id: case.backend.backend_id.clone(),
+                            wgpu_backend: "Vulkan".to_string(),
+                            batch_size: case.batch_size,
+                            token_chunk_size_requested: case.token_chunk_size,
+                            token_chunk_size_effective: effective_chunk_size,
+                        },
+                        scenario_params: ScenarioParams::PrefillUniform { seq_len },
+                        metrics: Some(Metrics::Prefill(metrics)),
                     };
 
                     if let Err(e) = writer.write_measure(&record) {
