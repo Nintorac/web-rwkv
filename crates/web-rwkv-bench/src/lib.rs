@@ -6,6 +6,7 @@
 //! - Config parsing for benchmark settings (skip conditions, limits)
 //! - Skip condition evaluation to filter benchmark cases
 //! - Limits tracking for controlling benchmark execution
+//! - Environment/build metadata collection for benchmark run headers
 //! - Sweep execution engine for cartesian expansion and case lifecycle management
 //!
 //! # Sweep Execution
@@ -41,9 +42,11 @@
 //! ```
 
 pub mod config;
+pub mod metadata;
 pub mod skip;
 pub mod sweep;
 
 pub use config::{CustomRule, Limits, SkipConditions};
+pub use metadata::{collect_run_metadata, BuildInfo, GitInfo, GpuInfo, HostInfo, RunMetadata};
 pub use skip::{LimitsTracker, SkipReason};
 pub use sweep::{CaseParams, ExpandedCase, Hooks, SweepConfig, SweepEngine, SweepSummary};
