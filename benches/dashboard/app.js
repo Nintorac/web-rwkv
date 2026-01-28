@@ -1218,6 +1218,12 @@
         const runsMap = new Map();
         state.data.runs.forEach(run => runsMap.set(run.run_id, run));
 
+        // Attach run timestamp for display (non-persistent)
+        filtered.forEach(m => {
+            const run = runsMap.get(m.run_id);
+            m._run_started_at = run?.started_at_utc || null;
+        });
+
         // Apply each filter
         // Note: token_chunk_size uses token_chunk_size_effective (or token_chunk_size_requested as fallback)
         const measureFilters = ['scenario', 'model_name', 'model_size', 'backend_id', 'wgpu_backend',
@@ -1446,6 +1452,7 @@
             const agg = {
                 case_id: caseId,
                 scenario: template.scenario,
+                started_at_utc: template._run_started_at || null,
                 model_name: template.model_name,
                 model_size: template.model_size,
                 backend_id: template.backend_id,
@@ -1582,6 +1589,7 @@
         // Base columns always shown
         const columns = [
             { key: 'scenario', label: 'Scenario', sortable: true },
+            { key: 'started_at_utc', label: 'Time', sortable: true },
             { key: 'model_name', label: 'Model', sortable: true },
             { key: 'model_size', label: 'Size', sortable: true },
             { key: 'backend_id', label: 'Backend', sortable: true },
@@ -1669,6 +1677,10 @@
             return '<span class="cell-empty">--</span>';
         }
 
+        if (key === 'started_at_utc') {
+            return formatRunTimestamp(value);
+        }
+
         // Format numbers
         if (typeof value === 'number') {
             if (isMetric) {
@@ -1698,6 +1710,21 @@
         }
 
         return escapeHtml(String(value));
+    }
+
+    function formatRunTimestamp(value) {
+        try {
+            const date = new Date(value);
+            return date.toLocaleString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+            });
+        } catch {
+            return escapeHtml(String(value));
+        }
     }
 
     /**
@@ -2407,7 +2434,8 @@
                 config.xKey !== 'batch_size' ? (m.batch_size || '?') : null,
                 m.model_name || '?',
                 m.backend_id || '?',
-                config.xKey !== 'token_chunk_size' ? (chunkSize || '?') : null
+                config.xKey !== 'token_chunk_size' ? (chunkSize || '?') : null,
+                m.run_id || '?'
             ].filter(part => part !== null);
             const seriesKey = seriesKeyParts.join('|');
 
@@ -2419,6 +2447,8 @@
                     model_size: m.model_size,
                     backend_id: m.backend_id,
                     token_chunk_size: chunkSize,
+                    run_id: m.run_id,
+                    run_started_at: m._run_started_at || null,
                     xKey: config.xKey,
                     points: new Map()  // xKey -> [values]
                 });
@@ -2455,6 +2485,8 @@
                     model_size: series.model_size,
                     backend_id: series.backend_id,
                     token_chunk_size: series.token_chunk_size,
+                    run_id: series.run_id,
+                    run_started_at: series.run_started_at,
                     xKey: series.xKey,
                     points: points
                 });
@@ -2746,6 +2778,9 @@
         if (series.token_chunk_size != null && config?.xKey !== 'token_chunk_size') {
             parts.push(`c=${series.token_chunk_size}`);
         }
+        if (series.run_started_at) {
+            parts.push(formatRunTimestamp(series.run_started_at));
+        }
         return parts.join(' ');
     }
 
@@ -2762,6 +2797,9 @@
         }
         if (series.token_chunk_size != null && config?.xKey !== 'token_chunk_size') {
             parts.push(`Chunk: ${series.token_chunk_size}`);
+        }
+        if (series.run_started_at) {
+            parts.push(`Time: ${formatRunTimestamp(series.run_started_at)}`);
         }
         return parts.join(', ');
     }
