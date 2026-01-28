@@ -31,11 +31,32 @@
 //! in the config file. Each run creates a new file with the pattern specified by
 //! `output.filename_pattern`.
 
+use half::f16;
+use memmap2::Mmap;
+use safetensors::SafeTensors;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::Path;
+use tokio::fs::File as TokioFile;
+
+use web_rwkv::{
+    context::{Context, ContextBuilder, InstanceExt},
+    runtime::{
+        infer::{Rnn, RnnInput, RnnInputBatch, RnnOption},
+        loader::Loader,
+        model::{ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
+        v4, v5, v6, v7, Runtime, TokioRuntime,
+    },
+};
+
+use web_rwkv_bench::{
+    collect_run_metadata, generate_case_id, generate_run_id, generate_timestamp_utc,
+    round_chunk_size, CaseIdParams, CaseIdentity, DecodeConfig, DecodeResults,
+    JsonlGpuInfo, JsonlHostInfo as HostInfo, JsonlWriter, MeasureRecord, Metrics,
+    RunHeader, Scenario, ScenarioParams, Status,
+};
 
 /// Default config file path
 const DEFAULT_CONFIG_PATH: &str = "benchmarks/config.yaml";
@@ -685,13 +706,237 @@ pub fn expand_profile(config: &BenchConfig, profile: &Profile) -> Result<Vec<Ben
 }
 
 // =============================================================================
+// BENCHMARK EXECUTION
+// =============================================================================
+
+/// Loaded model and runtime ready for inference
+struct LoadedModel {
+    #[allow(dead_code)]
+    context: Context,
+    runtime: Box<dyn Runtime<Rnn>>,
+    info: ModelInfo,
+    vocab_size: u32,
+}
+
+/// Create a wgpu context for the given model info
+async fn create_context(info: &ModelInfo) -> anyhow::Result<Context> {
+    let instance = wgpu::Instance::default();
+    let adapter = instance
+        .adapter(wgpu::PowerPreference::HighPerformance)
+        .await?;
+    let context = ContextBuilder::new(adapter)
+        .auto_limits(info)
+        .build()
+        .await?;
+    Ok(context)
+}
+
+/// Load a model and create runtime
+async fn load_model(model_path: &str, batch_size: usize, _token_chunk_size: usize) -> anyhow::Result<LoadedModel> {
+    let file = TokioFile::open(model_path).await?;
+    let data = unsafe { Mmap::map(&file)? };
+
+    let model = SafeTensors::deserialize(&data)?;
+    let info = Loader::info(&model)?;
+
+    let context = create_context(&info).await?;
+
+    let builder = ModelBuilder::new(&context, model);
+
+    let vocab_size = info.num_vocab as u32;
+
+    let runtime: Box<dyn Runtime<Rnn>> = match info.version {
+        ModelVersion::V4 => {
+            let model = builder.build_v4().await?;
+            let bundle = v4::Bundle::<f16>::new(model, batch_size);
+            Box::new(TokioRuntime::new(bundle).await)
+        }
+        ModelVersion::V5 => {
+            let model = builder.build_v5().await?;
+            let bundle = v5::Bundle::<f16>::new(model, batch_size);
+            Box::new(TokioRuntime::new(bundle).await)
+        }
+        ModelVersion::V6 => {
+            let model = builder.build_v6().await?;
+            let bundle = v6::Bundle::<f16>::new(model, batch_size);
+            Box::new(TokioRuntime::new(bundle).await)
+        }
+        ModelVersion::V7 => {
+            let model = builder.build_v7().await?;
+            let bundle = v7::Bundle::<f16>::new(model, batch_size);
+            Box::new(TokioRuntime::new(bundle).await)
+        }
+    };
+
+    Ok(LoadedModel {
+        context,
+        runtime,
+        info,
+        vocab_size,
+    })
+}
+
+/// Run a decode-only benchmark case
+///
+/// This function manually implements the decode scenario loop because we need to
+/// run inference asynchronously. The DecodeScenario::run() API expects a sync closure,
+/// but our runtime.infer() is async.
+async fn run_decode_benchmark(
+    loaded: &LoadedModel,
+    batch_size: u32,
+    token_chunk_size: usize,
+    decode_steps: u32,
+    warmup_runs: u32,
+    repeats: u32,
+) -> anyhow::Result<DecodeResults> {
+    use std::time::{Duration, Instant};
+    use web_rwkv_bench::{DecodeRepeatResult, TokenRng};
+
+    let vocab_size = loaded.vocab_size;
+    let runtime = &loaded.runtime;
+    let warmup_steps = 64.min(decode_steps);
+    let settle_ms = 50u64;
+
+    let mut rng = TokenRng::new(42);
+    let mut results = Vec::with_capacity(repeats as usize);
+
+    // === Warmup Phase ===
+    for _ in 0..warmup_runs {
+        for _ in 0..warmup_steps {
+            let batches: Vec<RnnInputBatch> = (0..batch_size)
+                .map(|_| {
+                    let token = rng.next_token(vocab_size) as u32;
+                    RnnInputBatch::new(vec![token], RnnOption::Last)
+                })
+                .collect();
+            let input = RnnInput::new(batches, token_chunk_size);
+            let (_remaining, _output) = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        }
+    }
+
+    // === Measurement Phase ===
+    for repeat_idx in 0..repeats {
+        // Optional settle delay
+        if repeat_idx > 0 {
+            tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+        }
+
+        // Reset RNG for reproducibility across repeats
+        rng = TokenRng::new(42);
+
+        // Pre-generate all tokens for this repeat
+        let all_tokens: Vec<Vec<u32>> = (0..decode_steps)
+            .map(|_| {
+                (0..batch_size)
+                    .map(|_| rng.next_token(vocab_size) as u32)
+                    .collect()
+            })
+            .collect();
+
+        // Timed decode loop
+        let start = Instant::now();
+
+        for step_tokens in &all_tokens {
+            let batches: Vec<RnnInputBatch> = step_tokens
+                .iter()
+                .map(|&token| RnnInputBatch::new(vec![token], RnnOption::Last))
+                .collect();
+            let input = RnnInput::new(batches, token_chunk_size);
+            let (_remaining, _output) = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        }
+
+        let elapsed = start.elapsed();
+        let decode_total_ms = elapsed.as_secs_f64() * 1000.0;
+        let decode_tokens = batch_size * decode_steps;
+        let decode_tok_per_s = decode_tokens as f64 / elapsed.as_secs_f64();
+
+        results.push(DecodeRepeatResult {
+            repeat_index: repeat_idx,
+            decode_total_ms,
+            decode_steps,
+            decode_tokens,
+            decode_tok_per_s,
+            step_latencies_ms: None,
+        });
+    }
+
+    // Calculate aggregate statistics
+    let throughputs: Vec<f64> = results.iter().map(|r| r.decode_tok_per_s).collect();
+    let (median, mean, min, max) = calculate_stats(&throughputs);
+
+    let config = DecodeConfig {
+        decode_steps,
+        batch_size,
+        seed: 42,
+        warmup_runs,
+        warmup_steps,
+        repeats,
+        prime_prefill_len: None,
+        settle_ms: Some(settle_ms),
+        collect_per_step_latencies: false,
+    };
+
+    Ok(DecodeResults {
+        config,
+        repeats: results,
+        median_tok_per_s: median,
+        mean_tok_per_s: mean,
+        min_tok_per_s: min,
+        max_tok_per_s: max,
+    })
+}
+
+/// Calculate statistics from a slice of values.
+fn calculate_stats(values: &[f64]) -> (f64, f64, f64, f64) {
+    if values.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+
+    let sum: f64 = values.iter().sum();
+    let mean = sum / values.len() as f64;
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let median = if sorted.len() % 2 == 0 {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+
+    let min = *sorted.first().unwrap();
+    let max = *sorted.last().unwrap();
+
+    (median, mean, min, max)
+}
+
+/// Get RWKV version string from ModelVersion
+fn rwkv_version_str(version: ModelVersion) -> &'static str {
+    match version {
+        ModelVersion::V4 => "v4",
+        ModelVersion::V5 => "v5",
+        ModelVersion::V6 => "v6",
+        ModelVersion::V7 => "v7",
+    }
+}
+
+// =============================================================================
 // TESTS
 // =============================================================================
 
-/// Smoke test: load config, select profile, expand cases
+/// Smoke test: load config, select profile, expand cases, and run benchmarks
 #[test]
 #[ignore]
 fn bench_smoke() {
+    // Build a tokio runtime for async operations
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+
+    rt.block_on(async {
+        bench_smoke_async().await;
+    });
+}
+
+async fn bench_smoke_async() {
     println!("\n=== web-rwkv Benchmark Runner ===\n");
 
     // Load configuration
@@ -737,35 +982,214 @@ fn bench_smoke() {
         }
     };
 
-    println!("\n[bench] Expanded {} benchmark cases:", cases.len());
-    for (i, case) in cases.iter().enumerate() {
-        println!(
-            "[bench]   {}. {} (batch={}, chunk={}, seq={:?}, steps={:?})",
-            i + 1,
-            case.case_id(),
-            case.batch_size,
-            case.token_chunk_size,
-            case.seq_len,
-            case.decode_steps,
-        );
+    // Filter to only decode_only cases for wgpu backend
+    let decode_cases: Vec<_> = cases
+        .iter()
+        .filter(|c| c.scenario == "decode_only" && c.backend.backend_id == "wgpu")
+        .collect();
+
+    println!("\n[bench] Expanded {} total cases, {} decode_only/wgpu cases", cases.len(), decode_cases.len());
+
+    if decode_cases.is_empty() {
+        println!("[bench] No decode_only cases to run");
+        return;
     }
 
-    // Output configuration
-    println!("\n[bench] Output configuration:");
-    println!("[bench]   Directory: {}", config.output.directory);
-    println!("[bench]   Pattern: {}", config.output.filename_pattern);
-    println!("[bench]   Mode: {}", config.output.mode);
+    // Create output directory
+    let output_dir = Path::new(&config.output.directory);
+    if let Err(e) = fs::create_dir_all(output_dir) {
+        eprintln!("[bench] Failed to create output directory: {}", e);
+        return;
+    }
 
-    // Limits
-    println!("\n[bench] Limits:");
-    println!("[bench]   Max total cases: {}", config.limits.max_total_cases);
-    println!("[bench]   Max runtime: {}s", config.limits.max_runtime_seconds);
-    println!("[bench]   Fail fast: {}", config.limits.fail_fast);
-    println!("[bench]   Case timeout: {}s", config.limits.case_timeout_seconds);
+    // Generate run ID and output file path
+    let run_id = generate_run_id();
+    let timestamp = generate_timestamp_utc();
+    let output_filename = config.output.filename_pattern
+        .replace("{profile}", &profile_name)
+        .replace("{timestamp}", &timestamp.replace(":", "").replace("-", ""))
+        .replace("{run_id}", &run_id);
+    let output_path = output_dir.join(&output_filename);
 
-    println!("\n[bench] Harness ready. Sweep execution will be implemented in subsequent tickets.");
-    println!("[bench] (bd-2ey.7: Sweep execution engine)");
-    println!("[bench] (bd-2ey.8: JSONL writer)");
+    println!("[bench] Output file: {}", output_path.display());
+
+    // Create JSONL writer
+    let mut writer = match JsonlWriter::create(&output_path) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[bench] Failed to create output file: {}", e);
+            return;
+        }
+    };
+
+    // Collect metadata and write run header
+    let metadata = collect_run_metadata(None);
+
+    let run_header = RunHeader {
+        run_id: run_id.clone(),
+        started_at_utc: timestamp.clone(),
+        git_sha: metadata.git.sha.clone().unwrap_or_else(|| "unknown".to_string()),
+        git_dirty: metadata.git.dirty.unwrap_or(true),
+        crate_version: metadata.build.crate_version.clone().unwrap_or_else(|| "unknown".to_string()),
+        rustc_version: metadata.build.rustc_version.clone().unwrap_or_else(|| "unknown".to_string()),
+        host: HostInfo {
+            os: metadata.host.os.clone().unwrap_or_else(|| "unknown".to_string()),
+            cpu: metadata.host.cpu.clone().unwrap_or_else(|| "unknown".to_string()),
+            ram_gb: metadata.host.ram_gb.unwrap_or(0.0),
+        },
+        gpu: JsonlGpuInfo {
+            adapter_name: "pending".to_string(),
+            backend_api: "wgpu".to_string(),
+            driver_version: None,
+            driver_info: None,
+        },
+        uname: metadata.host.uname.clone(),
+    };
+
+    if let Err(e) = writer.write_run_header(&run_header) {
+        eprintln!("[bench] Failed to write run header: {}", e);
+        return;
+    }
+    println!("[bench] Wrote run header");
+
+    // Group cases by model to avoid reloading
+    let mut current_model_path: Option<String> = None;
+    let mut current_batch_size: Option<u32> = None;
+    let mut loaded_model: Option<LoadedModel> = None;
+
+    let mut total_executed = 0;
+    let mut total_errors = 0;
+
+    for case in &decode_cases {
+        let decode_steps = match case.decode_steps {
+            Some(steps) => steps,
+            None => {
+                println!("[bench] Skipping case without decode_steps: {}", case.case_id());
+                continue;
+            }
+        };
+
+        // Check if we need to reload the model (different model or batch size)
+        let need_reload = current_model_path.as_ref() != Some(&case.model.path) ||
+                         current_batch_size != Some(case.batch_size);
+
+        if need_reload {
+            println!("\n[bench] Loading model: {} (batch={})", case.model.model_name, case.batch_size);
+
+            // Check model file exists
+            if !Path::new(&case.model.path).exists() {
+                eprintln!("[bench] Model file not found: {}", case.model.path);
+                total_errors += 1;
+                continue;
+            }
+
+            match load_model(&case.model.path, case.batch_size as usize, case.token_chunk_size as usize).await {
+                Ok(model) => {
+                    println!("[bench] Model loaded: {:?}", model.info.version);
+                    current_model_path = Some(case.model.path.clone());
+                    current_batch_size = Some(case.batch_size);
+                    loaded_model = Some(model);
+                }
+                Err(e) => {
+                    eprintln!("[bench] Failed to load model: {}", e);
+                    total_errors += 1;
+                    continue;
+                }
+            }
+        }
+
+        let loaded = match &loaded_model {
+            Some(m) => m,
+            None => {
+                eprintln!("[bench] No model loaded");
+                continue;
+            }
+        };
+
+        // Generate case_id
+        let effective_chunk_size = round_chunk_size(case.token_chunk_size);
+        let case_id_params = CaseIdParams {
+            scenario: Scenario::DecodeOnly,
+            model_id: &case.model.model_name,
+            backend_id: &case.backend.backend_id,
+            wgpu_backend: "Vulkan", // Default for now
+            batch_size: case.batch_size,
+            token_chunk_size_effective: effective_chunk_size,
+            decode_steps: Some(decode_steps),
+            seq_len: None,
+            mixed_case_id: None,
+        };
+        let case_id = generate_case_id(&case_id_params);
+
+        println!("[bench] Running: {} (steps={}, warmup={}, repeats={})",
+            case_id, decode_steps, case.warmup_runs, case.repeats);
+
+        // Run the benchmark
+        match run_decode_benchmark(
+            loaded,
+            case.batch_size,
+            case.token_chunk_size as usize,
+            decode_steps,
+            case.warmup_runs,
+            case.repeats,
+        ).await {
+            Ok(results) => {
+                println!("[bench]   Median: {:.1} tok/s, Mean: {:.1} tok/s",
+                    results.median_tok_per_s, results.mean_tok_per_s);
+
+                // Write measure records for each repeat
+                for (repeat_idx, _repeat) in results.repeats.iter().enumerate() {
+                    let metrics = results.to_metrics_for_repeat(repeat_idx);
+
+                    let record = MeasureRecord {
+                        run_id: run_id.clone(),
+                        case_id: case_id.clone(),
+                        repeat_index: repeat_idx as u32,
+                        scenario: Scenario::DecodeOnly,
+                        status: Status::Ok,
+                        error_kind: None,
+                        error_message: None,
+                        case_identity: CaseIdentity {
+                            model_id: case.model.model_id.clone(),
+                            model_name: case.model.model_name.clone(),
+                            model_path: case.model.path.clone(),
+                            model_size: case.model.model_size.clone(),
+                            rwkv_version: rwkv_version_str(loaded.info.version).to_string(),
+                            backend_id: case.backend.backend_id.clone(),
+                            wgpu_backend: "Vulkan".to_string(),
+                            batch_size: case.batch_size,
+                            token_chunk_size_requested: case.token_chunk_size,
+                            token_chunk_size_effective: effective_chunk_size,
+                        },
+                        scenario_params: ScenarioParams::Decode { decode_steps },
+                        metrics: Some(Metrics::Decode(metrics)),
+                    };
+
+                    if let Err(e) = writer.write_measure(&record) {
+                        eprintln!("[bench] Failed to write measure record: {}", e);
+                        total_errors += 1;
+                    }
+                }
+
+                total_executed += 1;
+            }
+            Err(e) => {
+                eprintln!("[bench]   Error: {}", e);
+                total_errors += 1;
+            }
+        }
+    }
+
+    // Flush and report
+    if let Err(e) = writer.flush() {
+        eprintln!("[bench] Failed to flush output: {}", e);
+    }
+
+    println!("\n=== Benchmark Summary ===");
+    println!("[bench] Cases executed: {}", total_executed);
+    println!("[bench] Errors: {}", total_errors);
+    println!("[bench] Records written: {}", writer.records_written());
+    println!("[bench] Output file: {}", output_path.display());
 }
 
 /// Test that validates config parsing
