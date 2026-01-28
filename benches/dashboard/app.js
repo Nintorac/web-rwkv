@@ -998,16 +998,322 @@
 
     /**
      * Render heatmap view using D3
+     * Displays batch_size x seq_len colored by tok/s for prefill-uniform data
      */
     function renderHeatmap() {
-        // Placeholder: will be implemented in later tickets
-        console.log('[dashboard] renderHeatmap() - Not yet implemented');
-        elements.viewContainer.innerHTML = `
-            <div class="empty-state">
-                <p>Heatmap view</p>
-                <p class="empty-hint">Coming soon</p>
-            </div>
+        console.log('[dashboard] renderHeatmap()');
+
+        // Get filtered data and filter to prefill_uniform scenario only
+        const allFiltered = applyFilters();
+        const filtered = allFiltered.filter(m => m.scenario === 'prefill_uniform');
+
+        if (filtered.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>No prefill-uniform data available</p>
+                    <p class="empty-hint">Load benchmark data with prefill_uniform scenario or adjust filters</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Extract unique batch_sizes and seq_lens, sorted numerically
+        const batchSizes = [...new Set(filtered.map(m => m.batch_size))].filter(v => v != null).sort((a, b) => a - b);
+        const seqLens = [...new Set(filtered.map(m => m.seq_len))].filter(v => v != null).sort((a, b) => a - b);
+
+        if (batchSizes.length === 0 || seqLens.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>Insufficient data for heatmap</p>
+                    <p class="empty-hint">Need batch_size and seq_len values in data</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Build a lookup map: (batch_size, seq_len) -> aggregated tok/s
+        // For cells with multiple measures (repeats), we average
+        const dataMap = new Map();
+        filtered.forEach(m => {
+            if (m.batch_size == null || m.seq_len == null || m.prefill_tok_per_s == null) return;
+            const key = `${m.batch_size}_${m.seq_len}`;
+            if (!dataMap.has(key)) {
+                dataMap.set(key, { values: [], batch_size: m.batch_size, seq_len: m.seq_len });
+            }
+            dataMap.get(key).values.push(m.prefill_tok_per_s);
+        });
+
+        // Compute averages
+        const heatmapData = [];
+        dataMap.forEach((entry, key) => {
+            const avg = entry.values.reduce((a, b) => a + b, 0) / entry.values.length;
+            heatmapData.push({
+                batch_size: entry.batch_size,
+                seq_len: entry.seq_len,
+                value: avg,
+                count: entry.values.length
+            });
+        });
+
+        // Find value range for color scale
+        const values = heatmapData.map(d => d.value);
+        const minValue = Math.min(...values);
+        const maxValue = Math.max(...values);
+
+        // Render the heatmap
+        renderHeatmapSVG(heatmapData, batchSizes, seqLens, minValue, maxValue);
+    }
+
+    /**
+     * Render heatmap SVG using D3
+     */
+    function renderHeatmapSVG(data, batchSizes, seqLens, minValue, maxValue) {
+        // Clear container
+        elements.viewContainer.innerHTML = '';
+
+        // Create wrapper div
+        const wrapper = document.createElement('div');
+        wrapper.className = 'heatmap-wrapper';
+        elements.viewContainer.appendChild(wrapper);
+
+        // Dimensions
+        const margin = { top: 40, right: 120, bottom: 60, left: 80 };
+        const containerWidth = elements.viewContainer.clientWidth || 800;
+        const width = Math.min(containerWidth - margin.left - margin.right, 800);
+        const height = Math.max(300, Math.min(500, seqLens.length * 35));
+
+        const cellWidth = width / seqLens.length;
+        const cellHeight = height / batchSizes.length;
+
+        // Create SVG
+        const svg = d3.select(wrapper)
+            .append('svg')
+            .attr('width', width + margin.left + margin.right)
+            .attr('height', height + margin.top + margin.bottom)
+            .attr('class', 'heatmap-svg');
+
+        const g = svg.append('g')
+            .attr('transform', `translate(${margin.left},${margin.top})`);
+
+        // Color scale (blues - darker = higher throughput)
+        const colorScale = d3.scaleSequential()
+            .domain([minValue, maxValue])
+            .interpolator(d3.interpolateBlues);
+
+        // Build a quick lookup for cell data
+        const dataLookup = new Map();
+        data.forEach(d => {
+            dataLookup.set(`${d.batch_size}_${d.seq_len}`, d);
+        });
+
+        // X scale (seq_len)
+        const xScale = d3.scaleBand()
+            .domain(seqLens.map(String))
+            .range([0, width])
+            .padding(0.05);
+
+        // Y scale (batch_size)
+        const yScale = d3.scaleBand()
+            .domain(batchSizes.map(String))
+            .range([0, height])
+            .padding(0.05);
+
+        // Draw cells for each combination
+        batchSizes.forEach(bs => {
+            seqLens.forEach(sl => {
+                const cellData = dataLookup.get(`${bs}_${sl}`);
+                const x = xScale(String(sl));
+                const y = yScale(String(bs));
+
+                if (cellData) {
+                    // Cell with data
+                    g.append('rect')
+                        .attr('x', x)
+                        .attr('y', y)
+                        .attr('width', xScale.bandwidth())
+                        .attr('height', yScale.bandwidth())
+                        .attr('fill', colorScale(cellData.value))
+                        .attr('class', 'heatmap-cell')
+                        .on('mouseover', function(event) {
+                            showHeatmapTooltip(event, cellData);
+                        })
+                        .on('mouseout', hideHeatmapTooltip);
+                } else {
+                    // Missing cell - show as gray with diagonal pattern
+                    g.append('rect')
+                        .attr('x', x)
+                        .attr('y', y)
+                        .attr('width', xScale.bandwidth())
+                        .attr('height', yScale.bandwidth())
+                        .attr('fill', 'var(--bg-tertiary)')
+                        .attr('stroke', 'var(--border-subtle)')
+                        .attr('stroke-width', 1)
+                        .attr('class', 'heatmap-cell heatmap-cell-missing');
+                }
+            });
+        });
+
+        // X axis (seq_len)
+        const xAxis = g.append('g')
+            .attr('class', 'axis x-axis')
+            .attr('transform', `translate(0,${height})`)
+            .call(d3.axisBottom(xScale));
+
+        // X axis label
+        g.append('text')
+            .attr('class', 'axis-label')
+            .attr('x', width / 2)
+            .attr('y', height + 45)
+            .attr('text-anchor', 'middle')
+            .text('Sequence Length');
+
+        // Y axis (batch_size)
+        const yAxis = g.append('g')
+            .attr('class', 'axis y-axis')
+            .call(d3.axisLeft(yScale));
+
+        // Y axis label
+        g.append('text')
+            .attr('class', 'axis-label')
+            .attr('transform', 'rotate(-90)')
+            .attr('x', -height / 2)
+            .attr('y', -50)
+            .attr('text-anchor', 'middle')
+            .text('Batch Size');
+
+        // Color legend
+        renderHeatmapLegend(svg, colorScale, minValue, maxValue, width + margin.left + 20, margin.top, height);
+
+        // Title
+        svg.append('text')
+            .attr('class', 'chart-title')
+            .attr('x', margin.left + width / 2)
+            .attr('y', 20)
+            .attr('text-anchor', 'middle')
+            .text('Prefill Throughput (tok/s) by Batch Size and Sequence Length');
+
+        console.log(`[dashboard] Heatmap rendered: ${batchSizes.length} x ${seqLens.length} grid, ${data.length} cells with data`);
+    }
+
+    /**
+     * Render color legend for heatmap
+     */
+    function renderHeatmapLegend(svg, colorScale, minValue, maxValue, x, y, height) {
+        const legendWidth = 20;
+        const legendHeight = Math.min(height, 200);
+
+        const legendGroup = svg.append('g')
+            .attr('class', 'legend')
+            .attr('transform', `translate(${x},${y})`);
+
+        // Create gradient
+        const gradientId = 'heatmap-gradient-' + Date.now();
+        const defs = svg.append('defs');
+        const gradient = defs.append('linearGradient')
+            .attr('id', gradientId)
+            .attr('x1', '0%')
+            .attr('y1', '100%')
+            .attr('x2', '0%')
+            .attr('y2', '0%');
+
+        // Add gradient stops
+        const nStops = 10;
+        for (let i = 0; i <= nStops; i++) {
+            const t = i / nStops;
+            const value = minValue + t * (maxValue - minValue);
+            gradient.append('stop')
+                .attr('offset', `${t * 100}%`)
+                .attr('stop-color', colorScale(value));
+        }
+
+        // Draw legend rect
+        legendGroup.append('rect')
+            .attr('width', legendWidth)
+            .attr('height', legendHeight)
+            .attr('fill', `url(#${gradientId})`)
+            .attr('stroke', 'var(--border-color)')
+            .attr('stroke-width', 1);
+
+        // Legend scale
+        const legendScale = d3.scaleLinear()
+            .domain([minValue, maxValue])
+            .range([legendHeight, 0]);
+
+        // Legend axis
+        const legendAxis = d3.axisRight(legendScale)
+            .ticks(5)
+            .tickFormat(d => formatThroughput(d));
+
+        legendGroup.append('g')
+            .attr('class', 'legend-axis')
+            .attr('transform', `translate(${legendWidth},0)`)
+            .call(legendAxis);
+
+        // Legend title
+        legendGroup.append('text')
+            .attr('class', 'legend-title')
+            .attr('x', legendWidth / 2)
+            .attr('y', -10)
+            .attr('text-anchor', 'middle')
+            .text('tok/s');
+    }
+
+    /**
+     * Format throughput value for display
+     */
+    function formatThroughput(value) {
+        if (value >= 1000000) {
+            return (value / 1000000).toFixed(1) + 'M';
+        } else if (value >= 1000) {
+            return (value / 1000).toFixed(1) + 'K';
+        } else {
+            return value.toFixed(0);
+        }
+    }
+
+    /**
+     * Show tooltip for heatmap cell
+     */
+    function showHeatmapTooltip(event, cellData) {
+        // Remove existing tooltip
+        hideHeatmapTooltip();
+
+        const tooltip = document.createElement('div');
+        tooltip.className = 'heatmap-tooltip';
+        tooltip.innerHTML = `
+            <div class="tooltip-row"><strong>Batch Size:</strong> ${cellData.batch_size}</div>
+            <div class="tooltip-row"><strong>Seq Length:</strong> ${cellData.seq_len}</div>
+            <div class="tooltip-row"><strong>Throughput:</strong> ${formatThroughput(cellData.value)} tok/s</div>
+            <div class="tooltip-row"><strong>Samples:</strong> ${cellData.count}</div>
         `;
+
+        document.body.appendChild(tooltip);
+
+        // Position tooltip
+        const tooltipRect = tooltip.getBoundingClientRect();
+        let left = event.pageX + 10;
+        let top = event.pageY + 10;
+
+        // Keep tooltip in viewport
+        if (left + tooltipRect.width > window.innerWidth) {
+            left = event.pageX - tooltipRect.width - 10;
+        }
+        if (top + tooltipRect.height > window.innerHeight) {
+            top = event.pageY - tooltipRect.height - 10;
+        }
+
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+    }
+
+    /**
+     * Hide heatmap tooltip
+     */
+    function hideHeatmapTooltip() {
+        const existing = document.querySelector('.heatmap-tooltip');
+        if (existing) {
+            existing.remove();
+        }
     }
 
     /**

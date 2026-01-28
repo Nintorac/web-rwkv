@@ -490,6 +490,100 @@ body {
     stroke-dasharray: 2,2;
 }
 
+/* Heatmap styles */
+.heatmap-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.heatmap-svg {
+    font-family: var(--font-sans);
+}
+
+.heatmap-svg .axis text {
+    font-size: 11px;
+    fill: var(--text-secondary);
+}
+
+.heatmap-svg .axis line,
+.heatmap-svg .axis path {
+    stroke: var(--border-color);
+}
+
+.heatmap-svg .axis-label {
+    font-size: 12px;
+    font-weight: 500;
+    fill: var(--text-secondary);
+}
+
+.heatmap-svg .chart-title {
+    font-size: 13px;
+    font-weight: 600;
+    fill: var(--text-primary);
+}
+
+.heatmap-cell {
+    cursor: pointer;
+    transition: opacity 0.1s ease;
+}
+
+.heatmap-cell:hover {
+    opacity: 0.85;
+    stroke: var(--text-primary);
+    stroke-width: 2;
+}
+
+.heatmap-cell-missing {
+    cursor: default;
+}
+
+.heatmap-cell-missing:hover {
+    opacity: 1;
+    stroke: var(--border-subtle);
+    stroke-width: 1;
+}
+
+/* Heatmap legend */
+.legend-axis text {
+    font-size: 10px;
+    fill: var(--text-secondary);
+}
+
+.legend-axis line,
+.legend-axis path {
+    stroke: var(--border-color);
+}
+
+.legend-title {
+    font-size: 11px;
+    font-weight: 500;
+    fill: var(--text-secondary);
+}
+
+/* Heatmap tooltip */
+.heatmap-tooltip {
+    position: fixed;
+    z-index: 1000;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: var(--space-sm) var(--space-md);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    pointer-events: none;
+    font-size: 12px;
+    min-width: 150px;
+}
+
+.heatmap-tooltip .tooltip-row {
+    padding: 2px 0;
+    color: var(--text-primary);
+}
+
+.heatmap-tooltip .tooltip-row strong {
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
 /* Footer */
 .footer {
     display: flex;
