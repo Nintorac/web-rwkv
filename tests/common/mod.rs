@@ -31,6 +31,42 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
+/// Tolerance specifications for different tensor types.
+///
+/// These tolerances are calibrated for comparing FP32 HIP output against BF16 reference
+/// (Python chunk_rwkv7 from rwkvfla). BF16 has only 7 mantissa bits, so the reference
+/// itself is only accurate to ~0.4% relative precision. Standard practice (per Triton
+/// and PyTorch testing guidelines) is atol=1e-2, rtol=1e-2 for FP32-vs-BF16 comparisons.
+///
+/// See: https://github.com/triton-lang/triton/issues/5283
+#[derive(Clone, Copy, Debug)]
+pub struct Tolerances {
+    pub rtol: f32,
+    pub atol: f32,
+}
+
+impl Tolerances {
+    /// BF16-appropriate tolerance for normalized activations (after layernorm, groupnorm, L2norm).
+    /// Normalization can amplify input differences for low-variance groups, so we use
+    /// the standard BF16 tolerance rather than trying to be tighter.
+    pub const NORMALIZED: Self = Self { rtol: 1e-2, atol: 1e-2 };
+
+    /// Tolerance for linear projections and matrix multiplications.
+    /// Standard BF16 comparison tolerance.
+    pub const MATMUL: Self = Self { rtol: 1e-2, atol: 1e-2 };
+
+    /// Tolerance for activations with potential numerical instability.
+    pub const ACTIVATION: Self = Self { rtol: 1e-2, atol: 1e-2 };
+
+    /// Tolerance for WKV state (FP32 accumulation on both sides).
+    /// Can be tighter since both implementations use FP32 for state.
+    pub const STATE: Self = Self { rtol: 1e-3, atol: 1e-4 };
+
+    /// Tolerance for values with accumulated error across layers.
+    /// After 12 layers, expect ~1e-2 aggregate relative error.
+    pub const ACCUMULATED: Self = Self { rtol: 2e-2, atol: 2e-2 };
+}
+
 /// Supported array types in fixtures.
 ///
 /// Note: f16 arrays are stored as f32 in the fixtures for compatibility.

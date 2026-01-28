@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{assert_tensors_close, TestFixture};
+use common::{assert_tensors_close, TestFixture, Tolerances};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -24,42 +24,6 @@ struct ValidationResult {
     fixture_key: String,
     passed: bool,
     error: Option<String>,
-}
-
-/// Tolerance specifications for different tensor types.
-///
-/// These tolerances are calibrated for comparing FP32 HIP output against BF16 reference
-/// (Python chunk_rwkv7 from rwkvfla). BF16 has only 7 mantissa bits, so the reference
-/// itself is only accurate to ~0.4% relative precision. Standard practice (per Triton
-/// and PyTorch testing guidelines) is atol=1e-2, rtol=1e-3 for FP32-vs-BF16 comparisons.
-///
-/// See: https://github.com/triton-lang/triton/issues/5283
-#[derive(Clone, Copy)]
-struct Tolerances {
-    rtol: f32,
-    atol: f32,
-}
-
-impl Tolerances {
-    /// BF16-appropriate tolerance for normalized activations (after layernorm, groupnorm, L2norm).
-    /// Normalization can amplify input differences for low-variance groups, so we use
-    /// the standard BF16 tolerance rather than trying to be tighter.
-    const NORMALIZED: Self = Self { rtol: 1e-2, atol: 1e-2 };
-
-    /// Tolerance for linear projections and matrix multiplications.
-    /// Standard BF16 comparison tolerance.
-    const MATMUL: Self = Self { rtol: 1e-2, atol: 1e-2 };
-
-    /// Tolerance for activations with potential numerical instability.
-    const ACTIVATION: Self = Self { rtol: 1e-2, atol: 1e-2 };
-
-    /// Tolerance for WKV state (FP32 accumulation on both sides).
-    /// Can be tighter since both implementations use FP32 for state.
-    const STATE: Self = Self { rtol: 1e-3, atol: 1e-4 };
-
-    /// Tolerance for values with accumulated error across layers.
-    /// After 12 layers, expect ~1e-2 aggregate relative error.
-    const ACCUMULATED: Self = Self { rtol: 2e-2, atol: 2e-2 };
 }
 
 /// Get tolerances for a specific hook point.
