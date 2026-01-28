@@ -15,12 +15,35 @@
             // Track source files for each record
             sourceFiles: new Map()  // run_id -> filename
         },
+        // Multi-select filter state: each key maps to Set of selected values (null = all)
         filters: {
             scenario: null,
             model_name: null,
+            model_size: null,
             backend_id: null,
+            wgpu_backend: null,
             batch_size: null,
-            seq_len: null
+            token_chunk_size: null,
+            seq_len: null,
+            mixed_case_id: null,
+            run_id: null,
+            git_sha: null,
+            timestamp: null  // Will store {min, max} range if set
+        },
+        // Available values for each filter dimension (extracted from data)
+        filterOptions: {
+            scenario: [],
+            model_name: [],
+            model_size: [],
+            backend_id: [],
+            wgpu_backend: [],
+            batch_size: [],
+            token_chunk_size: [],
+            seq_len: [],
+            mixed_case_id: [],
+            run_id: [],
+            git_sha: [],
+            timestamp: []
         },
         currentView: 'table',
         loading: false,
@@ -182,6 +205,7 @@
 
         // Update UI
         setLoadingState(false);
+        updateFilters();  // Update filter options and UI when data changes
         render();
 
         // Show error summary if there were parsing errors
@@ -353,6 +377,16 @@
         state.data.sourceFiles.clear();
         state.data.loaded = false;
         state.errors = [];
+
+        // Reset all filter states
+        for (const key of Object.keys(state.filters)) {
+            state.filters[key] = null;
+        }
+        // Reset filter options
+        for (const key of Object.keys(state.filterOptions)) {
+            state.filterOptions[key] = [];
+        }
+
         console.log('[dashboard] Data cleared');
     }
 
@@ -428,11 +462,395 @@
     }
 
     /**
+     * Filter dimension configuration
+     * Defines the order, labels, and data sources for each filter
+     */
+    const filterConfig = [
+        { key: 'scenario', label: 'Scenario', source: 'measures' },
+        { key: 'model_name', label: 'Model Name', source: 'measures' },
+        { key: 'model_size', label: 'Model Size', source: 'measures' },
+        { key: 'backend_id', label: 'Backend', source: 'measures' },
+        { key: 'wgpu_backend', label: 'WGPU Backend', source: 'measures' },
+        { key: 'batch_size', label: 'Batch Size', source: 'measures', numeric: true },
+        { key: 'token_chunk_size', label: 'Chunk Size', source: 'measures', numeric: true },
+        { key: 'seq_len', label: 'Seq Length', source: 'measures', numeric: true },
+        { key: 'mixed_case_id', label: 'Mixed Case', source: 'measures' },
+        { key: 'run_id', label: 'Run ID', source: 'runs' },
+        { key: 'git_sha', label: 'Git SHA', source: 'runs' },
+        { key: 'timestamp', label: 'Timestamp', source: 'runs' }
+    ];
+
+    /**
+     * Extract unique values for all filter dimensions from loaded data
+     */
+    function extractFilterOptions() {
+        const measures = state.data.measures;
+        const runs = state.data.runs;
+
+        // Reset filter options
+        for (const key of Object.keys(state.filterOptions)) {
+            state.filterOptions[key] = [];
+        }
+
+        // Extract from measures
+        const measureFields = ['scenario', 'model_name', 'model_size', 'backend_id', 'wgpu_backend',
+                               'batch_size', 'token_chunk_size', 'seq_len', 'mixed_case_id'];
+        measureFields.forEach(field => {
+            const values = new Set();
+            measures.forEach(m => {
+                if (m[field] !== undefined && m[field] !== null) {
+                    values.add(m[field]);
+                }
+            });
+            state.filterOptions[field] = Array.from(values).sort((a, b) => {
+                // Numeric sort for number values
+                if (typeof a === 'number' && typeof b === 'number') {
+                    return a - b;
+                }
+                return String(a).localeCompare(String(b));
+            });
+        });
+
+        // Extract from runs
+        const runFields = ['run_id', 'git_sha', 'timestamp'];
+        runFields.forEach(field => {
+            const values = new Set();
+            runs.forEach(r => {
+                if (r[field] !== undefined && r[field] !== null) {
+                    values.add(r[field]);
+                }
+            });
+            state.filterOptions[field] = Array.from(values).sort((a, b) => {
+                // Reverse sort for timestamps (most recent first)
+                if (field === 'timestamp') {
+                    return String(b).localeCompare(String(a));
+                }
+                return String(a).localeCompare(String(b));
+            });
+        });
+
+        console.log('[dashboard] Filter options extracted:', Object.entries(state.filterOptions)
+            .map(([k, v]) => `${k}: ${v.length}`).join(', '));
+    }
+
+    /**
      * Update filter UI based on loaded data
      */
     function updateFilters() {
-        // Placeholder: will be implemented in BD-BENCH-17
-        console.log('[dashboard] updateFilters() - Not yet implemented');
+        // Extract unique values for filter options
+        extractFilterOptions();
+
+        // Build filter UI
+        renderFilterUI();
+
+        console.log('[dashboard] Filters updated');
+    }
+
+    /**
+     * Render the filter UI based on available options
+     */
+    function renderFilterUI() {
+        const container = elements.filterGroups;
+
+        // Check if we have any data
+        const hasData = state.data.loaded && (state.data.measures.length > 0 || state.data.runs.length > 0);
+
+        if (!hasData) {
+            container.innerHTML = '<p class="placeholder-text">Load benchmark data to enable filters</p>';
+            return;
+        }
+
+        // Build filter groups HTML
+        let html = '';
+
+        filterConfig.forEach(config => {
+            const options = state.filterOptions[config.key];
+            const selectedValues = state.filters[config.key];
+
+            // Skip filters with no options
+            if (options.length === 0) {
+                return;
+            }
+
+            html += `
+                <div class="filter-group" data-filter="${config.key}">
+                    <label>${config.label}</label>
+                    <div class="multi-select" data-filter="${config.key}">
+                        <div class="multi-select-header" tabindex="0">
+                            <span class="multi-select-summary">${getFilterSummary(config.key, options, selectedValues)}</span>
+                            <span class="multi-select-arrow">&#9662;</span>
+                        </div>
+                        <div class="multi-select-dropdown">
+                            <div class="multi-select-controls">
+                                <button type="button" class="select-all-btn" data-filter="${config.key}">All</button>
+                                <button type="button" class="select-none-btn" data-filter="${config.key}">None</button>
+                            </div>
+                            <div class="multi-select-options">
+                                ${options.map(opt => {
+                                    const checked = selectedValues === null || selectedValues.has(opt);
+                                    const displayValue = formatFilterValue(config.key, opt);
+                                    return `
+                                        <label class="multi-select-option">
+                                            <input type="checkbox" value="${escapeHtml(String(opt))}" ${checked ? 'checked' : ''}>
+                                            <span class="option-label">${escapeHtml(displayValue)}</span>
+                                        </label>
+                                    `;
+                                }).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+
+        // Add clear all filters button
+        html += `
+            <div class="filter-actions">
+                <button type="button" class="clear-filters-btn" id="clear-filters-btn">Clear All Filters</button>
+            </div>
+        `;
+
+        container.innerHTML = html;
+
+        // Attach event listeners for filter interactions
+        attachFilterListeners();
+    }
+
+    /**
+     * Get summary text for a filter (showing selection state)
+     */
+    function getFilterSummary(key, options, selectedValues) {
+        if (selectedValues === null || selectedValues.size === options.length) {
+            return 'All';
+        }
+        if (selectedValues.size === 0) {
+            return 'None';
+        }
+        if (selectedValues.size === 1) {
+            const value = Array.from(selectedValues)[0];
+            return formatFilterValue(key, value);
+        }
+        return `${selectedValues.size} selected`;
+    }
+
+    /**
+     * Format a filter value for display
+     */
+    function formatFilterValue(key, value) {
+        if (value === null || value === undefined) {
+            return '(empty)';
+        }
+        // Truncate long values
+        const str = String(value);
+        if (str.length > 20) {
+            return str.substring(0, 17) + '...';
+        }
+        return str;
+    }
+
+    /**
+     * Escape HTML special characters
+     */
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    /**
+     * Attach event listeners for filter UI interactions
+     */
+    function attachFilterListeners() {
+        // Multi-select dropdown toggle
+        document.querySelectorAll('.multi-select-header').forEach(header => {
+            header.addEventListener('click', (e) => {
+                const multiSelect = header.closest('.multi-select');
+                toggleDropdown(multiSelect);
+            });
+
+            // Keyboard accessibility
+            header.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    const multiSelect = header.closest('.multi-select');
+                    toggleDropdown(multiSelect);
+                }
+            });
+        });
+
+        // Close dropdowns when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('.multi-select')) {
+                closeAllDropdowns();
+            }
+        });
+
+        // Checkbox change handlers
+        document.querySelectorAll('.multi-select-option input[type="checkbox"]').forEach(checkbox => {
+            checkbox.addEventListener('change', (e) => {
+                const multiSelect = checkbox.closest('.multi-select');
+                const filterKey = multiSelect.dataset.filter;
+                handleFilterChange(filterKey, multiSelect);
+            });
+        });
+
+        // Select All buttons
+        document.querySelectorAll('.select-all-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const filterKey = btn.dataset.filter;
+                const multiSelect = btn.closest('.multi-select');
+                selectAllOptions(filterKey, multiSelect);
+            });
+        });
+
+        // Select None buttons
+        document.querySelectorAll('.select-none-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const filterKey = btn.dataset.filter;
+                const multiSelect = btn.closest('.multi-select');
+                selectNoneOptions(filterKey, multiSelect);
+            });
+        });
+
+        // Clear all filters button
+        const clearBtn = document.getElementById('clear-filters-btn');
+        if (clearBtn) {
+            clearBtn.addEventListener('click', clearAllFilters);
+        }
+    }
+
+    /**
+     * Toggle dropdown visibility
+     */
+    function toggleDropdown(multiSelect) {
+        const isOpen = multiSelect.classList.contains('open');
+
+        // Close all other dropdowns first
+        closeAllDropdowns();
+
+        if (!isOpen) {
+            multiSelect.classList.add('open');
+        }
+    }
+
+    /**
+     * Close all open dropdowns
+     */
+    function closeAllDropdowns() {
+        document.querySelectorAll('.multi-select.open').forEach(ms => {
+            ms.classList.remove('open');
+        });
+    }
+
+    /**
+     * Handle filter checkbox change
+     */
+    function handleFilterChange(filterKey, multiSelect) {
+        const options = state.filterOptions[filterKey];
+        const checkboxes = multiSelect.querySelectorAll('.multi-select-option input[type="checkbox"]');
+
+        // Collect checked values
+        const checkedValues = new Set();
+        checkboxes.forEach(cb => {
+            if (cb.checked) {
+                // Parse value back to original type if numeric
+                let value = cb.value;
+                const config = filterConfig.find(c => c.key === filterKey);
+                if (config && config.numeric) {
+                    value = parseFloat(value);
+                }
+                checkedValues.add(value);
+            }
+        });
+
+        // Update filter state
+        if (checkedValues.size === options.length) {
+            // All selected = no filter
+            state.filters[filterKey] = null;
+        } else {
+            state.filters[filterKey] = checkedValues;
+        }
+
+        // Update summary text
+        const summary = multiSelect.querySelector('.multi-select-summary');
+        summary.textContent = getFilterSummary(filterKey, options, state.filters[filterKey]);
+
+        // Trigger re-render with filtered data
+        onFiltersChanged();
+    }
+
+    /**
+     * Select all options for a filter
+     */
+    function selectAllOptions(filterKey, multiSelect) {
+        const checkboxes = multiSelect.querySelectorAll('.multi-select-option input[type="checkbox"]');
+        checkboxes.forEach(cb => cb.checked = true);
+        state.filters[filterKey] = null;
+
+        // Update summary
+        const options = state.filterOptions[filterKey];
+        const summary = multiSelect.querySelector('.multi-select-summary');
+        summary.textContent = getFilterSummary(filterKey, options, null);
+
+        onFiltersChanged();
+    }
+
+    /**
+     * Deselect all options for a filter
+     */
+    function selectNoneOptions(filterKey, multiSelect) {
+        const checkboxes = multiSelect.querySelectorAll('.multi-select-option input[type="checkbox"]');
+        checkboxes.forEach(cb => cb.checked = false);
+        state.filters[filterKey] = new Set();
+
+        // Update summary
+        const options = state.filterOptions[filterKey];
+        const summary = multiSelect.querySelector('.multi-select-summary');
+        summary.textContent = getFilterSummary(filterKey, options, state.filters[filterKey]);
+
+        onFiltersChanged();
+    }
+
+    /**
+     * Clear all filters (reset to "All")
+     */
+    function clearAllFilters() {
+        // Reset all filter states
+        for (const key of Object.keys(state.filters)) {
+            state.filters[key] = null;
+        }
+
+        // Re-render filter UI to update checkboxes and summaries
+        renderFilterUI();
+
+        onFiltersChanged();
+
+        console.log('[dashboard] All filters cleared');
+    }
+
+    /**
+     * Called when filter state changes - triggers view update
+     */
+    function onFiltersChanged() {
+        console.log('[dashboard] Filters changed:', getActiveFiltersDescription());
+        render();
+    }
+
+    /**
+     * Get description of active filters for logging
+     */
+    function getActiveFiltersDescription() {
+        const active = [];
+        for (const [key, value] of Object.entries(state.filters)) {
+            if (value !== null) {
+                if (value instanceof Set) {
+                    active.push(`${key}: ${value.size} selected`);
+                } else {
+                    active.push(`${key}: ${JSON.stringify(value)}`);
+                }
+            }
+        }
+        return active.length > 0 ? active.join(', ') : '(none)';
     }
 
     /**
@@ -440,9 +858,55 @@
      * @returns {Array} Filtered measure records
      */
     function applyFilters() {
-        // Placeholder: will be implemented in BD-BENCH-17
-        console.log('[dashboard] applyFilters() - Not yet implemented');
-        return state.data.measures;
+        let filtered = state.data.measures;
+
+        // Build a map of run_id -> run record for run-level filters
+        const runsMap = new Map();
+        state.data.runs.forEach(run => runsMap.set(run.run_id, run));
+
+        // Apply each filter
+        const measureFilters = ['scenario', 'model_name', 'model_size', 'backend_id', 'wgpu_backend',
+                                'batch_size', 'token_chunk_size', 'seq_len', 'mixed_case_id'];
+        const runFilters = ['run_id', 'git_sha', 'timestamp'];
+
+        // Apply measure-level filters
+        measureFilters.forEach(key => {
+            const filterValue = state.filters[key];
+            if (filterValue !== null && filterValue instanceof Set) {
+                filtered = filtered.filter(m => {
+                    const value = m[key];
+                    if (value === undefined || value === null) {
+                        return false;  // Exclude records without the field if filter is active
+                    }
+                    return filterValue.has(value);
+                });
+            }
+        });
+
+        // Apply run-level filters (filter measures by their associated run)
+        runFilters.forEach(key => {
+            const filterValue = state.filters[key];
+            if (filterValue !== null && filterValue instanceof Set) {
+                filtered = filtered.filter(m => {
+                    const run = runsMap.get(m.run_id);
+                    if (!run) {
+                        // If we can't find the run, check if the measure has run_id directly
+                        if (key === 'run_id') {
+                            return filterValue.has(m.run_id);
+                        }
+                        return false;
+                    }
+                    const value = run[key];
+                    if (value === undefined || value === null) {
+                        return false;
+                    }
+                    return filterValue.has(value);
+                });
+            }
+        });
+
+        console.log(`[dashboard] applyFilters(): ${state.data.measures.length} -> ${filtered.length} records`);
+        return filtered;
     }
 
     /**
@@ -461,6 +925,8 @@
     function render() {
         if (!state.data.loaded) {
             renderEmptyState();
+            // Also reset filters UI to placeholder
+            elements.filterGroups.innerHTML = '<p class="placeholder-text">Load benchmark data to enable filters</p>';
             return;
         }
 
@@ -592,6 +1058,25 @@
             state.data.runs.forEach(run => map.set(run.run_id, run));
             return map;
         },
+        // Filter API for programmatic access
+        getFilters: () => state.filters,
+        getFilterOptions: () => state.filterOptions,
+        setFilter: (key, values) => {
+            if (!(key in state.filters)) {
+                console.warn(`[dashboard] Unknown filter key: ${key}`);
+                return;
+            }
+            if (values === null) {
+                state.filters[key] = null;
+            } else if (Array.isArray(values)) {
+                state.filters[key] = new Set(values);
+            } else {
+                state.filters[key] = new Set([values]);
+            }
+            renderFilterUI();
+            onFiltersChanged();
+        },
+        clearAllFilters: clearAllFilters,
         version: '0.1'
     };
 
