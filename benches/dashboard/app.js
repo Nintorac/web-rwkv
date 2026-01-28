@@ -2832,6 +2832,15 @@
                         <span class="legend-item improvement-legend">&#9650; Improvement</span>
                         <span class="legend-item unchanged-legend">&#8212; Unchanged</span>
                     </div>
+                    <div class="compare-export">
+                        <select id="export-format-select" class="export-format-select">
+                            <option value="json">JSON</option>
+                            <option value="markdown">Markdown</option>
+                        </select>
+                        <button id="export-report-btn" class="export-report-btn" title="Export comparison report">
+                            Export Report
+                        </button>
+                    </div>
                 </div>
             </div>
         `;
@@ -3195,6 +3204,280 @@
     }
 
     /**
+     * Export regression report in the specified format
+     * @param {string} format - 'json' or 'markdown'
+     */
+    function exportRegressionReport(format) {
+        console.log(`[dashboard] Exporting regression report as ${format}`);
+
+        // Validate that we have a comparison selected
+        if (!compareState.baseRun || !compareState.compareRun) {
+            alert('Please select two runs to compare before exporting.');
+            return;
+        }
+
+        const measures = state.data.measures;
+        const comparisonData = computeRunComparison(compareState.baseRun, compareState.compareRun, measures);
+
+        // Get run metadata
+        const runsMap = new Map();
+        state.data.runs.forEach(run => runsMap.set(run.run_id, run));
+        const baseRunInfo = runsMap.get(compareState.baseRun) || { run_id: compareState.baseRun };
+        const compareRunInfo = runsMap.get(compareState.compareRun) || { run_id: compareState.compareRun };
+
+        // Build report data structure
+        const reportData = buildReportData(comparisonData, baseRunInfo, compareRunInfo);
+
+        // Generate content based on format
+        let content, filename, mimeType;
+        if (format === 'markdown') {
+            content = generateMarkdownReport(reportData);
+            filename = `regression-report-${formatFilenameTimestamp()}.md`;
+            mimeType = 'text/markdown';
+        } else {
+            content = JSON.stringify(reportData, null, 2);
+            filename = `regression-report-${formatFilenameTimestamp()}.json`;
+            mimeType = 'application/json';
+        }
+
+        // Trigger download
+        downloadFile(content, filename, mimeType);
+
+        console.log(`[dashboard] Exported ${format} report: ${filename}`);
+    }
+
+    /**
+     * Build the report data structure for export
+     */
+    function buildReportData(comparisonData, baseRunInfo, compareRunInfo) {
+        const { matched, baseOnly, compareOnly, summary } = comparisonData;
+        const threshold = compareState.threshold;
+
+        // Categorize results
+        const regressions = matched.filter(m => m.delta_pct < -threshold);
+        const improvements = matched.filter(m => m.delta_pct > threshold);
+        const unchanged = matched.filter(m => Math.abs(m.delta_pct) <= threshold);
+
+        return {
+            metadata: {
+                generated_at: new Date().toISOString(),
+                dashboard_version: '0.1',
+                threshold_percent: threshold
+            },
+            baseline_run: {
+                run_id: baseRunInfo.run_id,
+                timestamp: baseRunInfo.started_at_utc || baseRunInfo.timestamp || null,
+                git_sha: baseRunInfo.git_sha || null,
+                git_branch: baseRunInfo.git_branch || null,
+                hostname: baseRunInfo.hostname || null
+            },
+            compare_run: {
+                run_id: compareRunInfo.run_id,
+                timestamp: compareRunInfo.started_at_utc || compareRunInfo.timestamp || null,
+                git_sha: compareRunInfo.git_sha || null,
+                git_branch: compareRunInfo.git_branch || null,
+                hostname: compareRunInfo.hostname || null
+            },
+            summary: {
+                total_matched_cases: summary.totalMatched,
+                regressions_count: summary.regressions,
+                improvements_count: summary.improvements,
+                unchanged_count: summary.unchanged,
+                average_change_percent: parseFloat(summary.avgDelta.toFixed(4)),
+                baseline_only_count: baseOnly.length,
+                compare_only_count: compareOnly.length
+            },
+            regressions: regressions.map(formatResultForExport),
+            improvements: improvements.map(formatResultForExport),
+            unchanged: unchanged.map(formatResultForExport),
+            unmatched: {
+                baseline_only: baseOnly.map(c => c.case_id),
+                compare_only: compareOnly.map(c => c.case_id)
+            }
+        };
+    }
+
+    /**
+     * Format a comparison result for export
+     */
+    function formatResultForExport(row) {
+        return {
+            case_id: row.case_id,
+            scenario: row.scenario,
+            model_name: row.model_name,
+            backend_id: row.backend_id,
+            wgpu_backend: row.wgpu_backend || null,
+            batch_size: row.batch_size,
+            token_chunk_size: row.token_chunk_size,
+            seq_len: row.seq_len || null,
+            decode_steps: row.decode_steps || null,
+            mixed_case_id: row.mixed_case_id || null,
+            metric_name: row.metric_name,
+            baseline_value: parseFloat(row.base_value.toFixed(4)),
+            compare_value: parseFloat(row.compare_value.toFixed(4)),
+            delta_percent: parseFloat(row.delta_pct.toFixed(4)),
+            baseline_repeats: row.base_repeats,
+            compare_repeats: row.compare_repeats
+        };
+    }
+
+    /**
+     * Generate a Markdown formatted regression report
+     */
+    function generateMarkdownReport(reportData) {
+        const lines = [];
+
+        // Header
+        lines.push('# Benchmark Regression Report');
+        lines.push('');
+        lines.push(`Generated: ${reportData.metadata.generated_at}`);
+        lines.push(`Dashboard Version: ${reportData.metadata.dashboard_version}`);
+        lines.push('');
+
+        // Run info
+        lines.push('## Run Information');
+        lines.push('');
+        lines.push('### Baseline Run');
+        lines.push(`- **Run ID**: \`${reportData.baseline_run.run_id}\``);
+        if (reportData.baseline_run.timestamp) {
+            lines.push(`- **Timestamp**: ${reportData.baseline_run.timestamp}`);
+        }
+        if (reportData.baseline_run.git_sha) {
+            lines.push(`- **Git SHA**: \`${reportData.baseline_run.git_sha}\``);
+        }
+        if (reportData.baseline_run.git_branch) {
+            lines.push(`- **Branch**: ${reportData.baseline_run.git_branch}`);
+        }
+        lines.push('');
+
+        lines.push('### Compare Run');
+        lines.push(`- **Run ID**: \`${reportData.compare_run.run_id}\``);
+        if (reportData.compare_run.timestamp) {
+            lines.push(`- **Timestamp**: ${reportData.compare_run.timestamp}`);
+        }
+        if (reportData.compare_run.git_sha) {
+            lines.push(`- **Git SHA**: \`${reportData.compare_run.git_sha}\``);
+        }
+        if (reportData.compare_run.git_branch) {
+            lines.push(`- **Branch**: ${reportData.compare_run.git_branch}`);
+        }
+        lines.push('');
+
+        // Summary
+        lines.push('## Summary');
+        lines.push('');
+        lines.push(`- **Regression Threshold**: ${reportData.metadata.threshold_percent}%`);
+        lines.push(`- **Total Matched Cases**: ${reportData.summary.total_matched_cases}`);
+        lines.push(`- **Regressions**: ${reportData.summary.regressions_count}`);
+        lines.push(`- **Improvements**: ${reportData.summary.improvements_count}`);
+        lines.push(`- **Unchanged**: ${reportData.summary.unchanged_count}`);
+        lines.push(`- **Average Change**: ${reportData.summary.average_change_percent >= 0 ? '+' : ''}${reportData.summary.average_change_percent.toFixed(2)}%`);
+        lines.push('');
+
+        // Regressions table
+        if (reportData.regressions.length > 0) {
+            lines.push('## Regressions');
+            lines.push('');
+            lines.push('Cases that got **slower** (throughput decreased by more than threshold):');
+            lines.push('');
+            lines.push(buildMarkdownTable(reportData.regressions));
+            lines.push('');
+        }
+
+        // Improvements table
+        if (reportData.improvements.length > 0) {
+            lines.push('## Improvements');
+            lines.push('');
+            lines.push('Cases that got **faster** (throughput increased by more than threshold):');
+            lines.push('');
+            lines.push(buildMarkdownTable(reportData.improvements));
+            lines.push('');
+        }
+
+        // Unmatched cases
+        if (reportData.unmatched.baseline_only.length > 0 || reportData.unmatched.compare_only.length > 0) {
+            lines.push('## Unmatched Cases');
+            lines.push('');
+
+            if (reportData.unmatched.baseline_only.length > 0) {
+                lines.push('### Only in Baseline');
+                lines.push('');
+                reportData.unmatched.baseline_only.forEach(caseId => {
+                    lines.push(`- \`${caseId}\``);
+                });
+                lines.push('');
+            }
+
+            if (reportData.unmatched.compare_only.length > 0) {
+                lines.push('### Only in Compare Run');
+                lines.push('');
+                reportData.unmatched.compare_only.forEach(caseId => {
+                    lines.push(`- \`${caseId}\``);
+                });
+                lines.push('');
+            }
+        }
+
+        return lines.join('\n');
+    }
+
+    /**
+     * Build a Markdown table from result data
+     */
+    function buildMarkdownTable(results) {
+        if (results.length === 0) return '';
+
+        const lines = [];
+
+        // Header
+        lines.push('| Scenario | Model | Backend | Batch | Chunk | Base (tok/s) | Compare (tok/s) | Change |');
+        lines.push('|----------|-------|---------|-------|-------|--------------|-----------------|--------|');
+
+        // Rows
+        results.forEach(row => {
+            const backend = row.wgpu_backend ? `${row.backend_id}/${row.wgpu_backend}` : row.backend_id;
+            const changeSign = row.delta_percent >= 0 ? '+' : '';
+            lines.push(`| ${row.scenario} | ${row.model_name || '--'} | ${backend || '--'} | ${row.batch_size ?? '--'} | ${row.token_chunk_size ?? '--'} | ${row.baseline_value.toFixed(1)} | ${row.compare_value.toFixed(1)} | ${changeSign}${row.delta_percent.toFixed(2)}% |`);
+        });
+
+        return lines.join('\n');
+    }
+
+    /**
+     * Format a timestamp for filenames (YYYYMMDD-HHMMSS)
+     */
+    function formatFilenameTimestamp() {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = String(now.getMonth() + 1).padStart(2, '0');
+        const day = String(now.getDate()).padStart(2, '0');
+        const hours = String(now.getHours()).padStart(2, '0');
+        const minutes = String(now.getMinutes()).padStart(2, '0');
+        const seconds = String(now.getSeconds()).padStart(2, '0');
+        return `${year}${month}${day}-${hours}${minutes}${seconds}`;
+    }
+
+    /**
+     * Trigger a file download in the browser
+     */
+    function downloadFile(content, filename, mimeType) {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+
+        // Cleanup
+        setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 100);
+    }
+
+    /**
      * Attach event listeners for compare view
      */
     function attachCompareListeners() {
@@ -3255,6 +3538,16 @@
                 renderCompare();
             });
         });
+
+        // Export report button
+        const exportReportBtn = document.getElementById('export-report-btn');
+        if (exportReportBtn) {
+            exportReportBtn.addEventListener('click', () => {
+                const formatSelect = document.getElementById('export-format-select');
+                const format = formatSelect ? formatSelect.value : 'json';
+                exportRegressionReport(format);
+            });
+        }
     }
 
     // Initialize on DOM ready
@@ -3298,6 +3591,9 @@
         clearAllFilters: clearAllFilters,
         // Export API
         exportToJsonl: exportToJsonl,
+        exportRegressionReport: exportRegressionReport,
+        // Compare state for programmatic access
+        getCompareState: () => compareState,
         version: '0.1'
     };
 

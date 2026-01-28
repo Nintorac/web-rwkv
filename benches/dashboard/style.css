@@ -39,6 +39,10 @@
     --header-height: 48px;
     --max-content-width: 1400px;
     --border-radius: 4px;
+
+    /* Shadows - minimal, functional only */
+    --shadow-dropdown: 0 2px 8px rgba(0, 0, 0, 0.08);
+    --shadow-tooltip: 0 2px 8px rgba(0, 0, 0, 0.12);
 }
 
 /* Reset and base */
@@ -235,7 +239,7 @@ body {
     background-color: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: var(--border-radius);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    box-shadow: var(--shadow-dropdown);
     z-index: 100;
     max-height: 280px;
     overflow: hidden;
@@ -679,7 +683,7 @@ body {
 .status-badge {
     display: inline-block;
     padding: 2px var(--space-sm);
-    border-radius: 10px;
+    border-radius: var(--border-radius);
     font-size: 11px;
     font-weight: 500;
     text-transform: uppercase;
@@ -1070,6 +1074,52 @@ body {
 
 .unchanged-legend {
     color: var(--text-muted);
+}
+
+/* Compare export controls */
+.compare-export {
+    display: flex;
+    gap: var(--space-sm);
+    align-items: center;
+    margin-left: auto;
+}
+
+.export-format-select {
+    padding: var(--space-xs) var(--space-sm);
+    font-size: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    background-color: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+
+.export-format-select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.export-report-btn {
+    padding: var(--space-xs) var(--space-md);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+
+.export-report-btn:hover {
+    background-color: var(--accent-subtle);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.export-report-btn:active {
+    background-color: var(--accent);
+    color: white;
 }
 
 /* Compare placeholder */
