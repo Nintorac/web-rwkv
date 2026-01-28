@@ -55,6 +55,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+use crate::prefill_mixed::PrefillMixedResult;
 use crate::prefill_uniform::PrefillResult;
 
 /// Current schema version for JSONL output.
@@ -272,6 +273,21 @@ pub struct PrefillMetrics {
 
 impl From<PrefillResult> for PrefillMetrics {
     fn from(result: PrefillResult) -> Self {
+        Self {
+            prefill_total_ms: result.prefill_total_ms,
+            total_prompt_tokens: result.total_prompt_tokens,
+            prefill_tok_per_s: result.prefill_tok_per_s,
+            num_infer_calls: result.num_infer_calls,
+            ttft_ms_local: result.ttft_ms_local,
+            ttft_min_ms: result.ttft_min_ms,
+            ttft_p50_ms: result.ttft_p50_ms,
+            ttft_max_ms: result.ttft_max_ms,
+        }
+    }
+}
+
+impl From<PrefillMixedResult> for PrefillMetrics {
+    fn from(result: PrefillMixedResult) -> Self {
         Self {
             prefill_total_ms: result.prefill_total_ms,
             total_prompt_tokens: result.total_prompt_tokens,
@@ -1344,5 +1360,28 @@ mod tests {
         assert_eq!(metrics.ttft_min_ms, 10.0);
         assert_eq!(metrics.ttft_max_ms, 40.0);
         assert_eq!(metrics.ttft_p50_ms, 25.0); // (20 + 30) / 2
+    }
+
+    #[test]
+    fn test_prefill_mixed_result_to_prefill_metrics() {
+        use crate::prefill_mixed::PrefillMixedResult;
+
+        // Mixed scenario with different sequence lengths
+        let ttft_ms = vec![10.0, 15.0, 25.0, 40.0];
+        let lengths = vec![100, 200, 300, 400]; // sum = 1000
+        let result = PrefillMixedResult::from_ttft(ttft_ms.clone(), &lengths, 4);
+
+        let metrics: PrefillMetrics = result.into();
+
+        assert_eq!(metrics.prefill_total_ms, 40.0);
+        assert_eq!(metrics.total_prompt_tokens, 1000); // sum of lengths
+        assert_eq!(metrics.num_infer_calls, 4);
+        assert_eq!(metrics.ttft_ms_local, ttft_ms);
+        assert_eq!(metrics.ttft_min_ms, 10.0);
+        assert_eq!(metrics.ttft_max_ms, 40.0);
+        assert_eq!(metrics.ttft_p50_ms, 20.0); // (15 + 25) / 2
+
+        // Verify throughput: 1000 tokens / 0.04 seconds = 25000 tok/s
+        assert!((metrics.prefill_tok_per_s - 25000.0).abs() < 0.1);
     }
 }

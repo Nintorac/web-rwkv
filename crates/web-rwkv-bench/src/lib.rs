@@ -109,7 +109,7 @@ pub use jsonl::{
 pub use metadata::{collect_run_metadata, BuildInfo, GitInfo, GpuInfo, HostInfo, RunMetadata};
 pub use prefill_mixed::{
     all_mixed_case_ids, generate_lengths, generate_lengths_from_str, total_tokens, MixedCaseError,
-    MixedCaseId, MixedCaseResult,
+    MixedCaseId, MixedCaseResult, MixedTtftTracker, PrefillMixedConfig, PrefillMixedResult,
 };
 pub use prefill_uniform::{
     all_prefill_lengths, canonical_length_list, compute_ttft_stats, seq_len_from_total_tokens,

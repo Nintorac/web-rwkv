@@ -309,6 +309,315 @@ pub fn total_tokens(lengths: &[u32]) -> u64 {
     lengths.iter().map(|&l| l as u64).sum()
 }
 
+// =============================================================================
+// TTFT TRACKING FOR MIXED PREFILL
+// =============================================================================
+
+use std::time::{Duration, Instant};
+
+use crate::prefill_uniform::compute_ttft_stats;
+
+/// Result of a prefill-mixed benchmark execution.
+///
+/// Contains all metrics required for JSONL output and analysis.
+/// Unlike `PrefillResult` in prefill_uniform, this struct handles
+/// sequences of different lengths within a batch.
+#[derive(Debug, Clone)]
+pub struct PrefillMixedResult {
+    /// Total time for prefill in milliseconds (max TTFT across all batches)
+    pub prefill_total_ms: f64,
+    /// Total tokens processed across all sequences (sum of all lengths)
+    pub total_prompt_tokens: u32,
+    /// Throughput in tokens per second (total_prompt_tokens / prefill_total_s)
+    pub prefill_tok_per_s: f64,
+    /// Number of inference calls made
+    pub num_infer_calls: u32,
+    /// Per-batch time to first token in milliseconds
+    pub ttft_ms_local: Vec<f64>,
+    /// Minimum TTFT across batches
+    pub ttft_min_ms: f64,
+    /// Median TTFT across batches (50th percentile)
+    pub ttft_p50_ms: f64,
+    /// Maximum TTFT across batches
+    pub ttft_max_ms: f64,
+}
+
+impl PrefillMixedResult {
+    /// Creates a PrefillMixedResult from raw timing data.
+    ///
+    /// This is the primary constructor for mixed-batch prefill results.
+    ///
+    /// # Arguments
+    ///
+    /// * `ttft_ms_local` - Per-batch TTFT values in milliseconds
+    /// * `lengths` - Per-batch sequence lengths (to compute total tokens)
+    /// * `num_infer_calls` - Number of inference calls made
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use web_rwkv_bench::prefill_mixed::PrefillMixedResult;
+    ///
+    /// let ttft_ms = vec![10.0, 15.0, 25.0, 40.0];
+    /// let lengths = vec![100, 200, 300, 400];
+    /// let result = PrefillMixedResult::from_ttft(ttft_ms, &lengths, 4);
+    ///
+    /// assert_eq!(result.total_prompt_tokens, 1000); // 100+200+300+400
+    /// assert_eq!(result.prefill_total_ms, 40.0);   // max TTFT
+    /// assert_eq!(result.ttft_min_ms, 10.0);
+    /// assert_eq!(result.ttft_max_ms, 40.0);
+    /// ```
+    pub fn from_ttft(ttft_ms_local: Vec<f64>, lengths: &[u32], num_infer_calls: u32) -> Self {
+        let prefill_total_ms = ttft_ms_local
+            .iter()
+            .cloned()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let total_prompt_tokens = total_tokens(lengths) as u32;
+
+        let prefill_tok_per_s = if prefill_total_ms > 0.0 {
+            (total_prompt_tokens as f64) / (prefill_total_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        let (ttft_min_ms, ttft_p50_ms, ttft_max_ms) = compute_ttft_stats(&ttft_ms_local);
+
+        Self {
+            prefill_total_ms,
+            total_prompt_tokens,
+            prefill_tok_per_s,
+            num_infer_calls,
+            ttft_ms_local,
+            ttft_min_ms,
+            ttft_p50_ms,
+            ttft_max_ms,
+        }
+    }
+}
+
+/// Tracks per-batch TTFT during mixed-prefill execution.
+///
+/// This struct records the time when each batch produces its first output,
+/// enabling per-batch TTFT tracking for mixed-length scenarios where
+/// different batches have different sequence lengths.
+///
+/// In a mixed scenario, shorter sequences will typically complete first,
+/// so their TTFT will be recorded before longer sequences.
+#[derive(Debug)]
+pub struct MixedTtftTracker {
+    /// Start time of the prefill operation
+    start: Instant,
+    /// Per-batch sequence lengths
+    lengths: Vec<u32>,
+    /// Per-batch TTFT (None if batch hasn't produced output yet)
+    ttft: Vec<Option<Duration>>,
+    /// Number of inference calls made
+    num_infer_calls: u32,
+}
+
+impl MixedTtftTracker {
+    /// Creates a new mixed TTFT tracker with the given sequence lengths.
+    ///
+    /// # Arguments
+    ///
+    /// * `lengths` - Per-batch sequence lengths
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use web_rwkv_bench::prefill_mixed::MixedTtftTracker;
+    ///
+    /// let lengths = vec![100, 200, 300, 400];
+    /// let tracker = MixedTtftTracker::new(lengths);
+    /// ```
+    pub fn new(lengths: Vec<u32>) -> Self {
+        let batch_size = lengths.len();
+        Self {
+            start: Instant::now(),
+            lengths,
+            ttft: vec![None; batch_size],
+            num_infer_calls: 0,
+        }
+    }
+
+    /// Returns the batch size.
+    pub fn batch_size(&self) -> usize {
+        self.lengths.len()
+    }
+
+    /// Returns the sequence lengths.
+    pub fn lengths(&self) -> &[u32] {
+        &self.lengths
+    }
+
+    /// Starts the timer. Call this immediately before the first inference call.
+    pub fn start(&mut self) {
+        self.start = Instant::now();
+    }
+
+    /// Records an inference call and checks which batches produced output.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch_has_output` - A function that returns true if batch `i` has produced output
+    ///
+    /// # Returns
+    ///
+    /// `true` if all batches have produced output, `false` otherwise
+    pub fn record_infer<F>(&mut self, batch_has_output: F) -> bool
+    where
+        F: Fn(usize) -> bool,
+    {
+        self.num_infer_calls += 1;
+        let now = self.start.elapsed();
+
+        let mut all_done = true;
+        for (i, ttft) in self.ttft.iter_mut().enumerate() {
+            if ttft.is_none() {
+                if batch_has_output(i) {
+                    *ttft = Some(now);
+                } else {
+                    all_done = false;
+                }
+            }
+        }
+
+        all_done
+    }
+
+    /// Checks if all batches have recorded their TTFT.
+    pub fn all_done(&self) -> bool {
+        self.ttft.iter().all(|t| t.is_some())
+    }
+
+    /// Returns the number of inference calls made.
+    pub fn num_infer_calls(&self) -> u32 {
+        self.num_infer_calls
+    }
+
+    /// Converts the tracker to a vector of TTFT values in milliseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any batch hasn't recorded its TTFT yet.
+    pub fn to_ttft_ms(&self) -> Vec<f64> {
+        self.ttft
+            .iter()
+            .map(|t| {
+                t.expect("All batches should have recorded TTFT")
+                    .as_secs_f64()
+                    * 1000.0
+            })
+            .collect()
+    }
+
+    /// Computes the total prefill time (max TTFT across all batches).
+    pub fn total_time(&self) -> Duration {
+        self.ttft
+            .iter()
+            .filter_map(|t| *t)
+            .max()
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Finalizes the tracker and returns a PrefillMixedResult.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any batch hasn't recorded its TTFT yet.
+    pub fn finalize(&self) -> PrefillMixedResult {
+        let ttft_ms = self.to_ttft_ms();
+        PrefillMixedResult::from_ttft(ttft_ms, &self.lengths, self.num_infer_calls)
+    }
+}
+
+/// Configuration for a prefill-mixed benchmark case.
+#[derive(Debug, Clone)]
+pub struct PrefillMixedConfig {
+    /// Mixed case identifier
+    pub mixed_case_id: MixedCaseId,
+    /// Batch size
+    pub batch_size: u32,
+    /// Token chunk size
+    pub token_chunk_size: u32,
+    /// Random seed for deterministic token generation
+    pub seed: u64,
+    /// Vocabulary size for token generation
+    pub vocab_size: u32,
+}
+
+impl Default for PrefillMixedConfig {
+    fn default() -> Self {
+        Self {
+            mixed_case_id: MixedCaseId::Staircase8,
+            batch_size: 8,
+            token_chunk_size: 256,
+            seed: 42,
+            vocab_size: 65536, // Common RWKV vocab size
+        }
+    }
+}
+
+impl PrefillMixedConfig {
+    /// Creates a new configuration with the given parameters.
+    pub fn new(mixed_case_id: MixedCaseId, batch_size: u32, token_chunk_size: u32) -> Self {
+        Self {
+            mixed_case_id,
+            batch_size,
+            token_chunk_size,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the random seed.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// Sets the vocabulary size.
+    pub fn with_vocab_size(mut self, vocab_size: u32) -> Self {
+        self.vocab_size = vocab_size;
+        self
+    }
+
+    /// Generates the length vector for this configuration.
+    pub fn generate_lengths(&self) -> MixedCaseResult<Vec<u32>> {
+        generate_lengths(self.mixed_case_id, self.batch_size, self.token_chunk_size)
+    }
+
+    /// Generates input tokens for this configuration.
+    ///
+    /// Returns a vector of token vectors, where each inner vector
+    /// corresponds to one batch element with its specific length.
+    pub fn generate_tokens(&self) -> MixedCaseResult<Vec<Vec<u16>>> {
+        use crate::prefill_uniform::TokenGenerator;
+
+        let lengths = self.generate_lengths()?;
+        let mut gen = TokenGenerator::new(self.seed, self.vocab_size);
+
+        let tokens = lengths
+            .iter()
+            .map(|&len| gen.generate(len as usize))
+            .collect();
+
+        Ok(tokens)
+    }
+
+    /// Computes the total number of prompt tokens.
+    pub fn total_prompt_tokens(&self) -> MixedCaseResult<u64> {
+        let lengths = self.generate_lengths()?;
+        Ok(total_tokens(&lengths))
+    }
+
+    /// Creates a MixedTtftTracker for this configuration.
+    pub fn create_tracker(&self) -> MixedCaseResult<MixedTtftTracker> {
+        let lengths = self.generate_lengths()?;
+        Ok(MixedTtftTracker::new(lengths))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +843,196 @@ mod tests {
         // With very small C, short_len = C/8 could be 0, should be clamped to 1
         let lengths = generate_lengths(MixedCaseId::BimodalHalf, 4, 4).unwrap();
         assert!(lengths.iter().all(|&l| l >= 1));
+    }
+
+    // =========================================================================
+    // TTFT TRACKING TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_prefill_mixed_result_from_ttft() {
+        let ttft_ms = vec![10.0, 15.0, 25.0, 40.0];
+        let lengths = vec![100, 200, 300, 400];
+        let result = PrefillMixedResult::from_ttft(ttft_ms.clone(), &lengths, 4);
+
+        assert_eq!(result.total_prompt_tokens, 1000); // 100+200+300+400
+        assert_eq!(result.prefill_total_ms, 40.0); // max TTFT
+        assert_eq!(result.num_infer_calls, 4);
+        assert_eq!(result.ttft_ms_local, ttft_ms);
+        assert_eq!(result.ttft_min_ms, 10.0);
+        assert_eq!(result.ttft_max_ms, 40.0);
+
+        // p50 = (15 + 25) / 2 = 20.0
+        assert_eq!(result.ttft_p50_ms, 20.0);
+
+        // prefill_tok_per_s = 1000 / (40ms / 1000) = 1000 / 0.04 = 25000
+        assert!((result.prefill_tok_per_s - 25000.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_prefill_mixed_result_single_batch() {
+        let ttft_ms = vec![50.0];
+        let lengths = vec![256];
+        let result = PrefillMixedResult::from_ttft(ttft_ms, &lengths, 1);
+
+        assert_eq!(result.total_prompt_tokens, 256);
+        assert_eq!(result.prefill_total_ms, 50.0);
+        assert_eq!(result.ttft_min_ms, 50.0);
+        assert_eq!(result.ttft_p50_ms, 50.0);
+        assert_eq!(result.ttft_max_ms, 50.0);
+    }
+
+    #[test]
+    fn test_prefill_mixed_result_odd_batch() {
+        // Test with odd number of batches (median is middle element)
+        let ttft_ms = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let lengths = vec![10, 20, 30, 40, 50];
+        let result = PrefillMixedResult::from_ttft(ttft_ms, &lengths, 5);
+
+        assert_eq!(result.total_prompt_tokens, 150);
+        assert_eq!(result.ttft_p50_ms, 30.0); // Middle element of sorted array
+    }
+
+    #[test]
+    fn test_mixed_ttft_tracker_new() {
+        let lengths = vec![100, 200, 300, 400];
+        let tracker = MixedTtftTracker::new(lengths.clone());
+
+        assert_eq!(tracker.batch_size(), 4);
+        assert_eq!(tracker.lengths(), &lengths[..]);
+        assert_eq!(tracker.num_infer_calls(), 0);
+        assert!(!tracker.all_done());
+    }
+
+    #[test]
+    fn test_mixed_ttft_tracker_record_infer() {
+        let lengths = vec![100, 200, 300, 400];
+        let mut tracker = MixedTtftTracker::new(lengths);
+        tracker.start();
+
+        // First infer: batches 0 and 1 produce output (shorter sequences finish first)
+        let done = tracker.record_infer(|i| i < 2);
+        assert!(!done);
+        assert_eq!(tracker.num_infer_calls(), 1);
+
+        // Second infer: batches 0, 1, 2 produce output
+        let done = tracker.record_infer(|i| i < 3);
+        assert!(!done);
+        assert_eq!(tracker.num_infer_calls(), 2);
+
+        // Third infer: all batches produce output
+        let done = tracker.record_infer(|_| true);
+        assert!(done);
+        assert_eq!(tracker.num_infer_calls(), 3);
+
+        // All should be done
+        assert!(tracker.all_done());
+    }
+
+    #[test]
+    fn test_mixed_ttft_tracker_finalize() {
+        let lengths = vec![100, 200, 300, 400];
+        let mut tracker = MixedTtftTracker::new(lengths);
+        tracker.start();
+
+        // Simulate all batches finishing at once
+        let done = tracker.record_infer(|_| true);
+        assert!(done);
+
+        let result = tracker.finalize();
+        assert_eq!(result.total_prompt_tokens, 1000);
+        assert_eq!(result.num_infer_calls, 1);
+        assert_eq!(result.ttft_ms_local.len(), 4);
+    }
+
+    #[test]
+    fn test_mixed_ttft_tracker_total_time() {
+        let lengths = vec![100, 200];
+        let mut tracker = MixedTtftTracker::new(lengths);
+        tracker.start();
+
+        // First batch finishes
+        tracker.record_infer(|i| i == 0);
+
+        // Second batch finishes
+        tracker.record_infer(|_| true);
+
+        // Total time should be the max TTFT
+        let total = tracker.total_time();
+        assert!(total > Duration::ZERO);
+    }
+
+    #[test]
+    fn test_prefill_mixed_config_default() {
+        let config = PrefillMixedConfig::default();
+        assert_eq!(config.mixed_case_id, MixedCaseId::Staircase8);
+        assert_eq!(config.batch_size, 8);
+        assert_eq!(config.token_chunk_size, 256);
+        assert_eq!(config.seed, 42);
+        assert_eq!(config.vocab_size, 65536);
+    }
+
+    #[test]
+    fn test_prefill_mixed_config_builder() {
+        let config = PrefillMixedConfig::new(MixedCaseId::BimodalHalf, 4, 128)
+            .with_seed(12345)
+            .with_vocab_size(50257);
+
+        assert_eq!(config.mixed_case_id, MixedCaseId::BimodalHalf);
+        assert_eq!(config.batch_size, 4);
+        assert_eq!(config.token_chunk_size, 128);
+        assert_eq!(config.seed, 12345);
+        assert_eq!(config.vocab_size, 50257);
+    }
+
+    #[test]
+    fn test_prefill_mixed_config_generate_lengths() {
+        let config = PrefillMixedConfig::new(MixedCaseId::Staircase8, 8, 256);
+        let lengths = config.generate_lengths().unwrap();
+        assert_eq!(lengths.len(), 8);
+        assert_eq!(lengths, vec![16, 32, 64, 128, 192, 256, 512, 1024]);
+    }
+
+    #[test]
+    fn test_prefill_mixed_config_generate_tokens() {
+        let config = PrefillMixedConfig::new(MixedCaseId::Staircase8, 4, 128).with_seed(42);
+        let tokens = config.generate_tokens().unwrap();
+
+        assert_eq!(tokens.len(), 4);
+        // Each batch should have the right length from staircase pattern
+        // For C=128, B=4: [8, 16, 32, 64] (first 4 elements of staircase)
+        let lengths = config.generate_lengths().unwrap();
+        for (i, batch_tokens) in tokens.iter().enumerate() {
+            assert_eq!(
+                batch_tokens.len(),
+                lengths[i] as usize,
+                "Batch {} should have {} tokens",
+                i,
+                lengths[i]
+            );
+        }
+
+        // Should be deterministic
+        let tokens2 = config.generate_tokens().unwrap();
+        assert_eq!(tokens, tokens2);
+    }
+
+    #[test]
+    fn test_prefill_mixed_config_total_prompt_tokens() {
+        let config = PrefillMixedConfig::new(MixedCaseId::Staircase8, 8, 256);
+        let total = config.total_prompt_tokens().unwrap();
+        // Sum of [16, 32, 64, 128, 192, 256, 512, 1024] = 2224
+        assert_eq!(total, 2224);
+    }
+
+    #[test]
+    fn test_prefill_mixed_config_create_tracker() {
+        let config = PrefillMixedConfig::new(MixedCaseId::BimodalHalf, 4, 256);
+        let tracker = config.create_tracker().unwrap();
+
+        assert_eq!(tracker.batch_size(), 4);
+        // BimodalHalf with B=4: [1024, 1024, 32, 32]
+        let expected_lengths = vec![1024, 1024, 32, 32];
+        assert_eq!(tracker.lengths(), &expected_lengths[..]);
     }
 }
