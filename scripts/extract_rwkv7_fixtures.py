@@ -295,13 +295,15 @@ class RWKV7FixtureExtractor:
 
         # Run WKV7 using official rwkvfla implementation
         # chunk_rwkv7 signature: (r, k, v, a, b, log_w=None, w=None, ...)
-        # Note: RWKV7 uses w = exp(-exp(w_raw)) as decay, but chunk_rwkv7 expects log_w
-        # w in our code is already -softplus(-...) - 0.5, which is log(decay)
+        # w = -softplus(-(...)) - 0.5 is the raw value
+        # decay = exp(-exp(w)), so log(decay) = -exp(w)
+        # chunk_rwkv7 expects log_w = log(decay) = -exp(w)
 
         r_wkv = r.view(B, T, H, N).to(torch.bfloat16)
         k_wkv = k_ctrl.view(B, T, H, N).to(torch.bfloat16)
         v_wkv = v.view(B, T, H, N).to(torch.bfloat16)
-        w_wkv = w.view(B, T, H, N).to(torch.bfloat16)
+        log_w = -torch.exp(w)  # Convert from raw w to log(decay)
+        w_wkv = log_w.view(B, T, H, N).to(torch.bfloat16)
         a_wkv = wkv_a.view(B, T, H, N).to(torch.bfloat16)
         b_wkv = wkv_b.view(B, T, H, N).to(torch.bfloat16)
 

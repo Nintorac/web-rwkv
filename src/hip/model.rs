@@ -15,7 +15,7 @@ use super::kernels::{
     sigmoid_f32, tanh_f32, softplus_decay_f32, squared_relu_f32,
     channel_mix_state_f32, channel_mix_state_f32_masked,
     control_k_f32, wkv7_f32_masked, wkv_bonus_f32,
-    add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32, broadcast_mul_f32,
+    add_f32, mul_f32, negate_f32, decay_exp_f32, broadcast_add_f32, broadcast_mul_f32,
     lerp_f32, copy_tensor_f32,
 };
 use super::blas::HipBlasContext;
@@ -1379,7 +1379,9 @@ impl Rwkv7Hip {
             // WKV inputs
             negate_f32(&att_kk, &mut wkv_a, stream)?;
             mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
-            exp_f32(&att_w, &mut w_decay, stream)?;
+            // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
+            // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
+            decay_exp_f32(&att_w, &mut w_decay, stream)?;
 
             // Reshape for WKV
             let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;
@@ -1720,7 +1722,9 @@ impl Rwkv7Hip {
             // WKV inputs
             negate_f32(&att_kk, &mut wkv_a, stream)?;
             mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
-            exp_f32(&att_w, &mut w_decay, stream)?;
+            // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
+            // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
+            decay_exp_f32(&att_w, &mut w_decay, stream)?;
 
             // Reshape for WKV
             let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;

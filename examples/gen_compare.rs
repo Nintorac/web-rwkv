@@ -33,7 +33,7 @@ use web_rwkv::{
         softmax::softmax_one,
         v4, v5, v6, v7, Runtime, TokioRuntime,
     },
-    tensor::TensorShape as _,
+    tensor::{TensorInit, TensorShape as _},
     tokenizer::Tokenizer,
 };
 
