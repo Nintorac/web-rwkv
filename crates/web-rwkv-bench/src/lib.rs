@@ -9,6 +9,7 @@
 //! - Environment/build metadata collection for benchmark run headers
 //! - Sweep execution engine for cartesian expansion and case lifecycle management
 //! - JSONL writer for benchmark output with append-only semantics
+//! - Prefill-mixed named case patterns for mixed-batch benchmarks
 //!
 //! # Sweep Execution
 //!
@@ -41,10 +42,24 @@
 //! }
 //! let summary = executor.finish();
 //! ```
+//!
+//! # Prefill-Mixed Patterns
+//!
+//! The `prefill_mixed` module provides deterministic length vector generation for
+//! mixed-batch prefill benchmarks:
+//!
+//! ```rust,ignore
+//! use web_rwkv_bench::prefill_mixed::{generate_lengths, MixedCaseId};
+//!
+//! // Generate lengths for staircase_8 pattern with B=8, C=256
+//! let lengths = generate_lengths(MixedCaseId::Staircase8, 8, 256).unwrap();
+//! // lengths = [16, 32, 64, 128, 192, 256, 512, 1024]
+//! ```
 
 pub mod config;
 pub mod jsonl;
 pub mod metadata;
+pub mod prefill_mixed;
 pub mod skip;
 pub mod sweep;
 
@@ -56,5 +71,9 @@ pub use jsonl::{
     PrefillMetrics, RunHeader, Scenario, ScenarioParams, Status, SCHEMA_VERSION,
 };
 pub use metadata::{collect_run_metadata, BuildInfo, GitInfo, GpuInfo, HostInfo, RunMetadata};
+pub use prefill_mixed::{
+    all_mixed_case_ids, generate_lengths, generate_lengths_from_str, total_tokens, MixedCaseError,
+    MixedCaseId, MixedCaseResult,
+};
 pub use skip::{LimitsTracker, SkipReason};
 pub use sweep::{CaseParams, ExpandedCase, Hooks, SweepConfig, SweepEngine, SweepSummary};
