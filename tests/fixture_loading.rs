@@ -1873,10 +1873,11 @@ fn test_rwkv7_hip_model_dimensions() {
     let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
 
-    // Check embedding weight shape: [n_embd, n_vocab, 1, 1] (load_tensor_f32 reverses dims)
-    // Original SafeTensors: [n_vocab, n_embd], after reverse: [n_embd, n_vocab]
-    let emb_shape = model.embed.w.shape();
-    assert_eq!(emb_shape.dim(0), 768, "Embedding dim 0 should be n_embd=768");
+    // Check embedding weight (CPU storage): [n_vocab * n_embd] flat array in row-major order
+    // Model info: n_vocab=65536, n_embd=768
+    let emb_len = model.embed.w.len();
+    assert_eq!(emb_len, 65536 * 768, "Embedding should have n_vocab * n_embd elements");
+    assert_eq!(model.embed.n_embd, 768, "Embedding n_embd should be 768");
 
     // Check head weight shape: [n_vocab, n_embd, 1, 1] (load_weight_matrix_f32 stores as [M, K])
     // Original SafeTensors: [n_vocab, n_embd] = [65536, 768]
@@ -1903,7 +1904,7 @@ fn test_rwkv7_hip_model_dimensions() {
     assert_eq!(r_k_shape.dim(1), 12, "r_k dim 1 should be n_head=12");
 
     println!("All tensor dimensions validated:");
-    println!("  emb.w: {:?}", emb_shape);
+    println!("  emb.w: len={}, n_embd={}", emb_len, model.embed.n_embd);
     println!("  head.w: {:?}", head_shape);
     println!("  layers[0].att.w_r: {:?}", w_r_shape);
     println!("  layers[0].ffn.w_k: {:?}", ffn_k_shape);
@@ -2164,8 +2165,8 @@ fn debug_hip_forward_extended() {
     let t = tokens.len();
     let b = 1;
     
-    // Get embedding data
-    let emb_data = model.embed.w.to_vec(&stream).unwrap();
+    // Get embedding data (CPU storage - no GPU transfer needed)
+    let emb_data = &model.embed.w;
     
     // Manual embedding lookup
     let mut x = vec![0.0f32; n_embd * t * b];

@@ -126,7 +126,11 @@ pub struct LayerHip {
 #[derive(Debug)]
 pub struct EmbedHip {
     pub ln: LayerNormHip,
-    pub w: TensorHip<f32>,  // [n_vocab, n_embd]
+    /// Embedding table kept on CPU to avoid GPU→CPU transfer per forward.
+    /// Shape: [n_vocab, n_embd] in row-major order (token_id * n_embd + c).
+    pub w: Vec<f32>,
+    /// Embedding dimension (n_embd)
+    pub n_embd: usize,
 }
 
 /// Output head weights.
@@ -435,6 +439,40 @@ fn load_tensor_f32(
     TensorHip::from_slice_managed(&f32_data, hip_shape, stream).map_err(ModelLoadError::from)
 }
 
+/// Load a tensor from SafeTensors, converting f16/bf16 to f32, keeping data on CPU.
+///
+/// This is used for embedding tables which are accessed on CPU during embedding lookup.
+/// The data is returned in row-major order as stored in SafeTensors.
+fn load_tensor_f32_cpu(
+    st: &safetensors::SafeTensors,
+    name: &str,
+) -> std::result::Result<Vec<f32>, ModelLoadError> {
+    let tensor = st.tensor(name).map_err(|e| ModelLoadError::SafeTensor(format!("{}: {}", name, e)))?;
+
+    let dtype = tensor.dtype();
+    let data = tensor.data();
+
+    // Convert f16/bf16 bytes to f32 vec
+    let f32_data: Vec<f32> = match dtype {
+        safetensors::Dtype::F16 => {
+            let f16_slice: &[f16] = bytemuck::cast_slice(data);
+            f16_slice.iter().map(|x| x.to_f32()).collect()
+        }
+        safetensors::Dtype::F32 => {
+            bytemuck::cast_slice(data).to_vec()
+        }
+        safetensors::Dtype::BF16 => {
+            let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
+            bf16_slice.iter().map(|x| x.to_f32()).collect()
+        }
+        _ => return Err(ModelLoadError::InvalidModel(format!(
+            "Unsupported dtype {:?} for tensor {}", dtype, name
+        ))),
+    };
+
+    Ok(f32_data)
+}
+
 /// Load a weight matrix from SafeTensors, transposing to column-major for rocBLAS.
 ///
 /// SafeTensors stores weights as row-major [out_features, in_features].
@@ -573,10 +611,11 @@ impl Rwkv7Hip {
         log::info!("Loading RWKV7 model: {} layers, {} embd, {} heads, {} vocab",
             n_layer, n_embd, n_head, n_vocab);
 
-        // Load embedding (no transpose - it's a lookup table, not GEMM)
+        // Load embedding to CPU (lookup table accessed on CPU, avoids GPU→CPU transfer per forward)
         let embed = EmbedHip {
             ln: load_layer_norm(&st, "blocks.0.ln0", &stream)?,
-            w: load_tensor_f32(&st, "emb.weight", &stream)?,
+            w: load_tensor_f32_cpu(&st, "emb.weight")?,
+            n_embd,
         };
 
         // Load output head (transpose to column-major for GEMM)
@@ -702,8 +741,9 @@ impl Rwkv7Hip {
     /// - "blocks.5.ffn.key.weight" - layer 5 FFN key weights
     /// - "head.weight" - output head weights
     pub fn get_weight(&self, name: &str) -> Option<&TensorHip<f32>> {
+        // Note: emb.weight is kept on CPU, use get_embedding() instead
         if name == "emb.weight" {
-            return Some(&self.embed.w);
+            return None;
         }
         if name == "head.weight" {
             return Some(&self.head.w);
@@ -768,6 +808,14 @@ impl Rwkv7Hip {
         let all_data = tensor.to_vec(&stream)?;
         let n = n.min(all_data.len());
         Ok(all_data[..n].to_vec())
+    }
+
+    /// Get a reference to the embedding table (CPU storage).
+    ///
+    /// The embedding table is kept on CPU to avoid GPU→CPU transfer overhead per forward call.
+    /// Shape: [n_vocab, n_embd] in row-major order (token_id * n_embd + c).
+    pub fn get_embedding(&self) -> &[f32] {
+        &self.embed.w
     }
 
     /// Extract LoRA dimensions from the model weights.
@@ -1160,15 +1208,17 @@ impl Rwkv7Hip {
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
 
         // Embedding lookup: tokens[b][t] -> x[c, t, b]
-        let emb_data = self.embed.w.to_vec(stream)?;
+        // Embedding table is kept on CPU - direct access, no GPU transfer needed
+        let emb_data = &self.embed.w;
+        let emb_stride = self.embed.n_embd;
         let mut x_host = vec![0.0f32; n_embd * t * b];
         for batch_idx in 0..b {
             for time_idx in 0..t {
                 let token = tokens[batch_idx][time_idx] as usize;
-                for c in 0..n_embd {
-                    let idx = batch_idx * t * n_embd + time_idx * n_embd + c;
-                    x_host[idx] = emb_data[token * n_embd + c];
-                }
+                let src_offset = token * emb_stride;
+                let dst_offset = batch_idx * t * n_embd + time_idx * n_embd;
+                x_host[dst_offset..dst_offset + n_embd]
+                    .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
             }
         }
         x.copy_from_slice(&x_host, stream)?;
