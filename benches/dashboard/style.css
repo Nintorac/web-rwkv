@@ -845,6 +845,99 @@ body {
     background-color: var(--bg-secondary);
 }
 
+/* Line chart styles */
+.line-chart-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.line-chart-svg {
+    font-family: var(--font-sans);
+}
+
+.line-chart-svg .axis text {
+    font-size: 11px;
+    fill: var(--text-secondary);
+}
+
+.line-chart-svg .axis line,
+.line-chart-svg .axis path {
+    stroke: var(--border-color);
+}
+
+.line-chart-svg .axis-label {
+    font-size: 12px;
+    font-weight: 500;
+    fill: var(--text-secondary);
+}
+
+.line-chart-svg .chart-title {
+    font-size: 13px;
+    font-weight: 600;
+    fill: var(--text-primary);
+}
+
+.line-chart-line {
+    fill: none;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+}
+
+.line-chart-point {
+    cursor: pointer;
+    transition: r 0.1s ease;
+}
+
+.line-chart-point:hover {
+    filter: brightness(0.9);
+}
+
+/* Line chart legend */
+.line-chart-legend .legend-text {
+    font-size: 11px;
+    fill: var(--text-primary);
+}
+
+.line-chart-legend .legend-more-text {
+    font-size: 10px;
+    fill: var(--text-muted);
+    font-style: italic;
+}
+
+/* Line chart tooltip */
+.line-chart-tooltip {
+    position: fixed;
+    z-index: 1000;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--border-radius);
+    padding: var(--space-sm) var(--space-md);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    pointer-events: none;
+    font-size: 12px;
+    min-width: 180px;
+    max-width: 300px;
+}
+
+.line-chart-tooltip .tooltip-header {
+    font-weight: 500;
+    color: var(--text-primary);
+    border-bottom: 1px solid var(--border-subtle);
+    padding-bottom: var(--space-xs);
+    margin-bottom: var(--space-xs);
+    word-wrap: break-word;
+}
+
+.line-chart-tooltip .tooltip-row {
+    padding: 2px 0;
+    color: var(--text-primary);
+}
+
+.line-chart-tooltip .tooltip-row strong {
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
 /* Utility classes */
 .hidden {
     display: none !important;

@@ -1921,16 +1921,398 @@
 
     /**
      * Render line chart view using D3
+     * Displays tok/s vs seq_len for prefill-uniform data with multiple series
+     * Series are grouped by: batch_size + model_name + backend_id + token_chunk_size
      */
     function renderLineChart() {
-        // Placeholder: will be implemented in later tickets
-        console.log('[dashboard] renderLineChart() - Not yet implemented');
-        elements.viewContainer.innerHTML = `
-            <div class="empty-state">
-                <p>Line chart view</p>
-                <p class="empty-hint">Coming soon</p>
-            </div>
+        console.log('[dashboard] renderLineChart()');
+
+        // Get filtered data and filter to prefill_uniform scenario only
+        const allFiltered = applyFilters();
+        const filtered = allFiltered.filter(m => m.scenario === 'prefill_uniform');
+
+        if (filtered.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>No prefill-uniform data available</p>
+                    <p class="empty-hint">Load benchmark data with prefill_uniform scenario or adjust filters</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Check if we have seq_len data
+        const seqLens = [...new Set(filtered.map(m => m.seq_len))].filter(v => v != null).sort((a, b) => a - b);
+        if (seqLens.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>Insufficient data for line chart</p>
+                    <p class="empty-hint">Need seq_len values in data</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Group data by series key: batch_size + model_name + backend_id + chunk_size
+        const seriesMap = new Map();
+        filtered.forEach(m => {
+            if (m.seq_len == null || m.prefill_tok_per_s == null) return;
+
+            const chunkSize = m.token_chunk_size_effective || m.token_chunk_size_requested || m.token_chunk_size;
+            const seriesKey = `${m.batch_size || '?'}|${m.model_name || '?'}|${m.backend_id || '?'}|${chunkSize || '?'}`;
+
+            if (!seriesMap.has(seriesKey)) {
+                seriesMap.set(seriesKey, {
+                    key: seriesKey,
+                    batch_size: m.batch_size,
+                    model_name: m.model_name,
+                    backend_id: m.backend_id,
+                    token_chunk_size: chunkSize,
+                    points: new Map()  // seq_len -> [values]
+                });
+            }
+
+            const series = seriesMap.get(seriesKey);
+            if (!series.points.has(m.seq_len)) {
+                series.points.set(m.seq_len, []);
+            }
+            series.points.get(m.seq_len).push(m.prefill_tok_per_s);
+        });
+
+        // Convert to array format with averaged points
+        const seriesData = [];
+        seriesMap.forEach((series, key) => {
+            const points = [];
+            series.points.forEach((values, seq_len) => {
+                const avg = values.reduce((a, b) => a + b, 0) / values.length;
+                points.push({ seq_len, value: avg, count: values.length });
+            });
+
+            // Sort points by seq_len for proper line drawing
+            points.sort((a, b) => a.seq_len - b.seq_len);
+
+            if (points.length > 0) {
+                seriesData.push({
+                    key: key,
+                    batch_size: series.batch_size,
+                    model_name: series.model_name,
+                    backend_id: series.backend_id,
+                    token_chunk_size: series.token_chunk_size,
+                    points: points
+                });
+            }
+        });
+
+        if (seriesData.length === 0) {
+            elements.viewContainer.innerHTML = `
+                <div class="empty-state">
+                    <p>No valid data points for line chart</p>
+                    <p class="empty-hint">Check that data has seq_len and prefill_tok_per_s values</p>
+                </div>
+            `;
+            return;
+        }
+
+        // Render the line chart
+        renderLineChartSVG(seriesData, seqLens);
+    }
+
+    /**
+     * Render line chart SVG using D3
+     */
+    function renderLineChartSVG(seriesData, allSeqLens) {
+        // Clear container
+        elements.viewContainer.innerHTML = '';
+
+        // Create wrapper div
+        const wrapper = document.createElement('div');
+        wrapper.className = 'line-chart-wrapper';
+        elements.viewContainer.appendChild(wrapper);
+
+        // Dimensions
+        const margin = { top: 40, right: 200, bottom: 60, left: 80 };
+        const containerWidth = elements.viewContainer.clientWidth || 900;
+        const width = Math.max(500, containerWidth - margin.left - margin.right);
+        const height = 400;
+
+        // Create SVG
+        const svg = d3.select(wrapper)
+            .append('svg')
+            .attr('width', width + margin.left + margin.right)
+            .attr('height', height + margin.top + margin.bottom)
+            .attr('class', 'line-chart-svg');
+
+        const g = svg.append('g')
+            .attr('transform', `translate(${margin.left},${margin.top})`);
+
+        // Find data ranges
+        let minSeqLen = Infinity, maxSeqLen = -Infinity;
+        let minValue = Infinity, maxValue = -Infinity;
+
+        seriesData.forEach(series => {
+            series.points.forEach(pt => {
+                if (pt.seq_len < minSeqLen) minSeqLen = pt.seq_len;
+                if (pt.seq_len > maxSeqLen) maxSeqLen = pt.seq_len;
+                if (pt.value < minValue) minValue = pt.value;
+                if (pt.value > maxValue) maxValue = pt.value;
+            });
+        });
+
+        // Add some padding to value range
+        const valuePadding = (maxValue - minValue) * 0.1 || maxValue * 0.1;
+        minValue = Math.max(0, minValue - valuePadding);
+        maxValue = maxValue + valuePadding;
+
+        // X scale (seq_len) - linear scale
+        const xScale = d3.scaleLinear()
+            .domain([minSeqLen, maxSeqLen])
+            .range([0, width]);
+
+        // Y scale (tok/s) - linear scale
+        const yScale = d3.scaleLinear()
+            .domain([minValue, maxValue])
+            .range([height, 0]);
+
+        // Color scale for different series
+        const colorScale = d3.scaleOrdinal()
+            .domain(seriesData.map(s => s.key))
+            .range(d3.schemeTableau10);
+
+        // Add grid lines
+        const yGridLines = g.append('g')
+            .attr('class', 'grid y-grid')
+            .call(d3.axisLeft(yScale)
+                .ticks(6)
+                .tickSize(-width)
+                .tickFormat('')
+            );
+
+        yGridLines.selectAll('line')
+            .attr('stroke', 'var(--border-subtle)')
+            .attr('stroke-dasharray', '3,3');
+
+        yGridLines.select('.domain').remove();
+
+        // Line generator
+        const lineGenerator = d3.line()
+            .x(d => xScale(d.seq_len))
+            .y(d => yScale(d.value))
+            .defined(d => d.value != null);
+
+        // Draw lines and points for each series
+        seriesData.forEach((series, idx) => {
+            const color = colorScale(series.key);
+
+            // Draw line connecting points
+            g.append('path')
+                .datum(series.points)
+                .attr('class', 'line-chart-line')
+                .attr('fill', 'none')
+                .attr('stroke', color)
+                .attr('stroke-width', 2)
+                .attr('d', lineGenerator);
+
+            // Draw data points
+            g.selectAll(`.line-chart-point-${idx}`)
+                .data(series.points)
+                .enter()
+                .append('circle')
+                .attr('class', `line-chart-point line-chart-point-${idx}`)
+                .attr('cx', d => xScale(d.seq_len))
+                .attr('cy', d => yScale(d.value))
+                .attr('r', 4)
+                .attr('fill', color)
+                .attr('stroke', 'var(--bg-secondary)')
+                .attr('stroke-width', 1.5)
+                .on('mouseover', function(event, d) {
+                    showLineChartTooltip(event, d, series);
+                    d3.select(this).attr('r', 6);
+                })
+                .on('mouseout', function() {
+                    hideLineChartTooltip();
+                    d3.select(this).attr('r', 4);
+                });
+        });
+
+        // X axis
+        const xAxis = g.append('g')
+            .attr('class', 'axis x-axis')
+            .attr('transform', `translate(0,${height})`)
+            .call(d3.axisBottom(xScale)
+                .ticks(8)
+                .tickFormat(d => formatSeqLen(d))
+            );
+
+        // X axis label
+        g.append('text')
+            .attr('class', 'axis-label')
+            .attr('x', width / 2)
+            .attr('y', height + 45)
+            .attr('text-anchor', 'middle')
+            .text('Sequence Length');
+
+        // Y axis
+        const yAxis = g.append('g')
+            .attr('class', 'axis y-axis')
+            .call(d3.axisLeft(yScale)
+                .ticks(6)
+                .tickFormat(d => formatThroughput(d))
+            );
+
+        // Y axis label
+        g.append('text')
+            .attr('class', 'axis-label')
+            .attr('transform', 'rotate(-90)')
+            .attr('x', -height / 2)
+            .attr('y', -55)
+            .attr('text-anchor', 'middle')
+            .text('Throughput (tok/s)');
+
+        // Title
+        svg.append('text')
+            .attr('class', 'chart-title')
+            .attr('x', margin.left + width / 2)
+            .attr('y', 20)
+            .attr('text-anchor', 'middle')
+            .text('Prefill Throughput vs Sequence Length');
+
+        // Legend
+        renderLineChartLegend(svg, seriesData, colorScale, width + margin.left + 20, margin.top);
+
+        console.log(`[dashboard] Line chart rendered with ${seriesData.length} series`);
+    }
+
+    /**
+     * Format sequence length for display on axis
+     */
+    function formatSeqLen(value) {
+        if (value >= 1000) {
+            return (value / 1000).toFixed(value % 1000 === 0 ? 0 : 1) + 'K';
+        }
+        return value.toString();
+    }
+
+    /**
+     * Render legend for line chart
+     */
+    function renderLineChartLegend(svg, seriesData, colorScale, x, y) {
+        const legendGroup = svg.append('g')
+            .attr('class', 'line-chart-legend')
+            .attr('transform', `translate(${x},${y})`);
+
+        const itemHeight = 22;
+        const maxItems = 15;
+        const displayData = seriesData.slice(0, maxItems);
+        const hasMore = seriesData.length > maxItems;
+
+        displayData.forEach((series, idx) => {
+            const itemGroup = legendGroup.append('g')
+                .attr('transform', `translate(0,${idx * itemHeight})`);
+
+            // Color swatch
+            itemGroup.append('rect')
+                .attr('x', 0)
+                .attr('y', 0)
+                .attr('width', 14)
+                .attr('height', 14)
+                .attr('rx', 2)
+                .attr('fill', colorScale(series.key));
+
+            // Label - abbreviated for space
+            const label = buildSeriesLabel(series);
+            itemGroup.append('text')
+                .attr('x', 20)
+                .attr('y', 11)
+                .attr('class', 'legend-text')
+                .text(label.length > 25 ? label.substring(0, 22) + '...' : label)
+                .append('title')
+                .text(buildSeriesLabelFull(series));
+        });
+
+        // Show "and N more" if truncated
+        if (hasMore) {
+            legendGroup.append('text')
+                .attr('x', 0)
+                .attr('y', displayData.length * itemHeight + 12)
+                .attr('class', 'legend-more-text')
+                .text(`... and ${seriesData.length - maxItems} more`);
+        }
+    }
+
+    /**
+     * Build abbreviated series label for legend
+     */
+    function buildSeriesLabel(series) {
+        const parts = [];
+        if (series.batch_size != null) parts.push(`bs=${series.batch_size}`);
+        if (series.backend_id) {
+            const shortBackend = series.backend_id.length > 8
+                ? series.backend_id.substring(0, 6) + '..'
+                : series.backend_id;
+            parts.push(shortBackend);
+        }
+        if (series.token_chunk_size != null) parts.push(`c=${series.token_chunk_size}`);
+        return parts.join(' ');
+    }
+
+    /**
+     * Build full series label for tooltip
+     */
+    function buildSeriesLabelFull(series) {
+        const parts = [];
+        if (series.model_name) parts.push(`Model: ${series.model_name}`);
+        if (series.backend_id) parts.push(`Backend: ${series.backend_id}`);
+        if (series.batch_size != null) parts.push(`Batch: ${series.batch_size}`);
+        if (series.token_chunk_size != null) parts.push(`Chunk: ${series.token_chunk_size}`);
+        return parts.join(', ');
+    }
+
+    /**
+     * Show tooltip for line chart point
+     */
+    function showLineChartTooltip(event, point, series) {
+        // Remove existing tooltip
+        hideLineChartTooltip();
+
+        const tooltip = document.createElement('div');
+        tooltip.className = 'line-chart-tooltip';
+        tooltip.innerHTML = `
+            <div class="tooltip-header">${escapeHtml(buildSeriesLabelFull(series))}</div>
+            <div class="tooltip-row"><strong>Seq Length:</strong> ${formatSeqLen(point.seq_len)}</div>
+            <div class="tooltip-row"><strong>Throughput:</strong> ${formatThroughput(point.value)} tok/s</div>
+            <div class="tooltip-row"><strong>Samples:</strong> ${point.count}</div>
         `;
+
+        document.body.appendChild(tooltip);
+
+        // Position tooltip
+        const tooltipRect = tooltip.getBoundingClientRect();
+        let left = event.pageX + 12;
+        let top = event.pageY - 10;
+
+        // Keep tooltip in viewport
+        if (left + tooltipRect.width > window.innerWidth) {
+            left = event.pageX - tooltipRect.width - 12;
+        }
+        if (top + tooltipRect.height > window.innerHeight) {
+            top = event.pageY - tooltipRect.height - 10;
+        }
+        if (top < 0) {
+            top = 10;
+        }
+
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+    }
+
+    /**
+     * Hide line chart tooltip
+     */
+    function hideLineChartTooltip() {
+        const existing = document.querySelector('.line-chart-tooltip');
+        if (existing) {
+            existing.remove();
+        }
     }
 
     /**
