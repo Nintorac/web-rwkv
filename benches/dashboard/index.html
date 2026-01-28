@@ -15,12 +15,28 @@
     </header>
 
     <main class="main-container">
-        <!-- File Drop Zone -->
-        <section class="drop-zone" id="drop-zone">
-            <div class="drop-zone-content">
-                <p class="drop-zone-text">Drop JSONL files here or click to browse</p>
-                <input type="file" id="file-input" accept=".jsonl,.json" multiple hidden>
-                <p class="drop-zone-hint">Supports multiple files</p>
+        <!-- File Loading Area -->
+        <section class="file-loading-area">
+            <!-- File Drop Zone -->
+            <div class="drop-zone" id="drop-zone">
+                <div class="drop-zone-content">
+                    <p class="drop-zone-text">Drop JSONL files here or click to browse</p>
+                    <input type="file" id="file-input" accept=".jsonl,.json" multiple hidden>
+                    <p class="drop-zone-hint">Supports multiple files</p>
+                </div>
+            </div>
+
+            <!-- Server Files Section -->
+            <div class="server-files-section" id="server-files-section">
+                <div class="server-files-header">
+                    <span class="server-files-title">Load from Server</span>
+                    <button class="server-refresh-btn" id="server-refresh-btn" title="Refresh file list">
+                        &#8635;
+                    </button>
+                </div>
+                <div class="server-files-content" id="server-files-content">
+                    <p class="server-files-status" id="server-files-status">Click refresh to load available files</p>
+                </div>
             </div>
         </section>
 

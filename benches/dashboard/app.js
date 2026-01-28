@@ -72,6 +72,7 @@
         setupDropZone();
         setupTabs();
         setupExportButton();
+        setupServerFiles();
 
         console.log('[dashboard] Initialization complete');
     }
@@ -92,7 +93,12 @@
                 backends: document.getElementById('stat-backends'),
                 models: document.getElementById('stat-models')
             },
-            exportBtn: document.getElementById('export-btn')
+            exportBtn: document.getElementById('export-btn'),
+            // Server files section
+            serverFilesSection: document.getElementById('server-files-section'),
+            serverFilesContent: document.getElementById('server-files-content'),
+            serverFilesStatus: document.getElementById('server-files-status'),
+            serverRefreshBtn: document.getElementById('server-refresh-btn')
         };
     }
 
@@ -176,6 +182,243 @@
         });
 
         console.log('[dashboard] Export button configured');
+    }
+
+    // =========================================================================
+    // Server Files Loading
+    // =========================================================================
+
+    /**
+     * Server files state
+     */
+    const serverFilesState = {
+        files: [],           // Array of file objects from manifest
+        loading: false,      // Whether currently loading manifest
+        error: null,         // Last error message
+        manifestPath: '/data/index.json'  // Default manifest path
+    };
+
+    /**
+     * Set up server files section
+     */
+    function setupServerFiles() {
+        const refreshBtn = elements.serverRefreshBtn;
+        if (!refreshBtn) {
+            console.warn('[dashboard] Server refresh button not found');
+            return;
+        }
+
+        refreshBtn.addEventListener('click', () => {
+            fetchServerFiles();
+        });
+
+        // Try to auto-load manifest on init (gracefully fail if not available)
+        fetchServerFiles();
+
+        console.log('[dashboard] Server files section configured');
+    }
+
+    /**
+     * Fetch the server manifest listing available JSONL files
+     */
+    async function fetchServerFiles() {
+        if (serverFilesState.loading) return;
+
+        console.log('[dashboard] Fetching server file manifest');
+        serverFilesState.loading = true;
+        serverFilesState.error = null;
+        updateServerFilesUI();
+
+        try {
+            const response = await fetch(serverFilesState.manifestPath);
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const manifest = await response.json();
+
+            // Validate manifest structure
+            if (!manifest.files || !Array.isArray(manifest.files)) {
+                throw new Error('Invalid manifest: missing "files" array');
+            }
+
+            serverFilesState.files = manifest.files;
+            serverFilesState.error = null;
+
+            console.log(`[dashboard] Loaded manifest: ${manifest.files.length} file(s) available`);
+
+        } catch (err) {
+            console.warn('[dashboard] Failed to fetch server manifest:', err.message);
+            serverFilesState.files = [];
+            serverFilesState.error = err.message;
+        } finally {
+            serverFilesState.loading = false;
+            updateServerFilesUI();
+        }
+    }
+
+    /**
+     * Load a single file from the server
+     * @param {string} filename - Name of the file to load
+     */
+    async function loadServerFile(filename) {
+        console.log(`[dashboard] Loading server file: ${filename}`);
+
+        // Reset errors for this load session
+        state.errors = [];
+
+        // Show loading state
+        setLoadingState(true);
+
+        // If not merging, clear existing data before loading
+        if (!config.mergeOnLoad) {
+            clearData();
+        }
+
+        try {
+            // Construct the full path (files are in /data/ directory)
+            const filePath = `/data/${filename}`;
+            const response = await fetch(filePath);
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const content = await response.text();
+            const parseResult = parseJsonlContent(content, filename);
+
+            // Merge results into state
+            let runsAdded = 0;
+            let measuresAdded = 0;
+
+            parseResult.runs.forEach(run => {
+                // Check for duplicate run_id
+                const existingIdx = state.data.runs.findIndex(r => r.run_id === run.run_id);
+                if (existingIdx === -1) {
+                    state.data.runs.push(run);
+                    state.data.sourceFiles.set(run.run_id, filename);
+                    runsAdded++;
+                } else {
+                    console.log(`[dashboard] Skipping duplicate run: ${run.run_id}`);
+                }
+            });
+
+            parseResult.measures.forEach(measure => {
+                measure._sourceFile = filename;
+                state.data.measures.push(measure);
+                measuresAdded++;
+            });
+
+            state.errors.push(...parseResult.errors);
+
+            console.log(`[dashboard] Loaded ${filename}: ${runsAdded} runs, ${measuresAdded} measures`);
+
+            // Mark data as loaded if we have any records
+            if (state.data.runs.length > 0 || state.data.measures.length > 0) {
+                state.data.loaded = true;
+            }
+
+            // Show error summary if there were parsing errors
+            if (parseResult.errors.length > 0) {
+                showErrorSummary(parseResult.errors);
+            }
+
+        } catch (err) {
+            const error = {
+                file: filename,
+                line: null,
+                message: `Failed to load: ${err.message}`
+            };
+            state.errors.push(error);
+            console.error(`[dashboard] Error loading ${filename}:`, err);
+            showErrorSummary([error]);
+        } finally {
+            setLoadingState(false);
+            updateFilters();
+            render();
+        }
+    }
+
+    /**
+     * Update the server files UI based on current state
+     */
+    function updateServerFilesUI() {
+        const content = elements.serverFilesContent;
+        const status = elements.serverFilesStatus;
+        if (!content) return;
+
+        if (serverFilesState.loading) {
+            content.innerHTML = '<p class="server-files-status">Loading...</p>';
+            return;
+        }
+
+        if (serverFilesState.error) {
+            // Show error with helpful message
+            let errorHtml = `<p class="server-files-status server-files-error">`;
+            if (serverFilesState.error.includes('404')) {
+                errorHtml += `No manifest found. Create <code>data/index.json</code> to enable server loading.`;
+            } else if (serverFilesState.error.includes('Failed to fetch')) {
+                errorHtml += `Server not available. Use drag-and-drop instead.`;
+            } else {
+                errorHtml += `Error: ${escapeHtml(serverFilesState.error)}`;
+            }
+            errorHtml += `</p>`;
+            content.innerHTML = errorHtml;
+            return;
+        }
+
+        if (serverFilesState.files.length === 0) {
+            content.innerHTML = '<p class="server-files-status">No files available</p>';
+            return;
+        }
+
+        // Build file list
+        let html = '<ul class="server-files-list">';
+        serverFilesState.files.forEach(file => {
+            const name = file.name || 'unknown';
+            const size = file.size ? formatBytes(file.size) : '';
+            const modified = file.modified ? formatDate(file.modified) : '';
+
+            html += `
+                <li class="server-file-item" data-filename="${escapeHtml(name)}">
+                    <button class="server-file-btn" title="Click to load">
+                        <span class="server-file-name">${escapeHtml(name)}</span>
+                        <span class="server-file-meta">${size}${modified ? ' - ' + modified : ''}</span>
+                    </button>
+                </li>
+            `;
+        });
+        html += '</ul>';
+
+        content.innerHTML = html;
+
+        // Attach click handlers
+        content.querySelectorAll('.server-file-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                const item = btn.closest('.server-file-item');
+                const filename = item.dataset.filename;
+                loadServerFile(filename);
+            });
+        });
+    }
+
+    /**
+     * Format a date string for display
+     * @param {string} dateStr - ISO date string
+     * @returns {string} Formatted date
+     */
+    function formatDate(dateStr) {
+        try {
+            const date = new Date(dateStr);
+            return date.toLocaleDateString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric'
+            });
+        } catch {
+            return dateStr;
+        }
     }
 
     /**
@@ -3620,6 +3863,10 @@
         exportRegressionReport: exportRegressionReport,
         // Compare state for programmatic access
         getCompareState: () => compareState,
+        // Server files API
+        getServerFilesState: () => serverFilesState,
+        fetchServerFiles: fetchServerFiles,
+        loadServerFile: loadServerFile,
         version: '0.1'
     };
 
