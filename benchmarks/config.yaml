@@ -33,27 +33,27 @@ profiles:
   dev:
     description: "Development profile (~5-10 min). Broader coverage for local testing."
     models:
-      - rwkv7_othello_9m
-      - rwkv_puzzle15
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
     backends:
-      - wgpu
       - hip
+      - wgpu
     scenarios:
       - decode_only
       - prefill_uniform
       - prefill_mixed
-    batch_sizes: [1, 2, 4, 8, 16]
-    token_chunk_sizes: [128, 256]
-    decode_steps: [128, 512]
-    seq_lens: [1, 32, 64, 128, 256, 512, 1024]
-    warmup_runs: 1
-    repeats: 3
+    batch_sizes: [16, 32]
+    token_chunk_sizes: [32]
+    decode_steps: [32, 64]
+    seq_lens: [32, 64]
+    warmup_runs: 0
+    repeats: 1
 
   full:
     description: "Full benchmark suite (~30+ min). Comprehensive coverage for CI/nightly."
     models:
-      - rwkv7_othello_9m
-      - rwkv_puzzle15
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
     backends:
       - wgpu
       - hip
@@ -74,6 +74,30 @@ profiles:
 # List of model entries. Each entry defines identity, path, and optional overrides.
 
 models:
+  - model_id: "a667c2c8c5505ffefd3ee043927751793a95e82dd286d64e6f141759b91dcbe3"
+    model_name: "rwkv7_g1a_0.1b"
+    model_size: "0.1b"
+    path: "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st"
+    tags:
+      rwkv_version: "v7"
+      variant: "g1a"
+      ctx: 4096
+    max_batch_size: 64
+    max_token_chunk_size: 4096
+    skip: false
+
+  - model_id: "cf1b7f37b346c6e44949c9ece3338aa99222a3acaeebe258b376745860e6d0ce"
+    model_name: "rwkv7_g1c_2.9b"
+    model_size: "2.9b"
+    path: "/workspace/models/rwkv7-g1c-2.9b-20251231-ctx8192.st"
+    tags:
+      rwkv_version: "v7"
+      variant: "g1c"
+      ctx: 8192
+    max_batch_size: 16
+    max_token_chunk_size: 4096
+    skip: false
+
   - model_id: "e06bcb54ba0c4421c5166f0c85e205e334e3161bc82bc636d4d87f18be7555f6"
     model_name: "rwkv7_othello_9m"
     model_size: "9m"
@@ -212,7 +236,7 @@ sweeps:
 
   # Development sweep
   dev:
-    models: ["rwkv7_othello_9m", "rwkv_puzzle15"]
+    models: ["rwkv7_g1a_0.1b", "rwkv7_g1c_2.9b"]
     backends: ["wgpu"]
     batch_sizes: [1, 2, 4, 8, 16]
     token_chunk_sizes: [128, 256]
@@ -221,7 +245,7 @@ sweeps:
 
   # Full sweep for CI
   full:
-    models: ["rwkv7_othello_9m", "rwkv_puzzle15"]
+    models: ["rwkv7_g1a_0.1b", "rwkv7_g1c_2.9b"]
     backends: ["wgpu", "hip"]
     batch_sizes: [1, 2, 4, 8, 16, 32]
     token_chunk_sizes: [32, 128, 256, 512]

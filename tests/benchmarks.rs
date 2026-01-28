@@ -46,10 +46,12 @@ use web_rwkv::{
     runtime::{
         infer::{Rnn, RnnInput, RnnInputBatch, RnnOption},
         loader::Loader,
-        model::{ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
+        model::{ContextAutoLimits, ModelBuilder, ModelCustomInfo, ModelInfo, ModelVersion},
         v4, v5, v6, v7, Runtime, TokioRuntime,
     },
 };
+#[cfg(feature = "hip")]
+use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
 use web_rwkv_bench::{
     collect_run_metadata, generate_case_id, generate_run_id, generate_timestamp_utc,
@@ -155,6 +157,14 @@ fn default_warmup_runs() -> u32 {
 
 fn default_repeats() -> u32 {
     5
+}
+
+fn wgpu_backend_label(backend_id: &str) -> &str {
+    if backend_id == "hip" {
+        "hip"
+    } else {
+        "Vulkan"
+    }
 }
 
 /// Model entry defining a model to benchmark
@@ -713,7 +723,7 @@ pub fn expand_profile(config: &BenchConfig, profile: &Profile) -> Result<Vec<Ben
 /// Loaded model and runtime ready for inference
 struct LoadedModel {
     #[allow(dead_code)]
-    context: Context,
+    context: Option<Context>,
     runtime: Box<dyn Runtime<Rnn>>,
     info: ModelInfo,
     vocab_size: u32,
@@ -733,7 +743,41 @@ async fn create_context(info: &ModelInfo) -> anyhow::Result<Context> {
 }
 
 /// Load a model and create runtime
-async fn load_model(model_path: &str, batch_size: usize, _token_chunk_size: usize) -> anyhow::Result<LoadedModel> {
+async fn load_model(
+    model_path: &str,
+    batch_size: usize,
+    token_chunk_size: usize,
+    backend_id: &str,
+) -> anyhow::Result<LoadedModel> {
+    if backend_id == "hip" {
+        #[cfg(feature = "hip")]
+        {
+            let model = Rwkv7Hip::load(model_path)?;
+            let config = HipRuntimeConfig::new(token_chunk_size, batch_size);
+            let runtime = HipRuntime::with_config(model, config)?;
+            let hip_info = runtime.info().clone();
+            let info = ModelInfo {
+                version: ModelVersion::V7,
+                num_layer: hip_info.n_layer,
+                num_emb: hip_info.n_embd,
+                num_hidden: hip_info.n_hidden,
+                num_vocab: hip_info.n_vocab,
+                num_head: hip_info.n_head,
+                custom: ModelCustomInfo::None,
+            };
+            return Ok(LoadedModel {
+                context: None,
+                runtime: Box::new(runtime),
+                info,
+                vocab_size: hip_info.n_vocab as u32,
+            });
+        }
+        #[cfg(not(feature = "hip"))]
+        {
+            anyhow::bail!("hip backend requested but 'hip' feature is not enabled");
+        }
+    }
+
     let file = TokioFile::open(model_path).await?;
     let data = unsafe { Mmap::map(&file)? };
 
@@ -770,7 +814,7 @@ async fn load_model(model_path: &str, batch_size: usize, _token_chunk_size: usiz
     };
 
     Ok(LoadedModel {
-        context,
+        context: Some(context),
         runtime,
         info,
         vocab_size,
@@ -1107,20 +1151,20 @@ async fn bench_smoke_async() {
         }
     };
 
-    // Filter to decode_only and prefill_uniform cases for wgpu backend
+    // Filter to decode_only and prefill_uniform cases
     let decode_cases: Vec<_> = cases
         .iter()
-        .filter(|c| c.scenario == "decode_only" && c.backend.backend_id == "wgpu")
+        .filter(|c| c.scenario == "decode_only")
         .collect();
 
     let prefill_cases: Vec<_> = cases
         .iter()
-        .filter(|c| c.scenario == "prefill_uniform" && c.backend.backend_id == "wgpu")
+        .filter(|c| c.scenario == "prefill_uniform")
         .collect();
 
     println!("\n[bench] Expanded {} total cases", cases.len());
-    println!("[bench]   decode_only/wgpu: {}", decode_cases.len());
-    println!("[bench]   prefill_uniform/wgpu: {}", prefill_cases.len());
+    println!("[bench]   decode_only: {}", decode_cases.len());
+    println!("[bench]   prefill_uniform: {}", prefill_cases.len());
 
     if decode_cases.is_empty() && prefill_cases.is_empty() {
         println!("[bench] No cases to run");
@@ -1171,7 +1215,11 @@ async fn bench_smoke_async() {
         },
         gpu: JsonlGpuInfo {
             adapter_name: "pending".to_string(),
-            backend_api: "wgpu".to_string(),
+            backend_api: if profile.backends.len() == 1 {
+                profile.backends[0].clone()
+            } else {
+                "mixed".to_string()
+            },
             driver_version: None,
             driver_info: None,
         },
@@ -1187,6 +1235,7 @@ async fn bench_smoke_async() {
     // Group cases by model to avoid reloading
     let mut current_model_path: Option<String> = None;
     let mut current_batch_size: Option<u32> = None;
+    let mut current_backend_id: Option<String> = None;
     let mut loaded_model: Option<LoadedModel> = None;
 
     let mut total_executed = 0;
@@ -1203,7 +1252,8 @@ async fn bench_smoke_async() {
 
         // Check if we need to reload the model (different model or batch size)
         let need_reload = current_model_path.as_ref() != Some(&case.model.path) ||
-                         current_batch_size != Some(case.batch_size);
+                         current_batch_size != Some(case.batch_size) ||
+                         current_backend_id.as_ref() != Some(&case.backend.backend_id);
 
         if need_reload {
             println!("\n[bench] Loading model: {} (batch={})", case.model.model_name, case.batch_size);
@@ -1215,11 +1265,17 @@ async fn bench_smoke_async() {
                 continue;
             }
 
-            match load_model(&case.model.path, case.batch_size as usize, case.token_chunk_size as usize).await {
+            match load_model(
+                &case.model.path,
+                case.batch_size as usize,
+                case.token_chunk_size as usize,
+                &case.backend.backend_id,
+            ).await {
                 Ok(model) => {
                     println!("[bench] Model loaded: {:?}", model.info.version);
                     current_model_path = Some(case.model.path.clone());
                     current_batch_size = Some(case.batch_size);
+                    current_backend_id = Some(case.backend.backend_id.clone());
                     loaded_model = Some(model);
                 }
                 Err(e) => {
@@ -1244,7 +1300,7 @@ async fn bench_smoke_async() {
             scenario: Scenario::DecodeOnly,
             model_id: &case.model.model_name,
             backend_id: &case.backend.backend_id,
-            wgpu_backend: "Vulkan", // Default for now
+            wgpu_backend: wgpu_backend_label(&case.backend.backend_id),
             batch_size: case.batch_size,
             token_chunk_size_effective: effective_chunk_size,
             decode_steps: Some(decode_steps),
@@ -1288,7 +1344,7 @@ async fn bench_smoke_async() {
                             model_size: case.model.model_size.clone(),
                             rwkv_version: rwkv_version_str(loaded.info.version).to_string(),
                             backend_id: case.backend.backend_id.clone(),
-                            wgpu_backend: "Vulkan".to_string(),
+                            wgpu_backend: wgpu_backend_label(&case.backend.backend_id).to_string(),
                             batch_size: case.batch_size,
                             token_chunk_size_requested: case.token_chunk_size,
                             token_chunk_size_effective: effective_chunk_size,
@@ -1320,6 +1376,7 @@ async fn bench_smoke_async() {
     // Reset model tracking for prefill cases
     current_model_path = None;
     current_batch_size = None;
+    current_backend_id = None;
     loaded_model = None;
 
     for case in &prefill_cases {
@@ -1333,7 +1390,8 @@ async fn bench_smoke_async() {
 
         // Check if we need to reload the model (different model or batch size)
         let need_reload = current_model_path.as_ref() != Some(&case.model.path) ||
-                         current_batch_size != Some(case.batch_size);
+                         current_batch_size != Some(case.batch_size) ||
+                         current_backend_id.as_ref() != Some(&case.backend.backend_id);
 
         if need_reload {
             println!("\n[bench] Loading model: {} (batch={})", case.model.model_name, case.batch_size);
@@ -1345,11 +1403,17 @@ async fn bench_smoke_async() {
                 continue;
             }
 
-            match load_model(&case.model.path, case.batch_size as usize, case.token_chunk_size as usize).await {
+            match load_model(
+                &case.model.path,
+                case.batch_size as usize,
+                case.token_chunk_size as usize,
+                &case.backend.backend_id,
+            ).await {
                 Ok(model) => {
                     println!("[bench] Model loaded: {:?}", model.info.version);
                     current_model_path = Some(case.model.path.clone());
                     current_batch_size = Some(case.batch_size);
+                    current_backend_id = Some(case.backend.backend_id.clone());
                     loaded_model = Some(model);
                 }
                 Err(e) => {
@@ -1374,7 +1438,7 @@ async fn bench_smoke_async() {
             scenario: Scenario::PrefillUniform,
             model_id: &case.model.model_name,
             backend_id: &case.backend.backend_id,
-            wgpu_backend: "Vulkan", // Default for now
+            wgpu_backend: wgpu_backend_label(&case.backend.backend_id),
             batch_size: case.batch_size,
             token_chunk_size_effective: effective_chunk_size,
             decode_steps: None,
@@ -1418,7 +1482,7 @@ async fn bench_smoke_async() {
                             model_size: case.model.model_size.clone(),
                             rwkv_version: rwkv_version_str(loaded.info.version).to_string(),
                             backend_id: case.backend.backend_id.clone(),
-                            wgpu_backend: "Vulkan".to_string(),
+                            wgpu_backend: wgpu_backend_label(&case.backend.backend_id).to_string(),
                             batch_size: case.batch_size,
                             token_chunk_size_requested: case.token_chunk_size,
                             token_chunk_size_effective: effective_chunk_size,
