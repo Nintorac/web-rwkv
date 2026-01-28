@@ -112,9 +112,9 @@ pub use prefill_mixed::{
     MixedCaseId, MixedCaseResult,
 };
 pub use prefill_uniform::{
-    all_prefill_lengths, canonical_length_list, seq_len_from_total_tokens, target_mode_lengths,
-    total_token_targets, LengthMetadata, LengthMode, PrefillResult, PrefillUniformConfig,
-    TokenGenerator, TtftTracker,
+    all_prefill_lengths, canonical_length_list, compute_ttft_stats, seq_len_from_total_tokens,
+    target_mode_lengths, total_token_targets, LengthMetadata, LengthMode, PrefillResult,
+    PrefillUniformConfig, TokenGenerator, TtftTracker,
 };
 pub use skip::{LimitsTracker, SkipReason};
 pub use sweep::{CaseParams, ExpandedCase, Hooks, SweepConfig, SweepEngine, SweepSummary};

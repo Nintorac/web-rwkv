@@ -378,7 +378,19 @@ impl PrefillResult {
 /// # Returns
 ///
 /// Tuple of (min, median, max) TTFT values
-fn compute_ttft_stats(ttft_values: &[f64]) -> (f64, f64, f64) {
+///
+/// # Example
+///
+/// ```
+/// use web_rwkv_bench::prefill_uniform::compute_ttft_stats;
+///
+/// let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+/// let (min, p50, max) = compute_ttft_stats(&values);
+/// assert_eq!(min, 10.0);
+/// assert_eq!(p50, 30.0); // median of 5 values is the 3rd
+/// assert_eq!(max, 50.0);
+/// ```
+pub fn compute_ttft_stats(ttft_values: &[f64]) -> (f64, f64, f64) {
     if ttft_values.is_empty() {
         return (0.0, 0.0, 0.0);
     }

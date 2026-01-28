@@ -55,6 +55,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+use crate::prefill_uniform::PrefillResult;
+
 /// Current schema version for JSONL output.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -266,6 +268,21 @@ pub struct PrefillMetrics {
     pub ttft_p50_ms: f64,
     /// Maximum TTFT across sequences
     pub ttft_max_ms: f64,
+}
+
+impl From<PrefillResult> for PrefillMetrics {
+    fn from(result: PrefillResult) -> Self {
+        Self {
+            prefill_total_ms: result.prefill_total_ms,
+            total_prompt_tokens: result.total_prompt_tokens,
+            prefill_tok_per_s: result.prefill_tok_per_s,
+            num_infer_calls: result.num_infer_calls,
+            ttft_ms_local: result.ttft_ms_local,
+            ttft_min_ms: result.ttft_min_ms,
+            ttft_p50_ms: result.ttft_p50_ms,
+            ttft_max_ms: result.ttft_max_ms,
+        }
+    }
 }
 
 /// Case identity fields for a measurement record.
@@ -1306,5 +1323,26 @@ mod tests {
         assert_eq!(rec2["run_id"], "run_2");
 
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_prefill_result_to_prefill_metrics() {
+        use crate::prefill_uniform::PrefillResult;
+
+        let result = PrefillResult::from_ttft(
+            vec![10.0, 20.0, 30.0, 40.0],
+            512,
+            2,
+        );
+
+        let metrics: PrefillMetrics = result.into();
+
+        assert_eq!(metrics.prefill_total_ms, 40.0);
+        assert_eq!(metrics.total_prompt_tokens, 512);
+        assert_eq!(metrics.num_infer_calls, 2);
+        assert_eq!(metrics.ttft_ms_local, vec![10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(metrics.ttft_min_ms, 10.0);
+        assert_eq!(metrics.ttft_max_ms, 40.0);
+        assert_eq!(metrics.ttft_p50_ms, 25.0); // (20 + 30) / 2
     }
 }
