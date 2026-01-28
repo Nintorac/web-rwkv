@@ -1224,10 +1224,10 @@ impl Rwkv7Hip {
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
 
         // Embedding lookup: tokens[b][t] -> x[c, t, b]
-        // Embedding table is kept on CPU - direct access, no GPU transfer needed
+        // Embedding table is kept on CPU - use pinned staging buffer for async upload
         let emb_data = &self.embed.w;
         let emb_stride = self.embed.n_embd;
-        let mut x_host = vec![0.0f32; n_embd * t * b];
+        let x_host = scratch.emb_staging.as_slice_mut();
         for batch_idx in 0..b {
             for time_idx in 0..t {
                 let token = tokens[batch_idx][time_idx] as usize;
@@ -1237,7 +1237,10 @@ impl Rwkv7Hip {
                     .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
             }
         }
-        x.copy_from_slice(&x_host, stream)?;
+        // Async copy from pinned host memory to GPU (truly non-blocking)
+        unsafe {
+            scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
+        }
 
         // Upload state to GPU using pinned async transfers
         let mut att_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);
@@ -1562,10 +1565,10 @@ impl Rwkv7Hip {
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
 
         // Embedding lookup: tokens[b][t] -> x[c, t, b]
-        // Embedding table is kept on CPU - direct access, no GPU transfer needed
+        // Embedding table is kept on CPU - use pinned staging buffer for async upload
         let emb_data = &self.embed.w;
         let emb_stride = self.embed.n_embd;
-        let mut x_host = vec![0.0f32; n_embd * t * b];
+        let x_host = scratch.emb_staging.as_slice_mut();
         for batch_idx in 0..b {
             for time_idx in 0..t {
                 let token = tokens[batch_idx][time_idx] as usize;
@@ -1575,7 +1578,10 @@ impl Rwkv7Hip {
                     .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
             }
         }
-        x.copy_from_slice(&x_host, stream)?;
+        // Async copy from pinned host memory to GPU (truly non-blocking)
+        unsafe {
+            scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
+        }
 
         // Upload state to GPU using pinned async transfers
         let mut att_shift_gpu: Vec<TensorHip<f32>> = Vec::with_capacity(n_layer);

@@ -14,6 +14,7 @@
 
 use super::ffi::Result;
 use super::model::Rwkv7ModelInfo;
+use super::pinned::PinnedBuffer;
 use super::tensor::{TensorHip, TensorShape};
 
 /// Runtime configuration for HIP inference.
@@ -213,6 +214,11 @@ pub struct HipScratch {
 
     /// GPU staging buffer for tokens (zero-copy chunking)
     pub token_staging: TensorHip<u32>,
+
+    // ========== Pinned host staging buffer [n_embd * T * B] ==========
+
+    /// Pinned host buffer for async embedding upload (avoids sync on hipMemcpyAsync)
+    pub emb_staging: PinnedBuffer<f32>,
 }
 
 impl HipScratch {
@@ -301,6 +307,9 @@ impl HipScratch {
 
             // Token staging buffer [T, B]
             token_staging: TensorHip::new(TensorShape::new(t, b, 1, 1))?,
+
+            // Pinned host buffer for async embedding upload [n_embd * T * B]
+            emb_staging: PinnedBuffer::new(c * t * b)?,
         })
     }
 
