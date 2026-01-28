@@ -84,6 +84,21 @@ profiles:
     warmup_runs: 0
     repeats: 1
 
+  decode_dev:
+    description: "Decode-only dev loop (very fast). 0.1b only, small batch sweep."
+    models:
+      - rwkv7_g1a_0.1b
+    backends:
+      - hip
+    scenarios:
+      - decode_only
+    batch_sizes: [32, 64, 128, 256]
+    token_chunk_sizes: [1]
+    decode_steps: [4]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
   full:
     description: "Full benchmark suite (~30+ min). Comprehensive coverage for CI/nightly."
     models:
