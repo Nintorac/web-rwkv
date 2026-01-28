@@ -94,6 +94,7 @@ pub mod jsonl;
 pub mod metadata;
 pub mod prefill_mixed;
 pub mod prefill_uniform;
+pub mod scenarios;
 pub mod skip;
 pub mod sweep;
 
@@ -117,3 +118,7 @@ pub use prefill_uniform::{
 };
 pub use skip::{LimitsTracker, SkipReason};
 pub use sweep::{CaseParams, ExpandedCase, Hooks, SweepConfig, SweepEngine, SweepSummary};
+pub use scenarios::{
+    decode_step_sets, DecodeConfig, DecodeConfigBuilder, DecodeRepeatResult, DecodeResults,
+    DecodeScenario, TokenRng,
+};
