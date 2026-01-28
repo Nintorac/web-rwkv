@@ -218,6 +218,35 @@ pub struct HipScratch {
     /// Value residual LoRA intermediate (may be empty if v_dim is None)
     pub lora_v: TensorHip<f32>,
 
+    /// Decay LoRA tanh output
+    pub lora_w_tanh: TensorHip<f32>,
+
+    /// Adaptation LoRA projection output
+    pub lora_a_proj: TensorHip<f32>,
+
+    /// Gate LoRA sigmoid output
+    pub lora_g_sig: TensorHip<f32>,
+
+    /// Value residual projection output
+    pub v_lora2: TensorHip<f32>,
+
+    // ========== Temporary buffers ==========
+
+    /// Temporary buffer for pointwise ops (std shape)
+    pub temp1: TensorHip<f32>,
+
+    /// Temporary buffer for pointwise ops (std shape)
+    pub temp2: TensorHip<f32>,
+
+    /// Temporary shift state output (state shape)
+    pub new_att_shift: TensorHip<f32>,
+
+    /// Temporary shift state output (state shape)
+    pub new_ffn_shift: TensorHip<f32>,
+
+    /// Temporary WKV state output (wkv state shape)
+    pub new_wkv_state: TensorHip<f32>,
+
     // ========== Output buffer [n_vocab, T, B] ==========
 
     /// Final logits output
@@ -227,6 +256,9 @@ pub struct HipScratch {
 
     /// GPU staging buffer for tokens (zero-copy chunking)
     pub token_staging: TensorHip<u32>,
+
+    /// GPU buffer for sequence lengths (masked kernels)
+    pub lens_gpu: TensorHip<i32>,
 
     // ========== Pinned host staging buffer [n_embd * T * B] ==========
 
@@ -329,12 +361,26 @@ impl HipScratch {
             lora_a: TensorHip::new(lora_a_shape)?,
             lora_g: TensorHip::new(lora_g_shape)?,
             lora_v: TensorHip::new(lora_v_shape)?,
+            lora_w_tanh: TensorHip::new(lora_w_shape)?,
+            lora_a_proj: TensorHip::new(std_shape)?,
+            lora_g_sig: TensorHip::new(lora_g_shape)?,
+            v_lora2: TensorHip::new(std_shape)?,
+
+            // Temporary buffers
+            temp1: TensorHip::new(std_shape)?,
+            temp2: TensorHip::new(std_shape)?,
+            new_att_shift: TensorHip::new(state_shape)?,
+            new_ffn_shift: TensorHip::new(state_shape)?,
+            new_wkv_state: TensorHip::new(wkv_state_shape)?,
 
             // Output buffer
             logits: TensorHip::new(out_shape)?,
 
             // Token staging buffer [T, B]
             token_staging: TensorHip::new(TensorShape::new(t, b, 1, 1))?,
+
+            // Sequence lengths buffer [B]
+            lens_gpu: TensorHip::new(TensorShape::new(b, 1, 1, 1))?,
 
             // Pinned host buffer for async embedding upload [n_embd * T * B]
             emb_staging: PinnedBuffer::new(c * t * b)?,

@@ -1191,7 +1191,8 @@ impl Rwkv7Hip {
         // Convert lens to i32 tensor for masked kernel
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
         let lens_shape = TensorShape::new(b, 1, 1, 1);
-        let lens_gpu = TensorHip::from_slice(&lens_i32, lens_shape, stream)?;
+        let mut lens_gpu = scratch.lens_gpu.resized_view_mut(lens_shape)?;
+        lens_gpu.copy_from_slice(&lens_i32, stream)?;
 
         // Shapes for this forward pass
         let std_shape = TensorShape::new(n_embd, t, b, 1);
@@ -1242,6 +1243,10 @@ impl Rwkv7Hip {
         let mut lora_a = scratch.lora_a.resized_view_mut(lora_a_shape)?;
         let mut lora_g = scratch.lora_g.resized_view_mut(lora_g_shape)?;
         let mut lora_v = scratch.lora_v.resized_view_mut(lora_v_shape)?;
+        let mut lora_w_tanh = scratch.lora_w_tanh.resized_view_mut(lora_w_shape)?;
+        let mut lora_a_proj = scratch.lora_a_proj.resized_view_mut(std_shape)?;
+        let mut lora_g_sig = scratch.lora_g_sig.resized_view_mut(lora_g_shape)?;
+        let mut v_lora2 = scratch.v_lora2.resized_view_mut(std_shape)?;
 
         // Output buffer
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
@@ -1306,11 +1311,11 @@ impl Rwkv7Hip {
         let result = (|| {
 
         // Temporary buffers
-        let mut new_att_shift = TensorHip::<f32>::new(state_shape)?;
-        let mut new_ffn_shift = TensorHip::<f32>::new(state_shape)?;
-        let mut new_wkv_state = TensorHip::<f32>::new(wkv_state_shape)?;
-        let mut temp1 = TensorHip::<f32>::new(std_shape)?;
-        let mut temp2 = TensorHip::<f32>::new(std_shape)?;
+        let mut new_att_shift = scratch.new_att_shift.resized_view_mut(state_shape)?;
+        let mut new_ffn_shift = scratch.new_ffn_shift.resized_view_mut(state_shape)?;
+        let mut new_wkv_state = scratch.new_wkv_state.resized_view_mut(wkv_state_shape)?;
+        let mut temp1 = scratch.temp1.resized_view_mut(std_shape)?;
+        let mut temp2 = scratch.temp2.resized_view_mut(std_shape)?;
 
         // Process each layer
         for layer_idx in 0..n_layer {
@@ -1369,22 +1374,19 @@ impl Rwkv7Hip {
 
             // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
             ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
-            let mut lora_tanh = TensorHip::<f32>::new(lora_w_shape)?;
-            tanh_f32(&lora_w, &mut lora_tanh, stream)?;
-            ctx.sgemm_into(&layer.att.w2, &lora_tanh, &mut att_w)?;
+            tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
+            ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
             broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
             softplus_decay_f32(&temp1, &mut att_w, stream)?;
 
             // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
             ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
-            let mut lora_a_proj = TensorHip::<f32>::new(std_shape)?;
             ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
             broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
             sigmoid_f32(&temp1, &mut att_a, stream)?;
 
             // Gate: g = sigmoid(xg @ g1) @ g2
             ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
-            let mut lora_g_sig = TensorHip::<f32>::new(lora_g_shape)?;
             sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
             ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
 
@@ -1393,7 +1395,6 @@ impl Rwkv7Hip {
                 if let (Some(v0), Some(v1), Some(v2)) =
                     (&layer.att.v0, &layer.att.v1, &layer.att.v2) {
                     ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
-                    let mut v_lora2 = TensorHip::<f32>::new(std_shape)?;
                     ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
                     broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
                     sigmoid_f32(&temp1, &mut temp2, stream)?;
@@ -1556,7 +1557,8 @@ impl Rwkv7Hip {
         // Convert lens to i32 tensor for masked kernel
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
         let lens_shape = TensorShape::new(b, 1, 1, 1);
-        let lens_gpu = TensorHip::from_slice(&lens_i32, lens_shape, stream)?;
+        let mut lens_gpu = scratch.lens_gpu.resized_view_mut(lens_shape)?;
+        lens_gpu.copy_from_slice(&lens_i32, stream)?;
 
         // Shapes for this forward pass
         let std_shape = TensorShape::new(n_embd, t, b, 1);
@@ -1607,6 +1609,10 @@ impl Rwkv7Hip {
         let mut lora_a = scratch.lora_a.resized_view_mut(lora_a_shape)?;
         let mut lora_g = scratch.lora_g.resized_view_mut(lora_g_shape)?;
         let mut lora_v = scratch.lora_v.resized_view_mut(lora_v_shape)?;
+        let mut lora_w_tanh = scratch.lora_w_tanh.resized_view_mut(lora_w_shape)?;
+        let mut lora_a_proj = scratch.lora_a_proj.resized_view_mut(std_shape)?;
+        let mut lora_g_sig = scratch.lora_g_sig.resized_view_mut(lora_g_shape)?;
+        let mut v_lora2 = scratch.v_lora2.resized_view_mut(std_shape)?;
 
         // Output buffer
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
@@ -1671,11 +1677,11 @@ impl Rwkv7Hip {
         let result = (|| {
 
         // Temporary buffers
-        let mut new_att_shift = TensorHip::<f32>::new(state_shape)?;
-        let mut new_ffn_shift = TensorHip::<f32>::new(state_shape)?;
-        let mut new_wkv_state = TensorHip::<f32>::new(wkv_state_shape)?;
-        let mut temp1 = TensorHip::<f32>::new(std_shape)?;
-        let mut temp2 = TensorHip::<f32>::new(std_shape)?;
+        let mut new_att_shift = scratch.new_att_shift.resized_view_mut(state_shape)?;
+        let mut new_ffn_shift = scratch.new_ffn_shift.resized_view_mut(state_shape)?;
+        let mut new_wkv_state = scratch.new_wkv_state.resized_view_mut(wkv_state_shape)?;
+        let mut temp1 = scratch.temp1.resized_view_mut(std_shape)?;
+        let mut temp2 = scratch.temp2.resized_view_mut(std_shape)?;
 
         // Process each layer
         for layer_idx in 0..n_layer {
@@ -1734,22 +1740,19 @@ impl Rwkv7Hip {
 
             // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
             ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
-            let mut lora_tanh = TensorHip::<f32>::new(lora_w_shape)?;
-            tanh_f32(&lora_w, &mut lora_tanh, stream)?;
-            ctx.sgemm_into(&layer.att.w2, &lora_tanh, &mut att_w)?;
+            tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
+            ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
             broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
             softplus_decay_f32(&temp1, &mut att_w, stream)?;
 
             // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
             ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
-            let mut lora_a_proj = TensorHip::<f32>::new(std_shape)?;
             ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
             broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
             sigmoid_f32(&temp1, &mut att_a, stream)?;
 
             // Gate: g = sigmoid(xg @ g1) @ g2
             ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
-            let mut lora_g_sig = TensorHip::<f32>::new(lora_g_shape)?;
             sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
             ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
 
@@ -1758,7 +1761,6 @@ impl Rwkv7Hip {
                 if let (Some(v0), Some(v1), Some(v2)) =
                     (&layer.att.v0, &layer.att.v1, &layer.att.v2) {
                     ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
-                    let mut v_lora2 = TensorHip::<f32>::new(std_shape)?;
                     ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
                     broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
                     sigmoid_f32(&temp1, &mut temp2, stream)?;
