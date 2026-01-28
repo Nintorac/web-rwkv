@@ -8,6 +8,7 @@ use super::ffi::{
     launch_sigmoid_f32, launch_squared_relu_f32, launch_softplus_decay_f32,
     launch_layer_norm_f32, launch_group_norm_f32, launch_l2_norm_f32,
     launch_tanh_f32, launch_token_shift_f32, launch_channel_mix_state_f32,
+    launch_channel_mix_state_f32_masked,
     launch_wkv_bonus_f32, launch_control_k_f32, launch_wkv7_f32, launch_wkv7_f32_masked,
     // Elementwise operations
     launch_add_f32, launch_mul_f32, launch_negate_f32, launch_exp_f32,
@@ -883,6 +884,86 @@ pub fn channel_mix_state_f32(
             x_k.as_ptr(),
             output.as_mut_ptr(),
             state_out.as_mut_ptr(),
+            c as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Channel-mix state computation with length masking for variable-length sequences.
+///
+/// Same as `channel_mix_state_f32` but respects per-batch sequence lengths.
+/// Only processes tokens [0, lengths[b]) for each batch, so state_out
+/// contains x[lengths[b]-1] instead of x[T-1].
+///
+/// # Arguments
+/// * `x` - Input tensor of shape [C, T, B, 1]
+/// * `state_in` - Previous state per batch of shape [C, B, 1, 1]
+/// * `x_k` - Per-channel mixing factor of shape [C, 1, 1, 1]
+/// * `output` - Output tensor of shape [C, T, B, 1]
+/// * `state_out` - New state per batch of shape [C, B, 1, 1]
+/// * `lengths` - GPU tensor of real sequence lengths per batch [B]
+/// * `stream` - HIP stream
+pub fn channel_mix_state_f32_masked(
+    x: &TensorHip<f32>,
+    state_in: &TensorHip<f32>,
+    x_k: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    state_out: &mut TensorHip<f32>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    let c = x.shape()[0];
+    let t = x.shape()[1];
+    let b = x.shape()[2];
+
+    if output.shape() != x.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                x.shape(), output.shape()
+            ),
+        });
+    }
+    if state_in.shape()[0] != c || state_in.shape()[1] != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected [{}, {}, 1, 1], got {}",
+                c, b, state_in.shape()
+            ),
+        });
+    }
+    if x_k.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
+                c, x_k.shape()
+            ),
+        });
+    }
+    if lengths.shape()[0] != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Lengths shape mismatch: expected [{}, 1, 1, 1], got {}",
+                b, lengths.shape()
+            ),
+        });
+    }
+
+    unsafe {
+        check(launch_channel_mix_state_f32_masked(
+            x.as_ptr(),
+            state_in.as_ptr(),
+            x_k.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            lengths.as_ptr() as *const c_int,
             c as c_int,
             t as c_int,
             b as c_int,

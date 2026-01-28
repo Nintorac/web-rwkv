@@ -170,6 +170,18 @@ extern "C" {
         b: c_int,
         stream: HipStream
     ) -> HipError;
+    pub fn launch_channel_mix_state_f32_masked(
+        x: *const f32,
+        state_in: *const f32,
+        x_k: *const f32,
+        output: *mut f32,
+        state_out: *mut f32,
+        lengths: *const c_int,
+        c: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
     pub fn launch_wkv_bonus_f32(
         r: *const f32,
         k: *const f32,

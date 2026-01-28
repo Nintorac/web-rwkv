@@ -701,6 +701,82 @@ hipError_t launch_channel_mix_state_f32(
 }
 
 // ============================================================================
+// Length-Masked Channel Mix State Kernel
+// Same as channel_mix_state but respects per-batch sequence lengths.
+// Only processes tokens [0, lengths[b]) for each batch, so state_out
+// contains x[lengths[b]-1] instead of x[T-1].
+// ============================================================================
+
+__global__ void kernel_channel_mix_state_f32_masked(
+    const float* __restrict__ x,          // [C, T, B, 1] - input tensor
+    const float* __restrict__ state_in,   // [C, B, 1, 1] - previous state per batch
+    const float* __restrict__ x_k,        // [C, 1, 1, 1] - mixing factor
+    float* __restrict__ output,           // [C, T, B, 1] - output
+    float* __restrict__ state_out,        // [C, B, 1, 1] - new state per batch
+    const int* __restrict__ lengths,      // [B] - real sequence length per batch
+    int C,                                 // Channel dimension
+    int T,                                 // Number of tokens (padded)
+    int B                                  // Batch size
+) {
+    // Each thread handles one (channel, batch) pair
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * B;
+    if (idx >= total) return;
+
+    int c = idx % C;        // Channel index
+    int b = idx / C;        // Batch index
+    int real_len = lengths[b];
+
+    // Handle empty sequences - preserve input state
+    if (real_len <= 0) {
+        state_out[b * C + c] = state_in[b * C + c];
+        return;
+    }
+
+    float mix_val = x_k[c];
+    float prev = state_in[b * C + c];
+
+    // Process only real tokens for this (channel, batch)
+    for (int t = 0; t < real_len; t++) {
+        int offset = b * T * C + t * C + c;
+        float curr = x[offset];
+
+        // Token shift: blend current with previous
+        output[offset] = curr + mix_val * (prev - curr);
+        prev = curr;
+    }
+
+    // State out is the last REAL token for this batch
+    state_out[b * C + c] = prev;
+}
+
+hipError_t launch_channel_mix_state_f32_masked(
+    const float* x,
+    const float* state_in,
+    const float* x_k,
+    float* output,
+    float* state_out,
+    const int* lengths,
+    int C,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (C <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+
+    int total = C * B;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_channel_mix_state_f32_masked, dim3(grid_size), dim3(block_size), 0, stream,
+                       x, state_in, x_k, output, state_out, lengths, C, T, B);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
 // WKV Bonus Kernel (time_first)
 // Computes: output = (r * k * r_k).sum(dim=head_size) * v
 // This is the "time_first" bonus attention on current token

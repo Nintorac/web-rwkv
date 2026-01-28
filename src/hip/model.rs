@@ -13,11 +13,10 @@ use super::kernels::{
     // GPU-native kernels used in forward
     layer_norm_f32, group_norm_f32, l2_norm_f32,
     sigmoid_f32, tanh_f32, softplus_decay_f32, squared_relu_f32,
-    channel_mix_state_f32, control_k_f32, wkv7_f32_masked, wkv_bonus_f32,
+    channel_mix_state_f32, channel_mix_state_f32_masked,
+    control_k_f32, wkv7_f32_masked, wkv_bonus_f32,
     add_f32, mul_f32, negate_f32, exp_f32, broadcast_add_f32, broadcast_mul_f32,
     lerp_f32, copy_tensor_f32,
-    // CPU helper for masked state extraction
-    extract_shift_state_at_lengths,
 };
 use super::blas::HipBlasContext;
 use super::scratch::HipScratch;
@@ -1277,11 +1276,13 @@ impl Rwkv7Hip {
                 &mut x_ln, 1e-5, stream
             )?;
 
-            // Token shifts for attention
-            channel_mix_state_f32(
+            // Token shifts for attention - use masked kernel for x_r to get correct state
+            // The masked kernel extracts state at lengths[b]-1 instead of T-1
+            channel_mix_state_f32_masked(
                 &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
-                &mut att_xr, &mut new_att_shift, stream
+                &mut att_xr, &mut new_att_shift, &lens_gpu, stream
             )?;
+            // Remaining shifts use regular kernel (we only need outputs, not state)
             channel_mix_state_f32(
                 &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
                 &mut att_xw, &mut temp1, stream
@@ -1303,13 +1304,8 @@ impl Rwkv7Hip {
                 &mut att_xg, &mut temp1, stream
             )?;
 
-            // Update shift state - re-extract at correct positions for masked sequences
-            // The kernel extracts from position T-1, but we need position lens[b]-1
-            {
-                let x_ln_host = x_ln.to_vec(stream)?;
-                let correct_state = extract_shift_state_at_lengths(&x_ln_host, lens, n_embd, t, b);
-                att_shift_gpu[layer_idx].copy_from_slice(&correct_state, stream)?;
-            }
+            // Update shift state - new_att_shift has correct state from masked kernel
+            std::mem::swap(&mut new_att_shift, &mut att_shift_gpu[layer_idx]);
 
             // Linear projections: r, k, v
             ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
@@ -1411,17 +1407,14 @@ impl Rwkv7Hip {
                 &mut x_ln, 1e-5, stream
             )?;
 
-            // Token shift for FFN
-            channel_mix_state_f32(
+            // Token shift for FFN - use masked kernel for correct state extraction
+            channel_mix_state_f32_masked(
                 &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
-                &mut ffn_xk, &mut new_ffn_shift, stream
+                &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
             )?;
-            // Re-extract at correct positions for masked sequences
-            {
-                let x_ln_host = x_ln.to_vec(stream)?;
-                let correct_state = extract_shift_state_at_lengths(&x_ln_host, lens, n_embd, t, b);
-                ffn_shift_gpu[layer_idx].copy_from_slice(&correct_state, stream)?;
-            }
+
+            // Update FFN shift state - new_ffn_shift has correct state from masked kernel
+            std::mem::swap(&mut new_ffn_shift, &mut ffn_shift_gpu[layer_idx]);
 
             // Key projection
             ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
