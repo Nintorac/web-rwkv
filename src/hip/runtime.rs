@@ -173,8 +173,8 @@ impl HipRuntime {
                 .unwrap_or_else(|| HipState::new(&self.model.info, self.num_batch).expect("Failed to allocate HIP state"))
         };
 
-        // New forward() handles variable-length sequences automatically
-        let (logits, new_state) = self.model.forward(sequences, Some(old_state))?;
+        // Use async path with pre-allocated pinned buffers (avoids memory pinning overhead)
+        let (logits, new_state) = self.model.forward_async(sequences, Some(old_state))?.wait()?;
 
         // Store the updated state
         let mut state_guard = self.state.lock().unwrap();

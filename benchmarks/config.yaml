@@ -60,11 +60,29 @@ profiles:
     scenarios:
       - decode_only
     # batch_sizes: [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-    batch_sizes: [32, 64, 128, 256, 512, 1024]
+    batch_sizes: [32, 64, 128, 256]
+    token_chunk_sizes: [1]
+    decode_steps: [8]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
+  ablation_all_sizes:
+    description: "Ablation across all model sizes (0.1b, 2.9b, 13.3b)."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+      - rwkv7_g0b_13.3b
+    backends:
+      - wgpu
+      - hip
+    scenarios:
+      - decode_only
+    batch_sizes: [1, 8, 32, 64, 128]
     token_chunk_sizes: [1]
     decode_steps: [16]
     seq_lens: []
-    warmup_runs: 0
+    warmup_runs: 1
     repeats: 1
 
   decode_batch_sweep_hip:
@@ -78,6 +96,22 @@ profiles:
       - decode_only
     # batch_sizes: [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     batch_sizes: [32, 64, 128, 256, 512, 1024]
+    token_chunk_sizes: [1]
+    decode_steps: [64]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
+  decode_batch_sweep_hip_large:
+    description: "Decode-only batch sweep (hip only, large batches)."
+    models:
+      - rwkv7_g1a_0.1b
+      # - rwkv7_g1c_2.9b
+    backends:
+      - hip
+    scenarios:
+      - decode_only
+    batch_sizes: [512, 1024, 2048, 4096, 8192, 16384, 32768]
     token_chunk_sizes: [1]
     decode_steps: [64]
     seq_lens: []
@@ -145,6 +179,18 @@ models:
       variant: "g1c"
       ctx: 8192
     max_batch_size: 65536
+    max_token_chunk_size: 4096
+    skip: false
+
+  - model_id: "rwkv7_g0b_13.3b"
+    model_name: "rwkv7_g0b_13.3b"
+    model_size: "13.3b"
+    path: "/workspace/models/rwkv7-g0b-13.3b-20251130-ctx8192.st"
+    tags:
+      rwkv_version: "v7"
+      variant: "g0b"
+      ctx: 8192
+    max_batch_size: 256
     max_token_chunk_size: 4096
     skip: false
 

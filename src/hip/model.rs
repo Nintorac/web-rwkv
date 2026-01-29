@@ -342,7 +342,8 @@ pub struct ForwardCompletion {
     /// Stream the work was submitted on
     stream: Stream,
     /// Pre-allocated buffer for logits (D→H copy is queued but not complete)
-    logits_buffer: PinnedBuffer<f16>,
+    /// Uses f32 - GPU does f16→f32 conversion before download
+    logits_buffer: PinnedBuffer<f32>,
     /// Pre-allocated buffers for state (D→H copies are queued but not complete)
     state_buffers: ForwardStateBuffers,
     /// Model info for reconstructing HipState
@@ -384,16 +385,13 @@ impl ForwardCompletion {
         // Extract only real tokens from padded output (matches sync forward behavior)
         // Layout: [n_vocab, chunk_size, batch_size] column-major
         // For batch b, token t: offset = (b * chunk_size + t) * n_vocab
+        // Data is already f32 (GPU did f16→f32 conversion before download)
         let padded = self.logits_buffer.as_slice();
         let mut logits = Vec::new();
         for (b, &real_len) in self.lens.iter().enumerate() {
             for t in 0..real_len {
                 let offset = (b * self.chunk_size + t) * self.n_vocab;
-                logits.extend(
-                    padded[offset..offset + self.n_vocab]
-                        .iter()
-                        .map(|v| v.to_f32()),
-                );
+                logits.extend_from_slice(&padded[offset..offset + self.n_vocab]);
             }
         }
 
@@ -1651,7 +1649,7 @@ impl Rwkv7Hip {
         state: &mut HipState,
         scratch: &mut HipScratch,
         lens: &[usize],
-        logits_dst: &mut PinnedBuffer<f16>,
+        logits_dst: &mut PinnedBuffer<f32>,
     ) -> Result<()> {
         let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
@@ -1730,8 +1728,9 @@ impl Rwkv7Hip {
         let mut lora_g_sig = scratch.lora_g_sig.resized_view_mut(lora_g_shape)?;
         let mut v_lora2 = scratch.v_lora2.resized_view_mut(std_shape)?;
 
-        // Output buffer
+        // Output buffers
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
+        let mut logits_f32 = scratch.logits_f32.resized_view_mut(out_shape)?;
 
         prof.time("embedding", || {
             // Embedding lookup: tokens[b][t] -> x[c, t, b]
@@ -2068,8 +2067,9 @@ impl Rwkv7Hip {
         })?;
 
             prof.time("logits_download", || {
-                // Download logits asynchronously (no sync)
-                logits.copy_to_slice_async(logits_dst.as_slice_mut(), stream)?;
+                // Convert f16 logits to f32 on GPU, then download asynchronously
+                copy_f16_to_f32(&logits, &mut logits_f32, stream)?;
+                logits_f32.copy_to_slice_async(logits_dst.as_slice_mut(), stream)?;
                 Ok(())
             })?;
 
@@ -2230,10 +2230,10 @@ impl Rwkv7Hip {
         }).collect();
         let chunk_refs: Vec<&[u32]> = chunk_tokens.iter().map(|v| v.as_slice()).collect();
 
-        // Allocate pinned buffer for logits
+        // Allocate pinned buffer for f32 logits (GPU does f16→f32 conversion)
         let n_vocab = self.info.n_vocab;
         let logits_size = n_vocab * chunk_size * batch_size;
-        let mut logits_buffer = PinnedBuffer::new(logits_size)?;
+        let mut logits_buffer: PinnedBuffer<f32> = PinnedBuffer::new(logits_size)?;
 
         // Run the async forward pass (queues work but doesn't sync)
         let mut current_state = current_state;
