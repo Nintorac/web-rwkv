@@ -250,8 +250,11 @@ pub struct HipScratch {
 
     // ========== Output buffer [n_vocab, T, B] ==========
 
-    /// Final logits output
+    /// Final logits output (f16)
     pub logits: TensorHip<f16>,
+
+    /// Logits converted to f32 on GPU (for efficient download)
+    pub logits_f32: TensorHip<f32>,
 
     // ========== Token staging buffer [T, B] ==========
 
@@ -376,6 +379,7 @@ impl HipScratch {
 
             // Output buffer
             logits: TensorHip::new(out_shape)?,
+            logits_f32: TensorHip::new(out_shape)?,
 
             // Token staging buffer [T, B]
             token_staging: TensorHip::new(TensorShape::new(t, b, 1, 1))?,
@@ -422,8 +426,11 @@ impl HipScratch {
         let lora_size = (ld.w_dim + ld.a_dim + ld.g_dim + ld.v_dim.unwrap_or(0)) * t * b;
 
         let f16_elements = std_count * std_size + ffn_count * ffn_size + lora_size + out_size;
+        let f32_elements = out_size; // logits_f32 buffer
         let u32_elements = token_size;
-        f16_elements * std::mem::size_of::<f16>() + u32_elements * std::mem::size_of::<u32>()
+        f16_elements * std::mem::size_of::<f16>()
+            + f32_elements * std::mem::size_of::<f32>()
+            + u32_elements * std::mem::size_of::<u32>()
     }
 
     /// Check if buffers are large enough for given sequence length and batch size.

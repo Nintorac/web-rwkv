@@ -16,7 +16,7 @@ use super::ffi::{
     HipErrorKind, Result, RocblasHandle, ROCBLAS_STATUS_SUCCESS,
     rocblas_handle_create, rocblas_handle_destroy, rocblas_set_stream_wrapper,
     rocblas_to_hip_error,
-    launch_hgemm, launch_sgemm, launch_sgemm_ta,
+    launch_hgemm, launch_hgemm_f32_out, launch_sgemm, launch_sgemm_ta,
 };
 use super::device::Stream;
 use super::tensor::{TensorShape, TensorHip};
@@ -115,6 +115,19 @@ impl HipBlasContext {
         output: &mut TensorHip<f16>,
     ) -> Result<()> {
         hgemm_f16(self.handle, weight, input, output)
+    }
+
+    /// Mixed-precision HGEMM: output = weight @ input with f16 inputs and f32 output.
+    ///
+    /// This is optimized for the head layer to avoid a separate f16->f32 conversion.
+    /// All tensors must be GPU-resident. No host copies occur.
+    pub fn hgemm_f16_to_f32_into(
+        &self,
+        weight: &TensorHip<f16>,
+        input: &TensorHip<f16>,
+        output: &mut TensorHip<f32>,
+    ) -> Result<()> {
+        hgemm_f16_to_f32(self.handle, weight, input, output)
     }
 
     /// Copy host data to a GPU tensor using this context's stream.
@@ -256,6 +269,67 @@ pub fn hgemm_f16(
         return Err(HipErrorKind {
             code: unsafe { rocblas_to_hip_error(status) },
             message: format!("rocBLAS HGEMM failed: status {}", status),
+        });
+    }
+
+    Ok(())
+}
+
+/// Mixed-precision HGEMM: C = A * B with FP16 inputs and FP32 output
+///
+/// Computes C = A * B where:
+/// - A is M×K matrix (stored column-major, FP16)
+/// - B is K×N matrix (stored column-major, FP16)
+/// - C is M×N matrix (stored column-major, FP32)
+///
+/// This uses rocblas_gemm_ex to perform the computation in FP32 and output
+/// directly to FP32, avoiding a separate f16->f32 conversion kernel.
+///
+/// For the RWKV head layer:
+/// - weight is (vocab_size, n_embd) = M×K
+/// - input is (n_embd, tokens) = K×N
+/// - output is (vocab_size, tokens) = M×N (f32 logits)
+pub fn hgemm_f16_to_f32(
+    handle: RocblasHandle,
+    weight: &TensorHip<f16>,
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f32>,
+) -> Result<()> {
+    let weight_shape = weight.shape();
+    let input_shape = input.shape();
+
+    // weight: [M, K, 1, 1] where M is out_features (vocab_size), K is in_features (n_embd)
+    // input: [K, T, B, 1] where K is in_features, T*B is total columns
+    let m = weight_shape[0] as c_int;  // M (output features / vocab_size)
+    let k = weight_shape[1] as c_int;  // K (input features / n_embd)
+    // Compute n as product of all dimensions except the first (handles batching)
+    let n = (input_shape[1] * input_shape[2] * input_shape[3]) as c_int;
+
+    // Verify dimensions
+    if input_shape[0] as c_int != k {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "HGEMM_F32_OUT dimension mismatch: weight has K={}, input has K={}",
+                k, input_shape[0]
+            ),
+        });
+    }
+
+    let status = unsafe {
+        launch_hgemm_f32_out(
+            handle,
+            m, n, k,
+            weight.as_ptr() as *const u16,
+            input.as_ptr() as *const u16,
+            output.as_mut_ptr(),
+        )
+    };
+
+    if status != ROCBLAS_STATUS_SUCCESS {
+        return Err(HipErrorKind {
+            code: unsafe { rocblas_to_hip_error(status) },
+            message: format!("rocBLAS HGEMM_F32_OUT failed: status {}", status),
         });
     }
 

@@ -972,6 +972,12 @@ __device__ __forceinline__ float pairwise_sum_64(float* __restrict__ tmp) {
     return tmp[0];
 }
 
+// Helper macro to compute dot product of float4 vectors
+#define DOT4(a, b) ((a).x * (b).x + (a).y * (b).y + (a).z * (b).z + (a).w * (b).w)
+
+// WKV7 kernel with explicit FMA and ILP optimization.
+// Uses scalar state but organizes computations for better instruction pipelining.
+// Accumulates into 4 independent partial sums to maximize ILP.
 __global__ void kernel_wkv7_f32(
     const float* __restrict__ w_decay,    // [N, H, T, B] - decay values
     const float* __restrict__ q,          // [N, H, T, B]
@@ -998,9 +1004,6 @@ __global__ void kernel_wkv7_f32(
     float state[WKV7_HEAD_SIZE];
 
     // Load initial state: state_in has shape [N, N, H, B] (column-major)
-    // In web-rwkv convention: [key/col, query/row, head, batch]
-    // For query position i, key position j, head hh, batch bb:
-    // state_in[j, i, hh, bb] is at: j + N*i + N*N*hh + N*N*H*bb
     int state_base = i*N + hh*N*N + bb*N*N*H;
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
@@ -1014,13 +1017,9 @@ __global__ void kernel_wkv7_f32(
     __shared__ float sh_a[WKV7_HEAD_SIZE];
     __shared__ float sh_b[WKV7_HEAD_SIZE];
 
-    // Temporary array for pairwise summation (per-thread)
-    float tmp[WKV7_HEAD_SIZE];
-
     // Process each timestep
     for (int t = 0; t < T; t++) {
         // Input index for this (n, h, t, b) element
-        // Shape [N, H, T, B]: ind = n + N*(h + H*(t + T*b))
         int ind = i + N*(hh + H*(t + T*bb));
 
         // Load vectors into shared memory (all threads collaborate)
@@ -1035,34 +1034,43 @@ __global__ void kernel_wkv7_f32(
         // Load this thread's v value
         float v_val = v[ind];
 
-        // Step 1: Compute sa = sum(a[j] * state[j]) using pairwise summation
-        // Pairwise sum reduces error from O(N*epsilon) to O(log(N)*epsilon)
+        // Step 1: Compute sa = sum(a[j] * state[j])
+        // Use 4 accumulators for ILP, each processing 16 elements
+        float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
         #pragma unroll
-        for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-            tmp[j] = sh_a[j] * state[j];
+        for (int j = 0; j < 16; j++) {
+            sa0 = __fmaf_rn(sh_a[j],    state[j],    sa0);
+            sa1 = __fmaf_rn(sh_a[j+16], state[j+16], sa1);
+            sa2 = __fmaf_rn(sh_a[j+32], state[j+32], sa2);
+            sa3 = __fmaf_rn(sh_a[j+48], state[j+48], sa3);
         }
-        float sa = pairwise_sum_64(tmp);
+        float sa = (sa0 + sa1) + (sa2 + sa3);
 
-        // Step 2: Update state (element-wise, no summation error)
+        // Step 2: Update state (element-wise)
         // state[j] = state[j] * w[j] + sa * b[j] + k[j] * v
+        // Use FMA: fma(fma(state, w, sa*b), 1, k*v) = state*w + sa*b + k*v
         #pragma unroll
         for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-            state[j] = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
+            float tmp = __fmaf_rn(state[j], sh_w[j], sa * sh_b[j]);
+            state[j] = __fmaf_rn(sh_k[j], v_val, tmp);
         }
 
-        // Step 3: Compute output y = sum(state[j] * q[j]) using pairwise summation
+        // Step 3: Compute output y = sum(state[j] * q[j])
+        float y0 = 0.0f, y1 = 0.0f, y2 = 0.0f, y3 = 0.0f;
         #pragma unroll
-        for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-            tmp[j] = state[j] * sh_q[j];
+        for (int j = 0; j < 16; j++) {
+            y0 = __fmaf_rn(state[j],    sh_q[j],    y0);
+            y1 = __fmaf_rn(state[j+16], sh_q[j+16], y1);
+            y2 = __fmaf_rn(state[j+32], sh_q[j+32], y2);
+            y3 = __fmaf_rn(state[j+48], sh_q[j+48], y3);
         }
-        float y = pairwise_sum_64(tmp);
+        float y_out = (y0 + y1) + (y2 + y3);
 
         // Write output
-        output[ind] = y;
+        output[ind] = y_out;
     }
 
-    // Save final state: same layout as input
-    // state_out[j, i, hh, bb] at: j + N*i + N*N*hh + N*N*H*bb
+    // Save final state
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
         state_out[j + state_base] = state[j];
@@ -1106,7 +1114,7 @@ hipError_t launch_wkv7_f32(
     return hipGetLastError();
 }
 
-// Length-masked WKV7 kernel: skips state updates for padding positions
+// Length-masked WKV7 kernel with explicit FMA and ILP optimization
 // Preserves invariant: state(seq + padding) == state(seq)
 __global__ void kernel_wkv7_f32_masked(
     const float* __restrict__ w_decay,    // [N, H, T, B] - decay values
@@ -1136,10 +1144,7 @@ __global__ void kernel_wkv7_f32_masked(
     // Each thread maintains its own state row (query position i)
     float state[WKV7_HEAD_SIZE];
 
-    // Load initial state: state_in has shape [N, N, H, B] (column-major)
-    // In web-rwkv convention: [key/col, query/row, head, batch]
-    // For query position i, key position j, head hh, batch bb:
-    // state_in[j, i, hh, bb] is at: j + N*i + N*N*hh + N*N*H*bb
+    // Load initial state
     int state_base = i*N + hh*N*N + bb*N*N*H;
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
@@ -1153,13 +1158,9 @@ __global__ void kernel_wkv7_f32_masked(
     __shared__ float sh_a[WKV7_HEAD_SIZE];
     __shared__ float sh_b[WKV7_HEAD_SIZE];
 
-    // Temporary array for pairwise summation (per-thread)
-    float tmp[WKV7_HEAD_SIZE];
-
     // Process each timestep
     for (int t = 0; t < T; t++) {
         // Input index for this (n, h, t, b) element
-        // Shape [N, H, T, B]: ind = n + N*(h + H*(t + T*b))
         int ind = i + N*(hh + H*(t + T*bb));
 
         // Load vectors into shared memory (all threads must participate)
@@ -1176,35 +1177,43 @@ __global__ void kernel_wkv7_f32_masked(
             // Load this thread's v value
             float v_val = v[ind];
 
-            // Step 1: Compute sa = sum(a[j] * state[j]) using pairwise summation
+            // Step 1: Compute sa = sum(a[j] * state[j])
+            // Use 4 accumulators for ILP
+            float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-                tmp[j] = sh_a[j] * state[j];
+            for (int j = 0; j < 16; j++) {
+                sa0 = __fmaf_rn(sh_a[j],    state[j],    sa0);
+                sa1 = __fmaf_rn(sh_a[j+16], state[j+16], sa1);
+                sa2 = __fmaf_rn(sh_a[j+32], state[j+32], sa2);
+                sa3 = __fmaf_rn(sh_a[j+48], state[j+48], sa3);
             }
-            float sa = pairwise_sum_64(tmp);
+            float sa = (sa0 + sa1) + (sa2 + sa3);
 
             // Step 2: Update state (element-wise)
-            // state[j] = state[j] * w[j] + sa * b[j] + k[j] * v
             #pragma unroll
             for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-                state[j] = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
+                float tmp = __fmaf_rn(state[j], sh_w[j], sa * sh_b[j]);
+                state[j] = __fmaf_rn(sh_k[j], v_val, tmp);
             }
 
-            // Step 3: Compute output y = sum(state[j] * q[j]) using pairwise summation
+            // Step 3: Compute output
+            float y0 = 0.0f, y1 = 0.0f, y2 = 0.0f, y3 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-                tmp[j] = state[j] * sh_q[j];
+            for (int j = 0; j < 16; j++) {
+                y0 = __fmaf_rn(state[j],    sh_q[j],    y0);
+                y1 = __fmaf_rn(state[j+16], sh_q[j+16], y1);
+                y2 = __fmaf_rn(state[j+32], sh_q[j+32], y2);
+                y3 = __fmaf_rn(state[j+48], sh_q[j+48], y3);
             }
-            float y = pairwise_sum_64(tmp);
+            float y_out = (y0 + y1) + (y2 + y3);
 
             // Write output
-            output[ind] = y;
+            output[ind] = y_out;
         }
         // For padding positions: state unchanged, output undefined
     }
 
-    // Save final state: same layout as input
-    // state_out[j, i, hh, bb] at: j + N*i + N*N*hh + N*N*H*bb
+    // Save final state
     #pragma unroll
     for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
         state_out[j + state_base] = state[j];
@@ -2463,6 +2472,7 @@ hipError_t launch_wkv_bonus_f16(
     return hipGetLastError();
 }
 
+// FP16 IO / FP32 state masked WKV7 kernel with explicit FMA and ILP optimization
 __global__ void kernel_wkv7_f16_masked(
     const __half* __restrict__ w_decay,    // [N, H, T, B]
     const __half* __restrict__ q,          // [N, H, T, B]
@@ -2500,8 +2510,6 @@ __global__ void kernel_wkv7_f16_masked(
     __shared__ float sh_a[WKV7_HEAD_SIZE];
     __shared__ float sh_b[WKV7_HEAD_SIZE];
 
-    float tmp[WKV7_HEAD_SIZE];
-
     for (int t = 0; t < T; t++) {
         int ind = i + N * (hh + H * (t + T * bb));
 
@@ -2516,23 +2524,35 @@ __global__ void kernel_wkv7_f16_masked(
         if (t < real_len) {
             float v_val = f16_to_f32(v[ind]);
 
+            // Step 1: Compute sa = sum(a[j] * state[j])
+            float sa0 = 0.0f, sa1 = 0.0f, sa2 = 0.0f, sa3 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-                tmp[j] = sh_a[j] * state[j];
+            for (int j = 0; j < 16; j++) {
+                sa0 = __fmaf_rn(sh_a[j],    state[j],    sa0);
+                sa1 = __fmaf_rn(sh_a[j+16], state[j+16], sa1);
+                sa2 = __fmaf_rn(sh_a[j+32], state[j+32], sa2);
+                sa3 = __fmaf_rn(sh_a[j+48], state[j+48], sa3);
             }
-            float sa = pairwise_sum_64(tmp);
+            float sa = (sa0 + sa1) + (sa2 + sa3);
 
+            // Step 2: Update state
             #pragma unroll
             for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-                state[j] = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
+                float tmp = __fmaf_rn(state[j], sh_w[j], sa * sh_b[j]);
+                state[j] = __fmaf_rn(sh_k[j], v_val, tmp);
             }
 
+            // Step 3: Compute output
+            float y0 = 0.0f, y1 = 0.0f, y2 = 0.0f, y3 = 0.0f;
             #pragma unroll
-            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
-                tmp[j] = state[j] * sh_q[j];
+            for (int j = 0; j < 16; j++) {
+                y0 = __fmaf_rn(state[j],    sh_q[j],    y0);
+                y1 = __fmaf_rn(state[j+16], sh_q[j+16], y1);
+                y2 = __fmaf_rn(state[j+32], sh_q[j+32], y2);
+                y3 = __fmaf_rn(state[j+48], sh_q[j+48], y3);
             }
-            float y = pairwise_sum_64(tmp);
-            output[ind] = f32_to_f16(y);
+            float y_out = (y0 + y1) + (y2 + y3);
+            output[ind] = f32_to_f16(y_out);
         }
     }
 
@@ -2568,6 +2588,67 @@ hipError_t launch_wkv7_f16_masked(
                        w_decay, q, k, v, a, b, state_in, output, state_out, lengths,
                        N, H, T, B);
     return hipGetLastError();
+}
+
+// ============================================================================
+// F16 to F32 conversion kernel (for GPU-side logits conversion)
+// ============================================================================
+
+__global__ void kernel_copy_f16_to_f32(const __half* __restrict__ input,
+                                       float* __restrict__ output,
+                                       int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __half2float(input[idx]);
+    }
+}
+
+hipError_t launch_copy_f16_to_f32(const __half* input, float* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_copy_f16_to_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+// ============================================================================
+// Mixed-precision HGEMM: f16 inputs -> f32 output (via rocblas_gemm_ex)
+// Used for head layer to avoid separate f16->f32 conversion kernel
+// ============================================================================
+
+rocblas_status launch_hgemm_f32_out(
+    rocblas_handle handle,
+    int M,              // rows of A and C (output features / vocab size)
+    int N,              // cols of B and C (tokens)
+    int K,              // cols of A, rows of B (embedding dim)
+    const __half* A,    // M×K matrix (f16 weights)
+    const __half* B,    // K×N matrix (f16 input)
+    float* C            // M×N matrix (f32 output)
+) {
+    // Use rocblas_gemm_ex for mixed precision:
+    // A and B are f16, C and D are f32, compute in f32
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    return rocblas_gemm_ex(
+        handle,
+        rocblas_operation_none,  // opA
+        rocblas_operation_none,  // opB
+        M, N, K,
+        &alpha,
+        A, rocblas_datatype_f16_r, M,       // A: f16, lda = M
+        B, rocblas_datatype_f16_r, K,       // B: f16, ldb = K
+        &beta,
+        C, rocblas_datatype_f32_r, M,       // C: f32 (for beta*C), ldc = M
+        C, rocblas_datatype_f32_r, M,       // D: f32 (output), ldd = M
+        rocblas_datatype_f32_r,             // compute_type: f32 accumulation
+        rocblas_gemm_algo_standard,
+        0,                                   // solution_index
+        0                                    // flags
+    );
 }
 
 } // extern "C"

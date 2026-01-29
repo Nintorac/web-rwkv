@@ -11,7 +11,7 @@ use super::ffi::{
     launch_tanh_f32, launch_token_shift_f32, launch_channel_mix_state_f32,
     launch_channel_mix_state_f32_masked,
     launch_wkv_bonus_f32, launch_control_k_f32, launch_wkv7_f32, launch_wkv7_f32_masked,
-    launch_copy_f16, launch_decay_exp_f16, launch_lerp_f16,
+    launch_copy_f16, launch_copy_f16_to_f32, launch_decay_exp_f16, launch_lerp_f16,
     launch_sigmoid_f16, launch_squared_relu_f16, launch_softplus_decay_f16,
     launch_layer_norm_f16, launch_group_norm_f16, launch_l2_norm_f16,
     launch_tanh_f16, launch_channel_mix_state_f16, launch_channel_mix_state_f16_masked,
@@ -115,6 +115,41 @@ pub fn copy_tensor_f16(
     }
     unsafe {
         check(launch_copy_f16(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Convert f16 tensor to f32 tensor on GPU.
+///
+/// This avoids CPU conversion overhead by performing the f16->f32 cast on the GPU.
+/// Useful for logits download where we want f32 output but computation is in f16.
+pub fn copy_f16_to_f32(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "copy_f16_to_f32 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_copy_f16_to_f32(
             input.as_ptr(),
             output.as_mut_ptr(),
             input.len() as c_int,
@@ -2814,5 +2849,91 @@ pub fn broadcast_mul_f16(
             scale.len() as c_int,
             stream.handle(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hip::tensor::TensorShape;
+
+    /// Test that copy_f16_to_f32 correctly converts f16 to f32 on GPU
+    #[test]
+    fn test_copy_f16_to_f32() {
+        let stream = Stream::null();
+
+        // Create test data with various values including edge cases
+        let data_f16: Vec<f16> = [
+            0.0f32, 1.0, -1.0, 0.5, -0.5,
+            100.0, -100.0, 0.001, -0.001,
+            65504.0,  // max f16
+            6.1e-5,   // smallest positive normal f16
+        ].iter().map(|&x| f16::from_f32(x)).collect();
+
+        let n = data_f16.len();
+        let shape = TensorShape::new(n, 1, 1, 1);
+
+        // Upload f16 data to GPU
+        let input = TensorHip::from_slice(&data_f16, shape, &stream)
+            .expect("Failed to create f16 tensor");
+
+        // Create output f32 tensor
+        let mut output: TensorHip<f32> = TensorHip::new(shape)
+            .expect("Failed to create f32 tensor");
+
+        // Run conversion kernel
+        copy_f16_to_f32(&input, &mut output, &stream)
+            .expect("copy_f16_to_f32 failed");
+
+        // Download result
+        let result = output.to_vec(&stream).expect("Failed to download result");
+
+        // Verify
+        assert_eq!(result.len(), n);
+        for (i, (&f16_val, &f32_val)) in data_f16.iter().zip(result.iter()).enumerate() {
+            let expected = f16_val.to_f32();
+            let diff = (expected - f32_val).abs();
+            assert!(
+                diff < 1e-6 || diff / expected.abs().max(1e-10) < 1e-6,
+                "Mismatch at index {}: f16={} -> expected={}, got={}",
+                i, f16_val, expected, f32_val
+            );
+        }
+    }
+
+    /// Test copy_f16_to_f32 with larger data (tests block/grid sizing)
+    #[test]
+    fn test_copy_f16_to_f32_large() {
+        let stream = Stream::null();
+
+        // Test with size that requires multiple blocks (>256 elements)
+        let n = 1024 * 4;
+        let data_f16: Vec<f16> = (0..n)
+            .map(|i| f16::from_f32((i as f32) * 0.1 - (n as f32) * 0.05))
+            .collect();
+
+        let shape = TensorShape::new(n, 1, 1, 1);
+
+        let input = TensorHip::from_slice(&data_f16, shape, &stream)
+            .expect("Failed to create f16 tensor");
+
+        let mut output: TensorHip<f32> = TensorHip::new(shape)
+            .expect("Failed to create f32 tensor");
+
+        copy_f16_to_f32(&input, &mut output, &stream)
+            .expect("copy_f16_to_f32 failed");
+
+        let result = output.to_vec(&stream).expect("Failed to download result");
+
+        assert_eq!(result.len(), n);
+        for (i, (&f16_val, &f32_val)) in data_f16.iter().zip(result.iter()).enumerate() {
+            let expected = f16_val.to_f32();
+            let diff = (expected - f32_val).abs();
+            assert!(
+                diff < 1e-4,
+                "Mismatch at index {}: f16={} -> expected={}, got={}",
+                i, f16_val, expected, f32_val
+            );
+        }
     }
 }

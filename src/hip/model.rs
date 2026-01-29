@@ -17,7 +17,7 @@ use super::kernels::{
     channel_mix_state_f16, channel_mix_state_f16_masked,
     control_k_f16, wkv7_f16_masked, wkv_bonus_f16,
     add_f16, mul_f16, negate_f16, decay_exp_f16, broadcast_add_f16, broadcast_mul_f16,
-    lerp_f16, copy_tensor_f16, exp_f16,
+    lerp_f16, copy_tensor_f16, exp_f16, copy_f16_to_f32,
 };
 use super::blas::HipBlasContext;
 use super::scratch::HipScratch;
@@ -1263,8 +1263,9 @@ impl Rwkv7Hip {
         let mut lora_g_sig = scratch.lora_g_sig.resized_view_mut(lora_g_shape)?;
         let mut v_lora2 = scratch.v_lora2.resized_view_mut(std_shape)?;
 
-        // Output buffer
+        // Output buffers
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
+        let mut logits_f32 = scratch.logits_f32.resized_view_mut(out_shape)?;
 
         prof.time("embedding", || {
             // Embedding lookup: tokens[b][t] -> x[c, t, b]
@@ -1595,16 +1596,16 @@ impl Rwkv7Hip {
                 &mut x_ln, 1e-5, stream
             )?;
 
+            // f16 GEMM for head layer
             ctx.hgemm_into(&self.head.w, &x_ln, &mut logits)?;
             prof_sync(stream)?;
             Ok(())
         })?;
 
-            // Download logits and return (use SIMD bulk conversion)
+            // Convert f16 logits to f32 on GPU, then download
             prof.time("logits_dl", || {
-                logits
-                    .to_vec(stream)
-                    .map(|vals| vals.to_f32_vec())
+                copy_f16_to_f32(&logits, &mut logits_f32, stream)?;
+                logits_f32.to_vec(stream)
             })
         })();
 

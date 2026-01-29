@@ -115,6 +115,7 @@ extern "C" {
     pub fn hip_get_error_string(error: HipError) -> *const c_char;
     pub fn launch_copy_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_copy_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_copy_f16_to_f32(input: *const f16, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_decay_exp_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_lerp_f32(a: *const f32, b: *const f32, t: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
@@ -396,6 +397,15 @@ extern "C" {
         b: *const f32,  // K×N matrix
         beta: f32,
         c: *mut f32     // M×N matrix
+    ) -> RocblasStatus;
+    pub fn launch_hgemm_f32_out(
+        handle: RocblasHandle,
+        m: c_int,       // rows of A and C (vocab size / output features)
+        n: c_int,       // cols of B and C (tokens)
+        k: c_int,       // cols of A, rows of B (embedding dim)
+        a: *const u16,  // M×K matrix (FP16 weights as u16)
+        b: *const u16,  // K×N matrix (FP16 input as u16)
+        c: *mut f32     // M×N matrix (FP32 output)
     ) -> RocblasStatus;
     pub fn rocblas_to_hip_error(status: RocblasStatus) -> HipError;
 }
