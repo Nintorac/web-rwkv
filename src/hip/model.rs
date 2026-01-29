@@ -11,12 +11,12 @@ use super::tensor::{TensorShape, TensorHip};
 use super::scratch::{LoraDims, HipRuntimeConfig};
 use super::kernels::{
     // GPU-native kernels used in forward
-    layer_norm_f32, group_norm_f32, l2_norm_f32,
-    sigmoid_f32, tanh_f32, softplus_decay_f32, squared_relu_f32,
-    channel_mix_state_f32, channel_mix_state_f32_masked,
-    control_k_f32, wkv7_f32_masked, wkv_bonus_f32,
-    add_f32, mul_f32, negate_f32, decay_exp_f32, broadcast_add_f32, broadcast_mul_f32,
-    lerp_f32, copy_tensor_f32,
+    layer_norm_f16, group_norm_f16, l2_norm_f16,
+    sigmoid_f16, tanh_f16, softplus_decay_f16, squared_relu_f16,
+    channel_mix_state_f16, channel_mix_state_f16_masked,
+    control_k_f16, wkv7_f16_masked, wkv_bonus_f16,
+    add_f16, mul_f16, negate_f16, decay_exp_f16, broadcast_add_f16, broadcast_mul_f16,
+    lerp_f16, copy_tensor_f16, exp_f16,
 };
 use super::blas::HipBlasContext;
 use super::scratch::HipScratch;
@@ -53,50 +53,50 @@ pub struct Rwkv7ModelInfo {
 /// A single layer's layer normalization weights.
 #[derive(Debug)]
 pub struct LayerNormHip {
-    pub weight: TensorHip<f32>,
-    pub bias: TensorHip<f32>,
+    pub weight: TensorHip<f16>,
+    pub bias: TensorHip<f16>,
 }
 
 /// Attention weights for a single layer.
 #[derive(Debug)]
 pub struct AttentionHip {
     // Token shift mix weights
-    pub x_r: TensorHip<f32>,
-    pub x_w: TensorHip<f32>,
-    pub x_k: TensorHip<f32>,
-    pub x_v: TensorHip<f32>,
-    pub x_a: TensorHip<f32>,
-    pub x_g: TensorHip<f32>,
+    pub x_r: TensorHip<f16>,
+    pub x_w: TensorHip<f16>,
+    pub x_k: TensorHip<f16>,
+    pub x_v: TensorHip<f16>,
+    pub x_a: TensorHip<f16>,
+    pub x_g: TensorHip<f16>,
 
     // Decay LoRA
-    pub w0: TensorHip<f32>,
-    pub w1: TensorHip<f32>,
-    pub w2: TensorHip<f32>,
+    pub w0: TensorHip<f16>,
+    pub w1: TensorHip<f16>,
+    pub w2: TensorHip<f16>,
 
     // Learning rate LoRA
-    pub a0: TensorHip<f32>,
-    pub a1: TensorHip<f32>,
-    pub a2: TensorHip<f32>,
+    pub a0: TensorHip<f16>,
+    pub a1: TensorHip<f16>,
+    pub a2: TensorHip<f16>,
 
     // Gate LoRA
-    pub g1: TensorHip<f32>,
-    pub g2: TensorHip<f32>,
+    pub g1: TensorHip<f16>,
+    pub g2: TensorHip<f16>,
 
     // Value residual LoRA (layers > 0)
-    pub v0: Option<TensorHip<f32>>,
-    pub v1: Option<TensorHip<f32>>,
-    pub v2: Option<TensorHip<f32>>,
+    pub v0: Option<TensorHip<f16>>,
+    pub v1: Option<TensorHip<f16>>,
+    pub v2: Option<TensorHip<f16>>,
 
     // Key normalization weights
-    pub r_k: TensorHip<f32>,
-    pub k_k: TensorHip<f32>,
-    pub k_a: TensorHip<f32>,
+    pub r_k: TensorHip<f16>,
+    pub k_k: TensorHip<f16>,
+    pub k_a: TensorHip<f16>,
 
     // Projection matrices (column-major for rocBLAS)
-    pub w_r: TensorHip<f32>,  // Receptance: [n_embd, n_embd]
-    pub w_k: TensorHip<f32>,  // Key: [n_embd, n_embd]
-    pub w_v: TensorHip<f32>,  // Value: [n_embd, n_embd]
-    pub w_o: TensorHip<f32>,  // Output: [n_embd, n_embd]
+    pub w_r: TensorHip<f16>,  // Receptance: [n_embd, n_embd]
+    pub w_k: TensorHip<f16>,  // Key: [n_embd, n_embd]
+    pub w_v: TensorHip<f16>,  // Value: [n_embd, n_embd]
+    pub w_o: TensorHip<f16>,  // Output: [n_embd, n_embd]
 
     // Group normalization
     pub gn: LayerNormHip,
@@ -106,11 +106,11 @@ pub struct AttentionHip {
 #[derive(Debug)]
 pub struct FfnHip {
     // Token shift mix weight
-    pub x_k: TensorHip<f32>,
+    pub x_k: TensorHip<f16>,
 
     // Projection matrices
-    pub w_k: TensorHip<f32>,  // Key (expand): [n_hidden, n_embd]
-    pub w_v: TensorHip<f32>,  // Value (contract): [n_embd, n_hidden]
+    pub w_k: TensorHip<f16>,  // Key (expand): [n_hidden, n_embd]
+    pub w_v: TensorHip<f16>,  // Value (contract): [n_embd, n_hidden]
 }
 
 /// A single transformer layer's weights.
@@ -128,7 +128,7 @@ pub struct EmbedHip {
     pub ln: LayerNormHip,
     /// Embedding table kept on CPU to avoid GPU→CPU transfer per forward.
     /// Shape: [n_vocab, n_embd] in row-major order (token_id * n_embd + c).
-    pub w: Vec<f32>,
+    pub w: Vec<f16>,
     /// Embedding dimension (n_embd)
     pub n_embd: usize,
 }
@@ -137,13 +137,13 @@ pub struct EmbedHip {
 #[derive(Debug)]
 pub struct HeadHip {
     pub ln: LayerNormHip,
-    pub w: TensorHip<f32>,  // [n_vocab, n_embd]
+    pub w: TensorHip<f16>,  // [n_vocab, n_embd]
 }
 
 /// RWKV7 model loaded into HIP memory.
 ///
 /// Weights are stored in managed memory for zero-copy APU access.
-/// All tensors use FP32 internally (converted from FP16 at load time).
+/// Weights and activations use FP16; recurrent WKV state remains FP32.
 pub struct Rwkv7Hip {
     pub info: Rwkv7ModelInfo,
     pub embed: EmbedHip,
@@ -240,13 +240,13 @@ pub struct HipState {
     pub att_states: Vec<PinnedBuffer<f32>>,
     /// Attention token shift state per layer: [n_embd * batch] per layer
     /// Stored in pinned memory for fast GPU transfers.
-    pub att_shift_states: Vec<PinnedBuffer<f32>>,
+    pub att_shift_states: Vec<PinnedBuffer<f16>>,
     /// FFN token shift state per layer: [n_embd * batch] per layer
     /// Stored in pinned memory for fast GPU transfers.
-    pub ffn_states: Vec<PinnedBuffer<f32>>,
+    pub ffn_states: Vec<PinnedBuffer<f16>>,
     /// Value residual from first layer for RWKV7, persisted across chunks: [n_embd * batch]
     /// Stored in pinned memory for fast GPU transfers.
-    pub v_first: Option<PinnedBuffer<f32>>,
+    pub v_first: Option<PinnedBuffer<f16>>,
 }
 
 impl HipState {
@@ -275,11 +275,11 @@ impl HipState {
             att_states.push(att);
 
             let mut att_shift = PinnedBuffer::new(n_embd * batch_size)?;
-            att_shift.as_slice_mut().fill(0.0);
+            att_shift.as_slice_mut().fill(f16::from_f32(0.0));
             att_shift_states.push(att_shift);
 
             let mut ffn = PinnedBuffer::new(n_embd * batch_size)?;
-            ffn.as_slice_mut().fill(0.0);
+            ffn.as_slice_mut().fill(f16::from_f32(0.0));
             ffn_states.push(ffn);
         }
 
@@ -298,10 +298,10 @@ impl HipState {
             state.as_slice_mut().fill(0.0);
         }
         for state in &mut self.att_shift_states {
-            state.as_slice_mut().fill(0.0);
+            state.as_slice_mut().fill(f16::from_f32(0.0));
         }
         for state in &mut self.ffn_states {
-            state.as_slice_mut().fill(0.0);
+            state.as_slice_mut().fill(f16::from_f32(0.0));
         }
         self.v_first = None;
     }
@@ -327,7 +327,7 @@ pub struct ForwardCompletion {
     /// Stream the work was submitted on
     stream: Stream,
     /// Pre-allocated buffer for logits (D→H copy is queued but not complete)
-    logits_buffer: PinnedBuffer<f32>,
+    logits_buffer: PinnedBuffer<f16>,
     /// Pre-allocated buffers for state (D→H copies are queued but not complete)
     state_buffers: ForwardStateBuffers,
     /// Model info for reconstructing HipState
@@ -344,9 +344,9 @@ pub struct ForwardCompletion {
 /// Internal buffers for async state download
 struct ForwardStateBuffers {
     att_states: Vec<PinnedBuffer<f32>>,
-    att_shift_states: Vec<PinnedBuffer<f32>>,
-    ffn_states: Vec<PinnedBuffer<f32>>,
-    v_first: Option<PinnedBuffer<f32>>,
+    att_shift_states: Vec<PinnedBuffer<f16>>,
+    ffn_states: Vec<PinnedBuffer<f16>>,
+    v_first: Option<PinnedBuffer<f16>>,
 }
 
 impl ForwardCompletion {
@@ -374,7 +374,11 @@ impl ForwardCompletion {
         for (b, &real_len) in self.lens.iter().enumerate() {
             for t in 0..real_len {
                 let offset = (b * self.chunk_size + t) * self.n_vocab;
-                logits.extend_from_slice(&padded[offset..offset + self.n_vocab]);
+                logits.extend(
+                    padded[offset..offset + self.n_vocab]
+                        .iter()
+                        .map(|v| v.to_f32()),
+                );
             }
         }
 
@@ -399,8 +403,8 @@ impl ForwardCompletion {
 /// to rocBLAS-native column-major format, per the plan:
 /// "Use rocBLAS-native column-major storage for GEMM/GEMV...
 ///  This avoids per-call row/col mapping in rocBLAS"
-fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut transposed = vec![0.0f32; data.len()];
+fn transpose_2d(data: &[f16], rows: usize, cols: usize) -> Vec<f16> {
+    let mut transposed = vec![f16::from_f32(0.0); data.len()];
     for i in 0..rows {
         for j in 0..cols {
             // row-major index: i * cols + j
@@ -411,30 +415,28 @@ fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     transposed
 }
 
-/// Load a tensor from SafeTensors, converting f16 to f32 and loading into managed HIP memory.
-fn load_tensor_f32(
+/// Load a tensor from SafeTensors, converting to f16 and loading into managed HIP memory.
+fn load_tensor_f16(
     st: &safetensors::SafeTensors,
     name: &str,
     stream: &Stream,
-) -> std::result::Result<TensorHip<f32>, ModelLoadError> {
+) -> std::result::Result<TensorHip<f16>, ModelLoadError> {
     let tensor = st.tensor(name).map_err(|e| ModelLoadError::SafeTensor(format!("{}: {}", name, e)))?;
 
     let shape_st = tensor.shape();
     let dtype = tensor.dtype();
     let data = tensor.data();
 
-    // Convert f16 bytes to f32 vec
-    let f32_data: Vec<f32> = match dtype {
-        safetensors::Dtype::F16 => {
-            let f16_slice: &[f16] = bytemuck::cast_slice(data);
-            f16_slice.iter().map(|x| x.to_f32()).collect()
-        }
-        safetensors::Dtype::F32 => {
-            bytemuck::cast_slice(data).to_vec()
-        }
+    // Convert to f16 vec
+    let f16_data: Vec<f16> = match dtype {
+        safetensors::Dtype::F16 => bytemuck::cast_slice(data).to_vec(),
+        safetensors::Dtype::F32 => bytemuck::cast_slice(data)
+            .iter()
+            .map(|x: &f32| f16::from_f32(*x))
+            .collect(),
         safetensors::Dtype::BF16 => {
             let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
-            bf16_slice.iter().map(|x| x.to_f32()).collect()
+            bf16_slice.iter().map(|x| f16::from_f32(x.to_f32())).collect()
         }
         _ => return Err(ModelLoadError::InvalidModel(format!(
             "Unsupported dtype {:?} for tensor {}", dtype, name
@@ -453,41 +455,39 @@ fn load_tensor_f32(
         ))),
     };
 
-    TensorHip::from_slice_managed(&f32_data, hip_shape, stream).map_err(ModelLoadError::from)
+    TensorHip::from_slice_managed(&f16_data, hip_shape, stream).map_err(ModelLoadError::from)
 }
 
-/// Load a tensor from SafeTensors, converting f16/bf16 to f32, keeping data on CPU.
+/// Load a tensor from SafeTensors, converting to f16, keeping data on CPU.
 ///
 /// This is used for embedding tables which are accessed on CPU during embedding lookup.
 /// The data is returned in row-major order as stored in SafeTensors.
-fn load_tensor_f32_cpu(
+fn load_tensor_f16_cpu(
     st: &safetensors::SafeTensors,
     name: &str,
-) -> std::result::Result<Vec<f32>, ModelLoadError> {
+) -> std::result::Result<Vec<f16>, ModelLoadError> {
     let tensor = st.tensor(name).map_err(|e| ModelLoadError::SafeTensor(format!("{}: {}", name, e)))?;
 
     let dtype = tensor.dtype();
     let data = tensor.data();
 
-    // Convert f16/bf16 bytes to f32 vec
-    let f32_data: Vec<f32> = match dtype {
-        safetensors::Dtype::F16 => {
-            let f16_slice: &[f16] = bytemuck::cast_slice(data);
-            f16_slice.iter().map(|x| x.to_f32()).collect()
-        }
-        safetensors::Dtype::F32 => {
-            bytemuck::cast_slice(data).to_vec()
-        }
+    // Convert to f16 vec
+    let f16_data: Vec<f16> = match dtype {
+        safetensors::Dtype::F16 => bytemuck::cast_slice(data).to_vec(),
+        safetensors::Dtype::F32 => bytemuck::cast_slice(data)
+            .iter()
+            .map(|x: &f32| f16::from_f32(*x))
+            .collect(),
         safetensors::Dtype::BF16 => {
             let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
-            bf16_slice.iter().map(|x| x.to_f32()).collect()
+            bf16_slice.iter().map(|x| f16::from_f32(x.to_f32())).collect()
         }
         _ => return Err(ModelLoadError::InvalidModel(format!(
             "Unsupported dtype {:?} for tensor {}", dtype, name
         ))),
     };
 
-    Ok(f32_data)
+    Ok(f16_data)
 }
 
 /// Load a weight matrix from SafeTensors, transposing to column-major for rocBLAS.
@@ -502,11 +502,11 @@ fn load_tensor_f32_cpu(
 ///
 /// Shape is stored as [M, K] where M=out_features, K=in_features.
 /// Use dim(0) to get M (out_features) and dim(1) to get K (in_features).
-fn load_weight_matrix_f32(
+fn load_weight_matrix_f16(
     st: &safetensors::SafeTensors,
     name: &str,
     stream: &Stream,
-) -> std::result::Result<TensorHip<f32>, ModelLoadError> {
+) -> std::result::Result<TensorHip<f16>, ModelLoadError> {
     let tensor = st.tensor(name).map_err(|e| ModelLoadError::SafeTensor(format!("{}: {}", name, e)))?;
 
     let shape_st = tensor.shape();
@@ -522,18 +522,16 @@ fn load_weight_matrix_f32(
     let rows = shape_st[0];  // out_features (M)
     let cols = shape_st[1];  // in_features (K)
 
-    // Convert f16 bytes to f32 vec
-    let f32_data: Vec<f32> = match dtype {
-        safetensors::Dtype::F16 => {
-            let f16_slice: &[f16] = bytemuck::cast_slice(data);
-            f16_slice.iter().map(|x| x.to_f32()).collect()
-        }
-        safetensors::Dtype::F32 => {
-            bytemuck::cast_slice(data).to_vec()
-        }
+    // Convert to f16 vec
+    let f16_data: Vec<f16> = match dtype {
+        safetensors::Dtype::F16 => bytemuck::cast_slice(data).to_vec(),
+        safetensors::Dtype::F32 => bytemuck::cast_slice(data)
+            .iter()
+            .map(|x: &f32| f16::from_f32(*x))
+            .collect(),
         safetensors::Dtype::BF16 => {
             let bf16_slice: &[half::bf16] = bytemuck::cast_slice(data);
-            bf16_slice.iter().map(|x| x.to_f32()).collect()
+            bf16_slice.iter().map(|x| f16::from_f32(x.to_f32())).collect()
         }
         _ => return Err(ModelLoadError::InvalidModel(format!(
             "Unsupported dtype {:?} for tensor {}", dtype, name
@@ -541,7 +539,7 @@ fn load_weight_matrix_f32(
     };
 
     // Transpose from row-major to column-major
-    let transposed = transpose_2d(&f32_data, rows, cols);
+    let transposed = transpose_2d(&f16_data, rows, cols);
 
     // Shape is [M, K] where M=rows (out_features), K=cols (in_features)
     // This is the natural column-major representation for rocBLAS
@@ -557,8 +555,8 @@ fn load_layer_norm(
     prefix: &str,
     stream: &Stream,
 ) -> std::result::Result<LayerNormHip, ModelLoadError> {
-    let weight = load_tensor_f32(st, &format!("{}.weight", prefix), stream)?;
-    let bias = load_tensor_f32(st, &format!("{}.bias", prefix), stream)?;
+    let weight = load_tensor_f16(st, &format!("{}.weight", prefix), stream)?;
+    let bias = load_tensor_f16(st, &format!("{}.bias", prefix), stream)?;
     Ok(LayerNormHip { weight, bias })
 }
 
@@ -566,7 +564,7 @@ impl Rwkv7Hip {
     /// Load an RWKV7 model from a SafeTensors file.
     ///
     /// Weights are loaded into managed (unified) memory for efficient APU access.
-    /// All weights are converted to FP32 for computation.
+    /// Weights are stored as FP16; WKV state remains FP32.
     ///
     /// # Arguments
     /// * `path` - Path to the .st (SafeTensors) file
@@ -631,14 +629,14 @@ impl Rwkv7Hip {
         // Load embedding to CPU (lookup table accessed on CPU, avoids GPU→CPU transfer per forward)
         let embed = EmbedHip {
             ln: load_layer_norm(&st, "blocks.0.ln0", &stream)?,
-            w: load_tensor_f32_cpu(&st, "emb.weight")?,
+            w: load_tensor_f16_cpu(&st, "emb.weight")?,
             n_embd,
         };
 
         // Load output head (transpose to column-major for GEMM)
         let head = HeadHip {
             ln: load_layer_norm(&st, "ln_out", &stream)?,
-            w: load_weight_matrix_f32(&st, "head.weight", &stream)?,
+            w: load_weight_matrix_f16(&st, "head.weight", &stream)?,
         };
 
         // Load layers
@@ -654,58 +652,58 @@ impl Rwkv7Hip {
 
             // Attention weights
             let att = AttentionHip {
-                x_r: load_tensor_f32(&st, &format!("{}.att.x_r", prefix), &stream)?,
-                x_w: load_tensor_f32(&st, &format!("{}.att.x_w", prefix), &stream)?,
-                x_k: load_tensor_f32(&st, &format!("{}.att.x_k", prefix), &stream)?,
-                x_v: load_tensor_f32(&st, &format!("{}.att.x_v", prefix), &stream)?,
-                x_a: load_tensor_f32(&st, &format!("{}.att.x_a", prefix), &stream)?,
-                x_g: load_tensor_f32(&st, &format!("{}.att.x_g", prefix), &stream)?,
+                x_r: load_tensor_f16(&st, &format!("{}.att.x_r", prefix), &stream)?,
+                x_w: load_tensor_f16(&st, &format!("{}.att.x_w", prefix), &stream)?,
+                x_k: load_tensor_f16(&st, &format!("{}.att.x_k", prefix), &stream)?,
+                x_v: load_tensor_f16(&st, &format!("{}.att.x_v", prefix), &stream)?,
+                x_a: load_tensor_f16(&st, &format!("{}.att.x_a", prefix), &stream)?,
+                x_g: load_tensor_f16(&st, &format!("{}.att.x_g", prefix), &stream)?,
 
-                w0: load_tensor_f32(&st, &format!("{}.att.w0", prefix), &stream)?,
-                w1: load_weight_matrix_f32(&st, &format!("{}.att.w1", prefix), &stream)?,
-                w2: load_weight_matrix_f32(&st, &format!("{}.att.w2", prefix), &stream)?,
+                w0: load_tensor_f16(&st, &format!("{}.att.w0", prefix), &stream)?,
+                w1: load_weight_matrix_f16(&st, &format!("{}.att.w1", prefix), &stream)?,
+                w2: load_weight_matrix_f16(&st, &format!("{}.att.w2", prefix), &stream)?,
 
-                a0: load_tensor_f32(&st, &format!("{}.att.a0", prefix), &stream)?,
-                a1: load_weight_matrix_f32(&st, &format!("{}.att.a1", prefix), &stream)?,
-                a2: load_weight_matrix_f32(&st, &format!("{}.att.a2", prefix), &stream)?,
+                a0: load_tensor_f16(&st, &format!("{}.att.a0", prefix), &stream)?,
+                a1: load_weight_matrix_f16(&st, &format!("{}.att.a1", prefix), &stream)?,
+                a2: load_weight_matrix_f16(&st, &format!("{}.att.a2", prefix), &stream)?,
 
-                g1: load_weight_matrix_f32(&st, &format!("{}.att.g1", prefix), &stream)?,
-                g2: load_weight_matrix_f32(&st, &format!("{}.att.g2", prefix), &stream)?,
+                g1: load_weight_matrix_f16(&st, &format!("{}.att.g1", prefix), &stream)?,
+                g2: load_weight_matrix_f16(&st, &format!("{}.att.g2", prefix), &stream)?,
 
                 // Value residual LoRA (only for layers > 0)
                 v0: if layer_idx > 0 {
-                    Some(load_tensor_f32(&st, &format!("{}.att.v0", prefix), &stream)?)
+                    Some(load_tensor_f16(&st, &format!("{}.att.v0", prefix), &stream)?)
                 } else {
                     None
                 },
                 v1: if layer_idx > 0 {
-                    Some(load_weight_matrix_f32(&st, &format!("{}.att.v1", prefix), &stream)?)
+                    Some(load_weight_matrix_f16(&st, &format!("{}.att.v1", prefix), &stream)?)
                 } else {
                     None
                 },
                 v2: if layer_idx > 0 {
-                    Some(load_weight_matrix_f32(&st, &format!("{}.att.v2", prefix), &stream)?)
+                    Some(load_weight_matrix_f16(&st, &format!("{}.att.v2", prefix), &stream)?)
                 } else {
                     None
                 },
 
-                r_k: load_tensor_f32(&st, &format!("{}.att.r_k", prefix), &stream)?,
-                k_k: load_tensor_f32(&st, &format!("{}.att.k_k", prefix), &stream)?,
-                k_a: load_tensor_f32(&st, &format!("{}.att.k_a", prefix), &stream)?,
+                r_k: load_tensor_f16(&st, &format!("{}.att.r_k", prefix), &stream)?,
+                k_k: load_tensor_f16(&st, &format!("{}.att.k_k", prefix), &stream)?,
+                k_a: load_tensor_f16(&st, &format!("{}.att.k_a", prefix), &stream)?,
 
-                w_r: load_weight_matrix_f32(&st, &format!("{}.att.receptance.weight", prefix), &stream)?,
-                w_k: load_weight_matrix_f32(&st, &format!("{}.att.key.weight", prefix), &stream)?,
-                w_v: load_weight_matrix_f32(&st, &format!("{}.att.value.weight", prefix), &stream)?,
-                w_o: load_weight_matrix_f32(&st, &format!("{}.att.output.weight", prefix), &stream)?,
+                w_r: load_weight_matrix_f16(&st, &format!("{}.att.receptance.weight", prefix), &stream)?,
+                w_k: load_weight_matrix_f16(&st, &format!("{}.att.key.weight", prefix), &stream)?,
+                w_v: load_weight_matrix_f16(&st, &format!("{}.att.value.weight", prefix), &stream)?,
+                w_o: load_weight_matrix_f16(&st, &format!("{}.att.output.weight", prefix), &stream)?,
 
                 gn: load_layer_norm(&st, &format!("{}.att.ln_x", prefix), &stream)?,
             };
 
             // FFN weights (transpose weight matrices to column-major for GEMM)
             let ffn = FfnHip {
-                x_k: load_tensor_f32(&st, &format!("{}.ffn.x_k", prefix), &stream)?,
-                w_k: load_weight_matrix_f32(&st, &format!("{}.ffn.key.weight", prefix), &stream)?,
-                w_v: load_weight_matrix_f32(&st, &format!("{}.ffn.value.weight", prefix), &stream)?,
+                x_k: load_tensor_f16(&st, &format!("{}.ffn.x_k", prefix), &stream)?,
+                w_k: load_weight_matrix_f16(&st, &format!("{}.ffn.key.weight", prefix), &stream)?,
+                w_v: load_weight_matrix_f16(&st, &format!("{}.ffn.value.weight", prefix), &stream)?,
             };
 
             layers.push(LayerHip { att_ln, ffn_ln, att, ffn });
@@ -757,7 +755,7 @@ impl Rwkv7Hip {
     /// - "blocks.0.att.receptance.weight" - layer 0 attention receptance
     /// - "blocks.5.ffn.key.weight" - layer 5 FFN key weights
     /// - "head.weight" - output head weights
-    pub fn get_weight(&self, name: &str) -> Option<&TensorHip<f32>> {
+    pub fn get_weight(&self, name: &str) -> Option<&TensorHip<f16>> {
         // Note: emb.weight is kept on CPU, use get_embedding() instead
         if name == "emb.weight" {
             return None;
@@ -824,14 +822,14 @@ impl Rwkv7Hip {
         let stream = Stream::null();
         let all_data = tensor.to_vec(&stream)?;
         let n = n.min(all_data.len());
-        Ok(all_data[..n].to_vec())
+        Ok(all_data[..n].iter().map(|v| v.to_f32()).collect())
     }
 
     /// Get a reference to the embedding table (CPU storage).
     ///
     /// The embedding table is kept on CPU to avoid GPU→CPU transfer overhead per forward call.
     /// Shape: [n_vocab, n_embd] in row-major order (token_id * n_embd + c).
-    pub fn get_embedding(&self) -> &[f32] {
+    pub fn get_embedding(&self) -> &[f16] {
         &self.embed.w
     }
 
@@ -1286,7 +1284,7 @@ impl Rwkv7Hip {
                 // Upload state to GPU using pinned async transfers
                 let mut att_shift_gpu = Vec::with_capacity(n_layer);
                 for s in &state.att_shift_states {
-                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    let mut gpu_tensor = TensorHip::<f16>::new(state_shape)?;
                     unsafe {
                         s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
                     }
@@ -1295,7 +1293,7 @@ impl Rwkv7Hip {
 
                 let mut ffn_shift_gpu = Vec::with_capacity(n_layer);
                 for s in &state.ffn_states {
-                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    let mut gpu_tensor = TensorHip::<f16>::new(state_shape)?;
                     unsafe {
                         s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
                     }
@@ -1330,18 +1328,18 @@ impl Rwkv7Hip {
             // Apply ln0 for layer 0
             if layer_idx == 0 {
                 prof.time("ln0", || {
-                    layer_norm_f32(
+                    layer_norm_f16(
                         &x, &self.embed.ln.weight, &self.embed.ln.bias,
                         &mut x_ln, 1e-5, stream
                     )?;
-                    copy_tensor_f32(&x_ln, &mut x, stream)?;
+                    copy_tensor_f16(&x_ln, &mut x, stream)?;
                     Ok(())
                 })?;
             }
 
             // ==== Time-Mix (Attention) ====
             prof.time("att_ln", || {
-                layer_norm_f32(
+                layer_norm_f16(
                     &x, &layer.att_ln.weight, &layer.att_ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
@@ -1351,28 +1349,28 @@ impl Rwkv7Hip {
             // Token shifts for attention - use masked kernel for x_r to get correct state
             // The masked kernel extracts state at lengths[b]-1 instead of T-1
             prof.time("att_shift", || {
-                channel_mix_state_f32_masked(
+                channel_mix_state_f16_masked(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
                     &mut att_xr, &mut new_att_shift, &lens_gpu, stream
                 )?;
                 // Remaining shifts use regular kernel (we only need outputs, not state)
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
                     &mut att_xw, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_k,
                     &mut att_xk, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_v,
                     &mut att_xv, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_a,
                     &mut att_xa, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
                     &mut att_xg, &mut temp1, stream
                 )?;
@@ -1384,36 +1382,36 @@ impl Rwkv7Hip {
 
             // Linear projections: r, k, v
             prof.time("att_proj", || {
-                ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
-                ctx.sgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
-                ctx.sgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+                ctx.hgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
+                ctx.hgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
+                ctx.hgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
                 Ok(())
             })?;
 
             // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
             prof.time("att_decay", || {
-                ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
-                tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
-                ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
-                broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
-                softplus_decay_f32(&temp1, &mut att_w, stream)?;
+                ctx.hgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
+                tanh_f16(&lora_w, &mut lora_w_tanh, stream)?;
+                ctx.hgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
+                broadcast_add_f16(&att_w, &layer.att.w0, &mut temp1, stream)?;
+                softplus_decay_f16(&temp1, &mut att_w, stream)?;
                 Ok(())
             })?;
 
             // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
             prof.time("att_adapt", || {
-                ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
-                ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
-                broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
-                sigmoid_f32(&temp1, &mut att_a, stream)?;
+                ctx.hgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
+                ctx.hgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
+                broadcast_add_f16(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
+                sigmoid_f16(&temp1, &mut att_a, stream)?;
                 Ok(())
             })?;
 
             // Gate: g = sigmoid(xg @ g1) @ g2
             prof.time("att_gate", || {
-                ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
-                sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
-                ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+                ctx.hgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
+                sigmoid_f16(&lora_g, &mut lora_g_sig, stream)?;
+                ctx.hgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
                 Ok(())
             })?;
 
@@ -1422,39 +1420,39 @@ impl Rwkv7Hip {
                 if let (Some(v0), Some(v1), Some(v2)) =
                     (&layer.att.v0, &layer.att.v1, &layer.att.v2) {
                     prof.time("att_vres", || {
-                        ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
-                        ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
-                        broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
-                        sigmoid_f32(&temp1, &mut temp2, stream)?;
-                        lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
-                        copy_tensor_f32(&temp1, &mut att_v, stream)?;
+                        ctx.hgemm_into(v1, &att_xv, &mut lora_v)?;
+                        ctx.hgemm_into(v2, &lora_v, &mut v_lora2)?;
+                        broadcast_add_f16(&v_lora2, v0, &mut temp1, stream)?;
+                        sigmoid_f16(&temp1, &mut temp2, stream)?;
+                        lerp_f16(&att_v, &v_first, &temp2, &mut temp1, stream)?;
+                        copy_tensor_f16(&temp1, &mut att_v, stream)?;
                         Ok(())
                     })?;
                 }
             } else {
-                copy_tensor_f32(&att_v, &mut v_first, stream)?;
+                copy_tensor_f16(&att_v, &mut v_first, stream)?;
             }
 
             // L2 normalize k
             prof.time("att_norm_k", || {
-                broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
-                l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
+                broadcast_mul_f16(&att_k, &layer.att.k_k, &mut temp1, stream)?;
+                l2_norm_f16(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
                 Ok(())
             })?;
 
             // Control K
             prof.time("att_ctrl_k", || {
-                control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
+                control_k_f16(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
                 Ok(())
             })?;
 
             // WKV inputs
             prof.time("att_wkv_in", || {
-                negate_f32(&att_kk, &mut wkv_a, stream)?;
-                mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
+                negate_f16(&att_kk, &mut wkv_a, stream)?;
+                mul_f16(&att_kk, &att_a, &mut wkv_b, stream)?;
                 // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
                 // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
-                decay_exp_f32(&att_w, &mut w_decay, stream)?;
+                decay_exp_f16(&att_w, &mut w_decay, stream)?;
                 Ok(())
             })?;
 
@@ -1469,7 +1467,7 @@ impl Rwkv7Hip {
 
             // Run masked WKV7 (skips state updates for padding positions)
             prof.time("wkv", || {
-                wkv7_f32_masked(
+                wkv7_f16_masked(
                     &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
                     &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
                     &lens_gpu, stream
@@ -1480,7 +1478,7 @@ impl Rwkv7Hip {
 
             // Group norm on WKV output
             prof.time("wkv_norm", || {
-                group_norm_f32(
+                group_norm_f16(
                     &wkv_out, &layer.att.gn.weight, &layer.att.gn.bias,
                     &mut wkv_normed, n_head, 64e-5, stream
                 )?;
@@ -1492,33 +1490,33 @@ impl Rwkv7Hip {
             let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
             let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
             prof.time("wkv_bonus", || {
-                wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
+                wkv_bonus_f16(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
                 Ok(())
             })?;
 
             // Combine and gate
             prof.time("att_gate_out", || {
-                add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
-                mul_f32(&temp1, &att_g, &mut temp2, stream)?;
+                add_f16(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
+                mul_f16(&temp1, &att_g, &mut temp2, stream)?;
                 Ok(())
             })?;
 
             // Output projection
             prof.time("att_out", || {
-                ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+                ctx.hgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
                 Ok(())
             })?;
 
             // Residual
             prof.time("att_resid", || {
-                add_f32(&x, &att_out, &mut temp1, stream)?;
-                copy_tensor_f32(&temp1, &mut x, stream)?;
+                add_f16(&x, &att_out, &mut temp1, stream)?;
+                copy_tensor_f16(&temp1, &mut x, stream)?;
                 Ok(())
             })?;
 
             // ==== Channel-Mix (FFN) ====
             prof.time("ffn_ln", || {
-                layer_norm_f32(
+                layer_norm_f16(
                     &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
@@ -1527,7 +1525,7 @@ impl Rwkv7Hip {
 
             // Token shift for FFN - use masked kernel for correct state extraction
             prof.time("ffn_shift", || {
-                channel_mix_state_f32_masked(
+                channel_mix_state_f16_masked(
                     &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
                     &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
                 )?;
@@ -1539,43 +1537,45 @@ impl Rwkv7Hip {
 
             // Key projection
             prof.time("ffn_k", || {
-                ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+                ctx.hgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
                 Ok(())
             })?;
 
             // Squared ReLU
             prof.time("ffn_relu2", || {
-                squared_relu_f32(&ffn_k, &mut ffn_k_sq, stream)?;
+                squared_relu_f16(&ffn_k, &mut ffn_k_sq, stream)?;
                 Ok(())
             })?;
 
             // Value projection
             prof.time("ffn_v", || {
-                ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+                ctx.hgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
                 Ok(())
             })?;
 
             // Residual
             prof.time("ffn_resid", || {
-                add_f32(&x, &ffn_out, &mut temp1, stream)?;
-                copy_tensor_f32(&temp1, &mut x, stream)?;
+                add_f16(&x, &ffn_out, &mut temp1, stream)?;
+                copy_tensor_f16(&temp1, &mut x, stream)?;
                 Ok(())
             })?;
         }
 
         prof.time("head", || {
             // ==== Output Head ====
-            layer_norm_f32(
+            layer_norm_f16(
                 &x, &self.head.ln.weight, &self.head.ln.bias,
                 &mut x_ln, 1e-5, stream
             )?;
 
-            ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            ctx.hgemm_into(&self.head.w, &x_ln, &mut logits)?;
             Ok(())
         })?;
 
             // Download logits and return
-            logits.to_vec(stream)
+            logits
+                .to_vec(stream)
+                .map(|vals| vals.into_iter().map(|v| v.to_f32()).collect())
         })();
 
         if use_resident_state {
@@ -1620,7 +1620,7 @@ impl Rwkv7Hip {
         state: &mut HipState,
         scratch: &mut HipScratch,
         lens: &[usize],
-        logits_dst: &mut PinnedBuffer<f32>,
+        logits_dst: &mut PinnedBuffer<f16>,
     ) -> Result<()> {
         let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
@@ -1735,7 +1735,7 @@ impl Rwkv7Hip {
                 // Upload state to GPU using pinned async transfers
                 let mut att_shift_gpu = Vec::with_capacity(n_layer);
                 for s in &state.att_shift_states {
-                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    let mut gpu_tensor = TensorHip::<f16>::new(state_shape)?;
                     unsafe {
                         s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
                     }
@@ -1744,7 +1744,7 @@ impl Rwkv7Hip {
 
                 let mut ffn_shift_gpu = Vec::with_capacity(n_layer);
                 for s in &state.ffn_states {
-                    let mut gpu_tensor = TensorHip::<f32>::new(state_shape)?;
+                    let mut gpu_tensor = TensorHip::<f16>::new(state_shape)?;
                     unsafe {
                         s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
                     }
@@ -1779,18 +1779,18 @@ impl Rwkv7Hip {
             // Apply ln0 for layer 0
             if layer_idx == 0 {
                 prof.time("ln0", || {
-                    layer_norm_f32(
+                    layer_norm_f16(
                         &x, &self.embed.ln.weight, &self.embed.ln.bias,
                         &mut x_ln, 1e-5, stream
                     )?;
-                    copy_tensor_f32(&x_ln, &mut x, stream)?;
+                    copy_tensor_f16(&x_ln, &mut x, stream)?;
                     Ok(())
                 })?;
             }
 
             // ==== Time-Mix (Attention) ====
             prof.time("att_ln", || {
-                layer_norm_f32(
+                layer_norm_f16(
                     &x, &layer.att_ln.weight, &layer.att_ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
@@ -1800,28 +1800,28 @@ impl Rwkv7Hip {
             // Token shifts for attention - use masked kernel for x_r to get correct state
             // The masked kernel extracts state at lengths[b]-1 instead of T-1
             prof.time("att_shift", || {
-                channel_mix_state_f32_masked(
+                channel_mix_state_f16_masked(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_r,
                     &mut att_xr, &mut new_att_shift, &lens_gpu, stream
                 )?;
                 // Remaining shifts use regular kernel (we only need outputs, not state)
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_w,
                     &mut att_xw, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_k,
                     &mut att_xk, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_v,
                     &mut att_xv, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_a,
                     &mut att_xa, &mut temp1, stream
                 )?;
-                channel_mix_state_f32(
+                channel_mix_state_f16(
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
                     &mut att_xg, &mut temp1, stream
                 )?;
@@ -1833,36 +1833,36 @@ impl Rwkv7Hip {
 
             // Linear projections: r, k, v
             prof.time("att_proj", || {
-                ctx.sgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
-                ctx.sgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
-                ctx.sgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+                ctx.hgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
+                ctx.hgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
+                ctx.hgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
                 Ok(())
             })?;
 
             // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
             prof.time("att_decay", || {
-                ctx.sgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
-                tanh_f32(&lora_w, &mut lora_w_tanh, stream)?;
-                ctx.sgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
-                broadcast_add_f32(&att_w, &layer.att.w0, &mut temp1, stream)?;
-                softplus_decay_f32(&temp1, &mut att_w, stream)?;
+                ctx.hgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
+                tanh_f16(&lora_w, &mut lora_w_tanh, stream)?;
+                ctx.hgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
+                broadcast_add_f16(&att_w, &layer.att.w0, &mut temp1, stream)?;
+                softplus_decay_f16(&temp1, &mut att_w, stream)?;
                 Ok(())
             })?;
 
             // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
             prof.time("att_adapt", || {
-                ctx.sgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
-                ctx.sgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
-                broadcast_add_f32(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
-                sigmoid_f32(&temp1, &mut att_a, stream)?;
+                ctx.hgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
+                ctx.hgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
+                broadcast_add_f16(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
+                sigmoid_f16(&temp1, &mut att_a, stream)?;
                 Ok(())
             })?;
 
             // Gate: g = sigmoid(xg @ g1) @ g2
             prof.time("att_gate", || {
-                ctx.sgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
-                sigmoid_f32(&lora_g, &mut lora_g_sig, stream)?;
-                ctx.sgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+                ctx.hgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
+                sigmoid_f16(&lora_g, &mut lora_g_sig, stream)?;
+                ctx.hgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
                 Ok(())
             })?;
 
@@ -1871,39 +1871,39 @@ impl Rwkv7Hip {
                 if let (Some(v0), Some(v1), Some(v2)) =
                     (&layer.att.v0, &layer.att.v1, &layer.att.v2) {
                     prof.time("att_vres", || {
-                        ctx.sgemm_into(v1, &att_xv, &mut lora_v)?;
-                        ctx.sgemm_into(v2, &lora_v, &mut v_lora2)?;
-                        broadcast_add_f32(&v_lora2, v0, &mut temp1, stream)?;
-                        sigmoid_f32(&temp1, &mut temp2, stream)?;
-                        lerp_f32(&att_v, &v_first, &temp2, &mut temp1, stream)?;
-                        copy_tensor_f32(&temp1, &mut att_v, stream)?;
+                        ctx.hgemm_into(v1, &att_xv, &mut lora_v)?;
+                        ctx.hgemm_into(v2, &lora_v, &mut v_lora2)?;
+                        broadcast_add_f16(&v_lora2, v0, &mut temp1, stream)?;
+                        sigmoid_f16(&temp1, &mut temp2, stream)?;
+                        lerp_f16(&att_v, &v_first, &temp2, &mut temp1, stream)?;
+                        copy_tensor_f16(&temp1, &mut att_v, stream)?;
                         Ok(())
                     })?;
                 }
             } else {
-                copy_tensor_f32(&att_v, &mut v_first, stream)?;
+                copy_tensor_f16(&att_v, &mut v_first, stream)?;
             }
 
             // L2 normalize k
             prof.time("att_norm_k", || {
-                broadcast_mul_f32(&att_k, &layer.att.k_k, &mut temp1, stream)?;
-                l2_norm_f32(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
+                broadcast_mul_f16(&att_k, &layer.att.k_k, &mut temp1, stream)?;
+                l2_norm_f16(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
                 Ok(())
             })?;
 
             // Control K
             prof.time("att_ctrl_k", || {
-                control_k_f32(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
+                control_k_f16(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
                 Ok(())
             })?;
 
             // WKV inputs
             prof.time("att_wkv_in", || {
-                negate_f32(&att_kk, &mut wkv_a, stream)?;
-                mul_f32(&att_kk, &att_a, &mut wkv_b, stream)?;
+                negate_f16(&att_kk, &mut wkv_a, stream)?;
+                mul_f16(&att_kk, &att_a, &mut wkv_b, stream)?;
                 // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
                 // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
-                decay_exp_f32(&att_w, &mut w_decay, stream)?;
+                decay_exp_f16(&att_w, &mut w_decay, stream)?;
                 Ok(())
             })?;
 
@@ -1918,7 +1918,7 @@ impl Rwkv7Hip {
 
             // Run masked WKV7 (skips state updates for padding positions)
             prof.time("wkv", || {
-                wkv7_f32_masked(
+                wkv7_f16_masked(
                     &w_decay_wkv, &r_wkv, &k_ctrl_wkv, &v_wkv, &wkv_a_wkv, &wkv_b_wkv,
                     &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
                     &lens_gpu, stream
@@ -1929,7 +1929,7 @@ impl Rwkv7Hip {
 
             // Group norm on WKV output
             prof.time("wkv_norm", || {
-                group_norm_f32(
+                group_norm_f16(
                     &wkv_out, &layer.att.gn.weight, &layer.att.gn.bias,
                     &mut wkv_normed, n_head, 64e-5, stream
                 )?;
@@ -1941,33 +1941,33 @@ impl Rwkv7Hip {
             let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
             let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
             prof.time("wkv_bonus", || {
-                wkv_bonus_f32(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
+                wkv_bonus_f16(&r_wkv, &k_ctrl_wkv, &v_wkv, &r_k_wkv, &mut wkv_bonus_wkv, stream)?;
                 Ok(())
             })?;
 
             // Combine and gate
             prof.time("att_gate_out", || {
-                add_f32(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
-                mul_f32(&temp1, &att_g, &mut temp2, stream)?;
+                add_f16(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
+                mul_f16(&temp1, &att_g, &mut temp2, stream)?;
                 Ok(())
             })?;
 
             // Output projection
             prof.time("att_out", || {
-                ctx.sgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+                ctx.hgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
                 Ok(())
             })?;
 
             // Residual
             prof.time("att_resid", || {
-                add_f32(&x, &att_out, &mut temp1, stream)?;
-                copy_tensor_f32(&temp1, &mut x, stream)?;
+                add_f16(&x, &att_out, &mut temp1, stream)?;
+                copy_tensor_f16(&temp1, &mut x, stream)?;
                 Ok(())
             })?;
 
             // ==== Channel-Mix (FFN) ====
             prof.time("ffn_ln", || {
-                layer_norm_f32(
+                layer_norm_f16(
                     &x, &layer.ffn_ln.weight, &layer.ffn_ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
@@ -1976,7 +1976,7 @@ impl Rwkv7Hip {
 
             // Token shift for FFN - use masked kernel for correct state extraction
             prof.time("ffn_shift", || {
-                channel_mix_state_f32_masked(
+                channel_mix_state_f16_masked(
                     &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
                     &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
                 )?;
@@ -1988,38 +1988,38 @@ impl Rwkv7Hip {
 
             // Key projection
             prof.time("ffn_k", || {
-                ctx.sgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+                ctx.hgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
                 Ok(())
             })?;
 
             // Squared ReLU
             prof.time("ffn_relu2", || {
-                squared_relu_f32(&ffn_k, &mut ffn_k_sq, stream)?;
+                squared_relu_f16(&ffn_k, &mut ffn_k_sq, stream)?;
                 Ok(())
             })?;
 
             // Value projection
             prof.time("ffn_v", || {
-                ctx.sgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+                ctx.hgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
                 Ok(())
             })?;
 
             // Residual
             prof.time("ffn_resid", || {
-                add_f32(&x, &ffn_out, &mut temp1, stream)?;
-                copy_tensor_f32(&temp1, &mut x, stream)?;
+                add_f16(&x, &ffn_out, &mut temp1, stream)?;
+                copy_tensor_f16(&temp1, &mut x, stream)?;
                 Ok(())
             })?;
         }
 
         prof.time("head", || {
             // ==== Output Head ====
-            layer_norm_f32(
+            layer_norm_f16(
                 &x, &self.head.ln.weight, &self.head.ln.bias,
                 &mut x_ln, 1e-5, stream
             )?;
 
-            ctx.sgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            ctx.hgemm_into(&self.head.w, &x_ln, &mut logits)?;
             Ok(())
         })?;
 

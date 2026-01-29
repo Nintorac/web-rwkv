@@ -12,6 +12,7 @@
 //! - LoRA buffers: `[lora_dim, max_seq_len, batch_size]`
 //! - Output buffer: `[n_vocab, max_seq_len, batch_size]`
 
+use half::f16;
 use super::ffi::Result;
 use super::model::Rwkv7ModelInfo;
 use super::pinned::PinnedBuffer;
@@ -126,123 +127,123 @@ pub struct HipScratch {
     pub lora_dims: LoraDims,
 
     /// Persistent GPU state (resident on device when enabled)
-    pub att_shift_state_gpu: Vec<TensorHip<f32>>,
-    pub ffn_state_gpu: Vec<TensorHip<f32>>,
+    pub att_shift_state_gpu: Vec<TensorHip<f16>>,
+    pub ffn_state_gpu: Vec<TensorHip<f16>>,
     pub wkv_state_gpu: Vec<TensorHip<f32>>,
 
     // ========== Standard buffers [n_embd, T, B] ==========
 
     /// Main hidden state (persists across layers within forward pass)
-    pub x: TensorHip<f32>,
+    pub x: TensorHip<f16>,
 
     /// Layer norm output (reused for att_ln, ffn_ln, head_ln)
-    pub x_ln: TensorHip<f32>,
+    pub x_ln: TensorHip<f16>,
 
     /// Token-shifted inputs for attention
-    pub att_xr: TensorHip<f32>,
-    pub att_xw: TensorHip<f32>,
-    pub att_xk: TensorHip<f32>,
-    pub att_xv: TensorHip<f32>,
-    pub att_xa: TensorHip<f32>,
-    pub att_xg: TensorHip<f32>,
+    pub att_xr: TensorHip<f16>,
+    pub att_xw: TensorHip<f16>,
+    pub att_xk: TensorHip<f16>,
+    pub att_xv: TensorHip<f16>,
+    pub att_xa: TensorHip<f16>,
+    pub att_xg: TensorHip<f16>,
 
     /// Linear projections
-    pub att_r: TensorHip<f32>,
-    pub att_k: TensorHip<f32>,
-    pub att_v: TensorHip<f32>,
+    pub att_r: TensorHip<f16>,
+    pub att_k: TensorHip<f16>,
+    pub att_v: TensorHip<f16>,
 
     /// Decay (after softplus transformation)
-    pub att_w: TensorHip<f32>,
+    pub att_w: TensorHip<f16>,
 
     /// Adaptation factor (after sigmoid)
-    pub att_a: TensorHip<f32>,
+    pub att_a: TensorHip<f16>,
 
     /// Gate (after LoRA projection)
-    pub att_g: TensorHip<f32>,
+    pub att_g: TensorHip<f16>,
 
     /// L2-normalized key
-    pub att_kk: TensorHip<f32>,
+    pub att_kk: TensorHip<f16>,
 
     /// Controlled key (k * (1 + (a-1) * k_a))
-    pub att_k_ctrl: TensorHip<f32>,
+    pub att_k_ctrl: TensorHip<f16>,
 
     /// WKV input: -kk
-    pub wkv_a: TensorHip<f32>,
+    pub wkv_a: TensorHip<f16>,
 
     /// WKV input: kk * a
-    pub wkv_b: TensorHip<f32>,
+    pub wkv_b: TensorHip<f16>,
 
     /// Decay for WKV: exp(w)
-    pub w_decay: TensorHip<f32>,
+    pub w_decay: TensorHip<f16>,
 
     /// WKV7 output
-    pub wkv_out: TensorHip<f32>,
+    pub wkv_out: TensorHip<f16>,
 
     /// Group-normalized WKV output
-    pub wkv_normed: TensorHip<f32>,
+    pub wkv_normed: TensorHip<f16>,
 
     /// WKV bonus (time_first contribution)
-    pub wkv_bonus: TensorHip<f32>,
+    pub wkv_bonus: TensorHip<f16>,
 
     /// Attention output (combined, gated, projected - can share storage)
-    pub att_out: TensorHip<f32>,
+    pub att_out: TensorHip<f16>,
 
     /// FFN token-shifted input
-    pub ffn_xk: TensorHip<f32>,
+    pub ffn_xk: TensorHip<f16>,
 
     /// FFN output
-    pub ffn_out: TensorHip<f32>,
+    pub ffn_out: TensorHip<f16>,
 
     /// Value from first layer for residual (stored across layers)
-    pub v_first: TensorHip<f32>,
+    pub v_first: TensorHip<f16>,
 
     // ========== FFN hidden buffers [n_hidden, T, B] ==========
 
     /// FFN key projection output
-    pub ffn_k: TensorHip<f32>,
+    pub ffn_k: TensorHip<f16>,
 
     /// FFN squared ReLU output
-    pub ffn_k_sq: TensorHip<f32>,
+    pub ffn_k_sq: TensorHip<f16>,
 
     // ========== LoRA buffers [lora_dim, T, B] ==========
 
     /// Decay LoRA intermediate
-    pub lora_w: TensorHip<f32>,
+    pub lora_w: TensorHip<f16>,
 
     /// Adaptation LoRA intermediate
-    pub lora_a: TensorHip<f32>,
+    pub lora_a: TensorHip<f16>,
 
     /// Gate LoRA intermediate
-    pub lora_g: TensorHip<f32>,
+    pub lora_g: TensorHip<f16>,
 
     /// Value residual LoRA intermediate (may be empty if v_dim is None)
-    pub lora_v: TensorHip<f32>,
+    pub lora_v: TensorHip<f16>,
 
     /// Decay LoRA tanh output
-    pub lora_w_tanh: TensorHip<f32>,
+    pub lora_w_tanh: TensorHip<f16>,
 
     /// Adaptation LoRA projection output
-    pub lora_a_proj: TensorHip<f32>,
+    pub lora_a_proj: TensorHip<f16>,
 
     /// Gate LoRA sigmoid output
-    pub lora_g_sig: TensorHip<f32>,
+    pub lora_g_sig: TensorHip<f16>,
 
     /// Value residual projection output
-    pub v_lora2: TensorHip<f32>,
+    pub v_lora2: TensorHip<f16>,
 
     // ========== Temporary buffers ==========
 
     /// Temporary buffer for pointwise ops (std shape)
-    pub temp1: TensorHip<f32>,
+    pub temp1: TensorHip<f16>,
 
     /// Temporary buffer for pointwise ops (std shape)
-    pub temp2: TensorHip<f32>,
+    pub temp2: TensorHip<f16>,
 
     /// Temporary shift state output (state shape)
-    pub new_att_shift: TensorHip<f32>,
+    pub new_att_shift: TensorHip<f16>,
 
     /// Temporary shift state output (state shape)
-    pub new_ffn_shift: TensorHip<f32>,
+    pub new_ffn_shift: TensorHip<f16>,
 
     /// Temporary WKV state output (wkv state shape)
     pub new_wkv_state: TensorHip<f32>,
@@ -250,7 +251,7 @@ pub struct HipScratch {
     // ========== Output buffer [n_vocab, T, B] ==========
 
     /// Final logits output
-    pub logits: TensorHip<f32>,
+    pub logits: TensorHip<f16>,
 
     // ========== Token staging buffer [T, B] ==========
 
@@ -263,7 +264,7 @@ pub struct HipScratch {
     // ========== Pinned host staging buffer [n_embd * T * B] ==========
 
     /// Pinned host buffer for async embedding upload (avoids sync on hipMemcpyAsync)
-    pub emb_staging: PinnedBuffer<f32>,
+    pub emb_staging: PinnedBuffer<f16>,
 }
 
 impl HipScratch {
@@ -420,9 +421,9 @@ impl HipScratch {
 
         let lora_size = (ld.w_dim + ld.a_dim + ld.g_dim + ld.v_dim.unwrap_or(0)) * t * b;
 
-        let f32_elements = std_count * std_size + ffn_count * ffn_size + lora_size + out_size;
+        let f16_elements = std_count * std_size + ffn_count * ffn_size + lora_size + out_size;
         let u32_elements = token_size;
-        f32_elements * std::mem::size_of::<f32>() + u32_elements * std::mem::size_of::<u32>()
+        f16_elements * std::mem::size_of::<f16>() + u32_elements * std::mem::size_of::<u32>()
     }
 
     /// Check if buffers are large enough for given sequence length and batch size.

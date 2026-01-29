@@ -1710,4 +1710,864 @@ hipError_t rocblas_to_hip_error(rocblas_status status) {
     }
 }
 
+// ============================================================================
+// FP16 kernel variants (FP16 I/O, FP32 accumulation)
+// ============================================================================
+
+__device__ __forceinline__ float f16_to_f32(__half v) {
+    return __half2float(v);
+}
+
+__device__ __forceinline__ __half f32_to_f16(float v) {
+    return __float2half(v);
+}
+
+__global__ void kernel_copy_f16(const __half* __restrict__ input,
+                                __half* __restrict__ output,
+                                int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = input[idx];
+    }
+}
+
+hipError_t launch_copy_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_copy_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_decay_exp_f16(const __half* __restrict__ input,
+                                     __half* __restrict__ output,
+                                     int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = f16_to_f32(input[idx]);
+        float out;
+        if (x > 80.0f) {
+            out = 0.0f;
+        } else if (x < -80.0f) {
+            out = 1.0f;
+        } else {
+            out = expf(-expf(x));
+        }
+        output[idx] = f32_to_f16(out);
+    }
+}
+
+hipError_t launch_decay_exp_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_decay_exp_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_lerp_f16(const __half* __restrict__ a,
+                                const __half* __restrict__ b,
+                                const __half* __restrict__ t,
+                                __half* __restrict__ output,
+                                int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float a_val = f16_to_f32(a[idx]);
+        float b_val = f16_to_f32(b[idx]);
+        float t_val = f16_to_f32(t[idx]);
+        float out = a_val + t_val * (b_val - a_val);
+        output[idx] = f32_to_f16(out);
+    }
+}
+
+hipError_t launch_lerp_f16(const __half* a, const __half* b, const __half* t,
+                           __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_lerp_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       a, b, t, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_sigmoid_f16(const __half* __restrict__ input,
+                                   __half* __restrict__ output,
+                                   int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = f16_to_f32(input[idx]);
+        float out = 1.0f / (1.0f + expf(-x));
+        output[idx] = f32_to_f16(out);
+    }
+}
+
+hipError_t launch_sigmoid_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_sigmoid_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_squared_relu_f16(const __half* __restrict__ input,
+                                        __half* __restrict__ output,
+                                        int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = f16_to_f32(input[idx]);
+        float relu = fmaxf(0.0f, x);
+        output[idx] = f32_to_f16(relu * relu);
+    }
+}
+
+hipError_t launch_squared_relu_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_squared_relu_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_softplus_decay_f16(const __half* __restrict__ input,
+                                          __half* __restrict__ output,
+                                          int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = f16_to_f32(input[idx]);
+        float log_sigmoid;
+        if (x > 20.0f) {
+            log_sigmoid = 0.0f;
+        } else if (x < -20.0f) {
+            log_sigmoid = x;
+        } else {
+            log_sigmoid = -logf(1.0f + expf(-x));
+        }
+        output[idx] = f32_to_f16(log_sigmoid - 0.5f);
+    }
+}
+
+hipError_t launch_softplus_decay_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_softplus_decay_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_tanh_f16(const __half* __restrict__ input,
+                                __half* __restrict__ output,
+                                int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = f16_to_f32(input[idx]);
+        output[idx] = f32_to_f16(tanhf(x));
+    }
+}
+
+hipError_t launch_tanh_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_tanh_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, output, n);
+    return hipGetLastError();
+}
+
+#define BLOCK_SIZE 256
+
+__global__ void kernel_add_f16(const __half* __restrict__ a,
+                               const __half* __restrict__ b,
+                               __half* __restrict__ output,
+                               int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float out = f16_to_f32(a[idx]) + f16_to_f32(b[idx]);
+        output[idx] = f32_to_f16(out);
+    }
+}
+
+hipError_t launch_add_f16(const __half* a, const __half* b, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_add_f16, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream, a, b, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_mul_f16(const __half* __restrict__ a,
+                               const __half* __restrict__ b,
+                               __half* __restrict__ output,
+                               int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float out = f16_to_f32(a[idx]) * f16_to_f32(b[idx]);
+        output[idx] = f32_to_f16(out);
+    }
+}
+
+hipError_t launch_mul_f16(const __half* a, const __half* b, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_mul_f16, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream, a, b, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_negate_f16(const __half* __restrict__ input,
+                                  __half* __restrict__ output,
+                                  int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = f32_to_f16(-f16_to_f32(input[idx]));
+    }
+}
+
+hipError_t launch_negate_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_negate_f16, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream, input, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_exp_f16(const __half* __restrict__ input,
+                               __half* __restrict__ output,
+                               int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = f32_to_f16(expf(f16_to_f32(input[idx])));
+    }
+}
+
+hipError_t launch_exp_f16(const __half* input, __half* output, int n, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_exp_f16, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream, input, output, n);
+    return hipGetLastError();
+}
+
+__global__ void kernel_broadcast_add_f16(const __half* __restrict__ input,
+                                         const __half* __restrict__ bias,
+                                         __half* __restrict__ output,
+                                         int n, int bias_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        int c_idx = idx % bias_len;
+        float out = f16_to_f32(input[idx]) + f16_to_f32(bias[c_idx]);
+        output[idx] = f32_to_f16(out);
+    }
+}
+
+hipError_t launch_broadcast_add_f16(const __half* input, const __half* bias, __half* output,
+                                    int n, int bias_len, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_broadcast_add_f16, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       input, bias, output, n, bias_len);
+    return hipGetLastError();
+}
+
+__global__ void kernel_broadcast_mul_f16(const __half* __restrict__ input,
+                                         const __half* __restrict__ scale,
+                                         __half* __restrict__ output,
+                                         int n, int scale_len) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        int c_idx = idx % scale_len;
+        float out = f16_to_f32(input[idx]) * f16_to_f32(scale[c_idx]);
+        output[idx] = f32_to_f16(out);
+    }
+}
+
+hipError_t launch_broadcast_mul_f16(const __half* input, const __half* scale, __half* output,
+                                    int n, int scale_len, hipStream_t stream) {
+    if (n <= 0) {
+        return hipSuccess;
+    }
+    int num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    hipLaunchKernelGGL(kernel_broadcast_mul_f16, dim3(num_blocks), dim3(BLOCK_SIZE), 0, stream,
+                       input, scale, output, n, scale_len);
+    return hipGetLastError();
+}
+
+__global__ void kernel_layer_norm_f16(
+    const __half* __restrict__ input,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    int C,
+    int N,
+    float eps
+) {
+    int vec_idx = blockIdx.x;
+    if (vec_idx >= N) return;
+
+    __shared__ float shared_mem[LAYERNORM_BLOCK_SIZE / 32];
+    __shared__ float mean_shared;
+    __shared__ float rstd_shared;
+
+    int base_offset = vec_idx * C;
+
+    float local_sum = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        local_sum += f16_to_f32(input[base_offset + c]);
+    }
+
+    float total_sum = block_reduce_sum(local_sum, shared_mem);
+    if (threadIdx.x == 0) {
+        mean_shared = total_sum / (float)C;
+    }
+    __syncthreads();
+
+    float mean = mean_shared;
+    float local_var_sum = 0.0f;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float x = f16_to_f32(input[base_offset + c]);
+        float diff = x - mean;
+        local_var_sum += diff * diff;
+    }
+
+    float total_var_sum = block_reduce_sum(local_var_sum, shared_mem);
+    if (threadIdx.x == 0) {
+        float variance = total_var_sum / (float)C;
+        rstd_shared = rsqrtf(variance + eps);
+    }
+    __syncthreads();
+
+    float rstd = rstd_shared;
+    for (int c = threadIdx.x; c < C; c += blockDim.x) {
+        float x = f16_to_f32(input[base_offset + c]);
+        float normalized = (x - mean) * rstd;
+        float w = f16_to_f32(weight[c]);
+        float b = f16_to_f32(bias[c]);
+        output[base_offset + c] = f32_to_f16(normalized * w + b);
+    }
+}
+
+hipError_t launch_layer_norm_f16(
+    const __half* input,
+    const __half* weight,
+    const __half* bias,
+    __half* output,
+    int C,
+    int N,
+    float eps,
+    hipStream_t stream
+) {
+    if (C <= 0 || N <= 0) {
+        return hipSuccess;
+    }
+    int block_size = LAYERNORM_BLOCK_SIZE;
+    int grid_size = N;
+    hipLaunchKernelGGL(kernel_layer_norm_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       input, weight, bias, output, C, N, eps);
+    return hipGetLastError();
+}
+
+__global__ void kernel_group_norm_f16(
+    const __half* __restrict__ input,
+    const __half* __restrict__ weight,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    int C,
+    int N,
+    int G,
+    float eps
+) {
+    int group_idx = blockIdx.x;
+    int vec_idx = blockIdx.y;
+    if (group_idx >= G || vec_idx >= N) return;
+
+    int channels_per_group = C / G;
+    __shared__ float shared_mem[LAYERNORM_BLOCK_SIZE / 32];
+    __shared__ float mean_shared;
+    __shared__ float rstd_shared;
+
+    int vec_offset = vec_idx * C;
+    int group_start = group_idx * channels_per_group;
+
+    float local_sum = 0.0f;
+    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
+        int c = group_start + i;
+        local_sum += f16_to_f32(input[vec_offset + c]);
+    }
+
+    float total_sum = block_reduce_sum(local_sum, shared_mem);
+    if (threadIdx.x == 0) {
+        mean_shared = total_sum / (float)channels_per_group;
+    }
+    __syncthreads();
+
+    float mean = mean_shared;
+    float local_var_sum = 0.0f;
+    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
+        int c = group_start + i;
+        float x = f16_to_f32(input[vec_offset + c]);
+        float diff = x - mean;
+        local_var_sum += diff * diff;
+    }
+
+    float total_var_sum = block_reduce_sum(local_var_sum, shared_mem);
+    if (threadIdx.x == 0) {
+        float variance = total_var_sum / (float)channels_per_group;
+        rstd_shared = rsqrtf(variance + eps);
+    }
+    __syncthreads();
+
+    float rstd = rstd_shared;
+    for (int i = threadIdx.x; i < channels_per_group; i += blockDim.x) {
+        int c = group_start + i;
+        float x = f16_to_f32(input[vec_offset + c]);
+        float normalized = (x - mean) * rstd;
+        float w = f16_to_f32(weight[c]);
+        float b = f16_to_f32(bias[c]);
+        output[vec_offset + c] = f32_to_f16(normalized * w + b);
+    }
+}
+
+hipError_t launch_group_norm_f16(
+    const __half* input,
+    const __half* weight,
+    const __half* bias,
+    __half* output,
+    int C,
+    int N,
+    int G,
+    float eps,
+    hipStream_t stream
+) {
+    if (C <= 0 || N <= 0 || G <= 0) {
+        return hipSuccess;
+    }
+    int block_size = LAYERNORM_BLOCK_SIZE;
+    dim3 grid_size(G, N);
+    hipLaunchKernelGGL(kernel_group_norm_f16, grid_size, dim3(block_size), 0, stream,
+                       input, weight, bias, output, C, N, G, eps);
+    return hipGetLastError();
+}
+
+__global__ void kernel_l2_norm_f16(
+    const __half* __restrict__ input,
+    __half* __restrict__ output,
+    int C,
+    int N,
+    int head_size,
+    float eps
+) {
+    int H = C / head_size;
+    int head_idx = blockIdx.x;
+    int vec_idx = blockIdx.y;
+    if (head_idx >= H || vec_idx >= N) return;
+
+    __shared__ float shared_mem[LAYERNORM_BLOCK_SIZE / 32];
+    __shared__ float rnorm_shared;
+
+    int vec_offset = vec_idx * C;
+    int head_start = head_idx * head_size;
+
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+        int c = head_start + i;
+        float x = f16_to_f32(input[vec_offset + c]);
+        local_sum_sq += x * x;
+    }
+
+    float total_sum_sq = block_reduce_sum(local_sum_sq, shared_mem);
+    if (threadIdx.x == 0) {
+        rnorm_shared = rsqrtf(total_sum_sq + eps);
+    }
+    __syncthreads();
+
+    float rnorm = rnorm_shared;
+    for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+        int c = head_start + i;
+        float x = f16_to_f32(input[vec_offset + c]);
+        output[vec_offset + c] = f32_to_f16(x * rnorm);
+    }
+}
+
+hipError_t launch_l2_norm_f16(
+    const __half* input,
+    __half* output,
+    int C,
+    int N,
+    int head_size,
+    float eps,
+    hipStream_t stream
+) {
+    if (C <= 0 || N <= 0 || head_size <= 0) {
+        return hipSuccess;
+    }
+    int H = C / head_size;
+    int block_size = LAYERNORM_BLOCK_SIZE;
+    dim3 grid_size(H, N);
+    hipLaunchKernelGGL(kernel_l2_norm_f16, grid_size, dim3(block_size), 0, stream,
+                       input, output, C, N, head_size, eps);
+    return hipGetLastError();
+}
+
+__global__ void kernel_channel_mix_state_f16(
+    const __half* __restrict__ x,
+    const __half* __restrict__ state_in,
+    const __half* __restrict__ x_k,
+    __half* __restrict__ output,
+    __half* __restrict__ state_out,
+    int C,
+    int T,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * B;
+    if (idx >= total) return;
+
+    int c = idx % C;
+    int b = idx / C;
+
+    float mix_val = f16_to_f32(x_k[c]);
+    float prev = f16_to_f32(state_in[b * C + c]);
+
+    for (int t = 0; t < T; t++) {
+        int offset = b * T * C + t * C + c;
+        float curr = f16_to_f32(x[offset]);
+        float out = curr + mix_val * (prev - curr);
+        output[offset] = f32_to_f16(out);
+        prev = curr;
+    }
+
+    state_out[b * C + c] = f32_to_f16(prev);
+}
+
+hipError_t launch_channel_mix_state_f16(
+    const __half* x,
+    const __half* state_in,
+    const __half* x_k,
+    __half* output,
+    __half* state_out,
+    int C,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (C <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+    int total = C * B;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_channel_mix_state_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       x, state_in, x_k, output, state_out, C, T, B);
+    return hipGetLastError();
+}
+
+__global__ void kernel_channel_mix_state_f16_masked(
+    const __half* __restrict__ x,
+    const __half* __restrict__ state_in,
+    const __half* __restrict__ x_k,
+    __half* __restrict__ output,
+    __half* __restrict__ state_out,
+    const int* __restrict__ lengths,
+    int C,
+    int T,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * B;
+    if (idx >= total) return;
+
+    int c = idx % C;
+    int b = idx / C;
+    int real_len = lengths[b];
+
+    if (real_len <= 0) {
+        state_out[b * C + c] = state_in[b * C + c];
+        return;
+    }
+
+    float mix_val = f16_to_f32(x_k[c]);
+    float prev = f16_to_f32(state_in[b * C + c]);
+
+    for (int t = 0; t < real_len; t++) {
+        int offset = b * T * C + t * C + c;
+        float curr = f16_to_f32(x[offset]);
+        float out = curr + mix_val * (prev - curr);
+        output[offset] = f32_to_f16(out);
+        prev = curr;
+    }
+
+    state_out[b * C + c] = f32_to_f16(prev);
+}
+
+hipError_t launch_channel_mix_state_f16_masked(
+    const __half* x,
+    const __half* state_in,
+    const __half* x_k,
+    __half* output,
+    __half* state_out,
+    const int* lengths,
+    int C,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (C <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+    int total = C * B;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_channel_mix_state_f16_masked, dim3(grid_size), dim3(block_size), 0, stream,
+                       x, state_in, x_k, output, state_out, lengths, C, T, B);
+    return hipGetLastError();
+}
+
+__global__ void kernel_control_k_f16(
+    const __half* __restrict__ k_a,
+    const __half* __restrict__ a,
+    const __half* __restrict__ k,
+    __half* __restrict__ output,
+    int C,
+    int T,
+    int B
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = C * T * B;
+    if (idx >= total) return;
+    int c = idx % C;
+    float k_a_val = f16_to_f32(k_a[c]);
+    float a_val = f16_to_f32(a[idx]);
+    float k_val = f16_to_f32(k[idx]);
+    float out = k_val * (1.0f + (a_val - 1.0f) * k_a_val);
+    output[idx] = f32_to_f16(out);
+}
+
+hipError_t launch_control_k_f16(
+    const __half* k_a,
+    const __half* a,
+    const __half* k,
+    __half* output,
+    int C,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (C <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+    int total = C * T * B;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_control_k_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       k_a, a, k, output, C, T, B);
+    return hipGetLastError();
+}
+
+__global__ void kernel_wkv_bonus_f16(
+    const __half* __restrict__ r,          // [N, H, T, B]
+    const __half* __restrict__ k,          // [N, H, T, B]
+    const __half* __restrict__ v,          // [N, H, T, B]
+    const __half* __restrict__ r_k,        // [N, H, 1, 1]
+    __half* __restrict__ output,           // [N, H, T, B]
+    int N,
+    int H,
+    int T,
+    int B
+) {
+    int htb_idx = blockIdx.x;
+    int total_htb = H * T * B;
+    if (htb_idx >= total_htb) return;
+
+    int h = htb_idx % H;
+    int tb = htb_idx / H;
+    int t = tb % T;
+    int b = tb / T;
+
+    __shared__ float shared_sum[LAYERNORM_BLOCK_SIZE];
+
+    int base = N * (h + H * t + H * T * b);
+    int r_k_base = N * h;
+
+    float local_sum = 0.0f;
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        int idx = base + n;
+        float r_val = f16_to_f32(r[idx]);
+        float k_val = f16_to_f32(k[idx]);
+        float rk_val = f16_to_f32(r_k[r_k_base + n]);
+        local_sum += r_val * k_val * rk_val;
+    }
+
+    shared_sum[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    float total_sum = shared_sum[0];
+
+    for (int n = threadIdx.x; n < N; n += blockDim.x) {
+        int idx = base + n;
+        float v_val = f16_to_f32(v[idx]);
+        output[idx] = f32_to_f16(total_sum * v_val);
+    }
+}
+
+hipError_t launch_wkv_bonus_f16(
+    const __half* r,
+    const __half* k,
+    const __half* v,
+    const __half* r_k,
+    __half* output,
+    int N,
+    int H,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (N <= 0 || H <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+    int total = N * H * T * B;
+    int block_size = 256;
+    int grid_size = (total + block_size - 1) / block_size;
+    hipLaunchKernelGGL(kernel_wkv_bonus_f16, dim3(grid_size), dim3(block_size), 0, stream,
+                       r, k, v, r_k, output, N, H, T, B);
+    return hipGetLastError();
+}
+
+__global__ void kernel_wkv7_f16_masked(
+    const __half* __restrict__ w_decay,    // [N, H, T, B]
+    const __half* __restrict__ q,          // [N, H, T, B]
+    const __half* __restrict__ k,          // [N, H, T, B]
+    const __half* __restrict__ v,          // [N, H, T, B]
+    const __half* __restrict__ a,          // [N, H, T, B]
+    const __half* __restrict__ b,          // [N, H, T, B]
+    const float* __restrict__ state_in,    // [N, N, H, B]
+    __half* __restrict__ output,           // [N, H, T, B]
+    float* __restrict__ state_out,         // [N, N, H, B]
+    const int* __restrict__ lengths,       // [B]
+    int N,
+    int H,
+    int T,
+    int B
+) {
+    int i = threadIdx.x;
+    int hh = blockIdx.x;
+    int bb = blockIdx.y;
+
+    if (i >= N) return;
+
+    int real_len = lengths[bb];
+
+    float state[WKV7_HEAD_SIZE];
+    int state_base = i * N + hh * N * N + bb * N * N * H;
+    #pragma unroll
+    for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+        state[j] = state_in[j + state_base];
+    }
+
+    __shared__ float sh_q[WKV7_HEAD_SIZE];
+    __shared__ float sh_k[WKV7_HEAD_SIZE];
+    __shared__ float sh_w[WKV7_HEAD_SIZE];
+    __shared__ float sh_a[WKV7_HEAD_SIZE];
+    __shared__ float sh_b[WKV7_HEAD_SIZE];
+
+    float tmp[WKV7_HEAD_SIZE];
+
+    for (int t = 0; t < T; t++) {
+        int ind = i + N * (hh + H * (t + T * bb));
+
+        __syncthreads();
+        sh_q[i] = f16_to_f32(q[ind]);
+        sh_w[i] = f16_to_f32(w_decay[ind]);
+        sh_k[i] = f16_to_f32(k[ind]);
+        sh_a[i] = f16_to_f32(a[ind]);
+        sh_b[i] = f16_to_f32(b[ind]);
+        __syncthreads();
+
+        if (t < real_len) {
+            float v_val = f16_to_f32(v[ind]);
+
+            #pragma unroll
+            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+                tmp[j] = sh_a[j] * state[j];
+            }
+            float sa = pairwise_sum_64(tmp);
+
+            #pragma unroll
+            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+                state[j] = state[j] * sh_w[j] + sa * sh_b[j] + sh_k[j] * v_val;
+            }
+
+            #pragma unroll
+            for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+                tmp[j] = state[j] * sh_q[j];
+            }
+            float y = pairwise_sum_64(tmp);
+            output[ind] = f32_to_f16(y);
+        }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < WKV7_HEAD_SIZE; j++) {
+        state_out[j + state_base] = state[j];
+    }
+}
+
+hipError_t launch_wkv7_f16_masked(
+    const __half* w_decay,
+    const __half* q,
+    const __half* k,
+    const __half* v,
+    const __half* a,
+    const __half* b,
+    const float* state_in,
+    __half* output,
+    float* state_out,
+    const int* lengths,
+    int N,
+    int H,
+    int T,
+    int B,
+    hipStream_t stream
+) {
+    if (N <= 0 || H <= 0 || T <= 0 || B <= 0) {
+        return hipSuccess;
+    }
+    dim3 grid(H, B);
+    dim3 block(N);
+    hipLaunchKernelGGL(kernel_wkv7_f16_masked, grid, block, 0, stream,
+                       w_decay, q, k, v, a, b, state_in, output, state_out, lengths,
+                       N, H, T, B);
+    return hipGetLastError();
+}
+
 } // extern "C"

@@ -11,6 +11,7 @@
 
 use std::ffi::c_int;
 
+use half::f16;
 use super::ffi::{
     HipErrorKind, Result, RocblasHandle, ROCBLAS_STATUS_SUCCESS,
     rocblas_handle_create, rocblas_handle_destroy, rocblas_set_stream_wrapper,
@@ -109,9 +110,9 @@ impl HipBlasContext {
     /// All tensors must be GPU-resident. No host copies occur.
     pub fn hgemm_into(
         &self,
-        weight: &TensorHip<f32>,  // Actually f16 storage
-        input: &TensorHip<f32>,   // Actually f16 storage
-        output: &mut TensorHip<f32>, // Actually f16 storage
+        weight: &TensorHip<f16>,
+        input: &TensorHip<f16>,
+        output: &mut TensorHip<f16>,
     ) -> Result<()> {
         hgemm_f16(self.handle, weight, input, output)
     }
@@ -205,9 +206,9 @@ pub fn rocblas_set_stream(handle: RocblasHandle, stream: &Stream) -> Result<()> 
 /// The operation is: output = weight @ input
 pub fn hgemm_f16(
     handle: RocblasHandle,
-    weight: &TensorHip<f32>,  // Actually f16 stored as f32 for API simplicity
-    input: &TensorHip<f32>,   // Actually f16
-    output: &mut TensorHip<f32>, // Actually f16
+    weight: &TensorHip<f16>,
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
 ) -> Result<()> {
     // For web-rwkv tensor convention:
     // weight: Shape(N, K) where N is fastest = column-major K×N = N cols, K rows
@@ -496,12 +497,12 @@ pub fn hip_sgemm_ta(
 /// # Returns
 /// * Output vector [N, A] (flattened)
 pub fn hip_hgemm(
-    weight: &[f32],
-    input: &[f32],
+    weight: &[f16],
+    input: &[f16],
     m: usize,   // output features (N)
     k: usize,   // input features (K)
     n: usize,   // tokens (A)
-) -> Result<Vec<f32>> {
+) -> Result<Vec<f16>> {
     if weight.len() != m * k {
         return Err(HipErrorKind {
             code: -1,
@@ -533,7 +534,7 @@ pub fn hip_hgemm(
 
     let d_weight = TensorHip::from_slice(weight, weight_shape, &stream)?;
     let d_input = TensorHip::from_slice(input, input_shape, &stream)?;
-    let mut d_output = TensorHip::<f32>::new(output_shape)?;
+    let mut d_output = TensorHip::<f16>::new(output_shape)?;
 
     // Create rocBLAS handle
     let handle = rocblas_create()?;
@@ -548,4 +549,3 @@ pub fn hip_hgemm(
     // Copy back result
     d_output.to_vec(&stream)
 }
-

@@ -1,6 +1,7 @@
 //! HIP kernel wrapper functions.
 
 use std::ffi::c_int;
+use half::f16;
 
 use super::ffi::{
     HipErrorKind, Result, check,
@@ -10,9 +11,16 @@ use super::ffi::{
     launch_tanh_f32, launch_token_shift_f32, launch_channel_mix_state_f32,
     launch_channel_mix_state_f32_masked,
     launch_wkv_bonus_f32, launch_control_k_f32, launch_wkv7_f32, launch_wkv7_f32_masked,
+    launch_copy_f16, launch_decay_exp_f16, launch_lerp_f16,
+    launch_sigmoid_f16, launch_squared_relu_f16, launch_softplus_decay_f16,
+    launch_layer_norm_f16, launch_group_norm_f16, launch_l2_norm_f16,
+    launch_tanh_f16, launch_channel_mix_state_f16, launch_channel_mix_state_f16_masked,
+    launch_wkv_bonus_f16, launch_control_k_f16, launch_wkv7_f16_masked,
     // Elementwise operations
     launch_add_f32, launch_mul_f32, launch_negate_f32, launch_exp_f32,
     launch_broadcast_add_f32, launch_broadcast_mul_f32,
+    launch_add_f16, launch_mul_f16, launch_negate_f16, launch_exp_f16,
+    launch_broadcast_add_f16, launch_broadcast_mul_f16,
 };
 use super::device::Stream;
 use super::buffer::DeviceBuffer;
@@ -83,6 +91,38 @@ pub fn copy_tensor_f32(
     }
 }
 
+/// GPU-to-GPU copy for TensorHip<f16>: output = input
+pub fn copy_tensor_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "copy_tensor_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_copy_f16(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Copy f32 data from host, through GPU copy kernel, back to host.
 /// This is a convenience function for testing.
 pub fn hip_copy_kernel(input: &[f32]) -> Result<Vec<f32>> {
@@ -137,6 +177,37 @@ pub fn decay_exp_f32(
     }
 }
 
+pub fn decay_exp_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "decay_exp_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_decay_exp_f16(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Compute decay exponential on host data, returning results.
 /// This is a convenience function for testing.
 pub fn hip_decay_exp(input: &[f32]) -> Result<Vec<f32>> {
@@ -180,6 +251,41 @@ pub fn lerp_f32(
     }
     unsafe {
         check(launch_lerp_f32(
+            a.as_ptr(),
+            b.as_ptr(),
+            t.as_ptr(),
+            output.as_mut_ptr(),
+            n as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn lerp_f16(
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    t: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    let n = a.len();
+    if b.len() != n || t.len() != n || output.len() != n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: a={}, b={}, t={}, output={}",
+                n, b.len(), t.len(), output.len()
+            ),
+        });
+    }
+    if !a.is_contiguous() || !b.is_contiguous() || !t.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "lerp_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_lerp_f16(
             a.as_ptr(),
             b.as_ptr(),
             t.as_ptr(),
@@ -247,6 +353,37 @@ pub fn sigmoid_f32(
     }
 }
 
+pub fn sigmoid_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "sigmoid_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_sigmoid_f16(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Compute sigmoid on host data, returning results.
 /// This is a convenience function for testing.
 pub fn hip_sigmoid(input: &[f32]) -> Result<Vec<f32>> {
@@ -287,6 +424,37 @@ pub fn squared_relu_f32(
     }
     unsafe {
         check(launch_squared_relu_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn squared_relu_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "squared_relu_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_squared_relu_f16(
             input.as_ptr(),
             output.as_mut_ptr(),
             input.len() as c_int,
@@ -336,6 +504,37 @@ pub fn softplus_decay_f32(
     }
     unsafe {
         check(launch_softplus_decay_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn softplus_decay_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "softplus_decay_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_softplus_decay_f16(
             input.as_ptr(),
             output.as_mut_ptr(),
             input.len() as c_int,
@@ -414,6 +613,43 @@ pub fn layer_norm_f32(
 
     unsafe {
         check(launch_layer_norm_f32(
+            input.as_ptr(),
+            weight.as_ptr(),
+            bias.as_ptr(),
+            output.as_mut_ptr(),
+            c as c_int,
+            n as c_int,
+            eps,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn layer_norm_f16(
+    input: &TensorHip<f16>,
+    weight: &TensorHip<f16>,
+    bias: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    eps: f32,
+    stream: &Stream,
+) -> Result<()> {
+    let shape = input.shape();
+    let c = shape[0];
+    let n = shape[1] * shape[2] * shape[3];
+    if input.len() != output.len() || weight.len() != c || bias.len() != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "layer_norm_f16 shape mismatch".to_string(),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() || !weight.is_contiguous() || !bias.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "layer_norm_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_layer_norm_f16(
             input.as_ptr(),
             weight.as_ptr(),
             bias.as_ptr(),
@@ -548,6 +784,59 @@ pub fn group_norm_f32(
     }
 }
 
+pub fn group_norm_f16(
+    input: &TensorHip<f16>,
+    weight: &TensorHip<f16>,
+    bias: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    num_groups: usize,
+    eps: f32,
+    stream: &Stream,
+) -> Result<()> {
+    let c = input.shape()[0];
+    let n = input.shape()[1] * input.shape()[2] * input.shape()[3];
+
+    if c % num_groups != 0 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Channel count {} must be divisible by num_groups {}",
+                c, num_groups
+            ),
+        });
+    }
+    let out_n = output.shape()[1] * output.shape()[2] * output.shape()[3];
+    if output.shape()[0] != c || out_n != n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
+                c, n, output.shape(), out_n
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "group_norm_f16 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_group_norm_f16(
+            input.as_ptr(),
+            weight.as_ptr(),
+            bias.as_ptr(),
+            output.as_mut_ptr(),
+            c as c_int,
+            n as c_int,
+            num_groups as c_int,
+            eps,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Compute group normalization on host data.
 pub fn hip_group_norm(
     input: &[f32],
@@ -647,6 +936,55 @@ pub fn l2_norm_f32(
     }
 }
 
+pub fn l2_norm_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    head_size: usize,
+    eps: f32,
+    stream: &Stream,
+) -> Result<()> {
+    let c = input.shape()[0];
+    let n = input.shape()[1] * input.shape()[2] * input.shape()[3];
+
+    if c % head_size != 0 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Channel count {} must be divisible by head_size {}",
+                c, head_size
+            ),
+        });
+    }
+    let out_n = output.shape()[1] * output.shape()[2] * output.shape()[3];
+    if output.shape()[0] != c || out_n != n {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
+                c, n, output.shape(), out_n
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "l2_norm_f16 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_l2_norm_f16(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            c as c_int,
+            n as c_int,
+            head_size as c_int,
+            eps,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Compute L2 normalization on host data.
 pub fn hip_l2_norm(
     input: &[f32],
@@ -697,6 +1035,37 @@ pub fn tanh_f32(
     }
     unsafe {
         check(launch_tanh_f32(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn tanh_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input {} vs output {}",
+                input.len(),
+                output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "tanh_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_tanh_f16(
             input.as_ptr(),
             output.as_mut_ptr(),
             input.len() as c_int,
@@ -972,6 +1341,127 @@ pub fn channel_mix_state_f32_masked(
     }
 }
 
+pub fn channel_mix_state_f16(
+    x: &TensorHip<f16>,
+    state_in: &TensorHip<f16>,
+    x_k: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    state_out: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    let c = x.shape()[0];
+    let t = x.shape()[1];
+    let b = x.shape()[2];
+
+    if output.shape() != x.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                x.shape(), output.shape()
+            ),
+        });
+    }
+    if state_in.shape()[0] != c || state_in.shape()[1] != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected [{}, {}, 1, 1], got {}",
+                c, b, state_in.shape()
+            ),
+        });
+    }
+    if x_k.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
+                c, x_k.shape()
+            ),
+        });
+    }
+
+    unsafe {
+        check(launch_channel_mix_state_f16(
+            x.as_ptr(),
+            state_in.as_ptr(),
+            x_k.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            c as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn channel_mix_state_f16_masked(
+    x: &TensorHip<f16>,
+    state_in: &TensorHip<f16>,
+    x_k: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    state_out: &mut TensorHip<f16>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    let c = x.shape()[0];
+    let t = x.shape()[1];
+    let b = x.shape()[2];
+
+    if output.shape() != x.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                x.shape(), output.shape()
+            ),
+        });
+    }
+    if state_in.shape()[0] != c || state_in.shape()[1] != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected [{}, {}, 1, 1], got {}",
+                c, b, state_in.shape()
+            ),
+        });
+    }
+    if x_k.shape()[0] != c {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
+                c, x_k.shape()
+            ),
+        });
+    }
+    if lengths.shape()[0] != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Lengths shape mismatch: expected [{}, 1, 1, 1], got {}",
+                b, lengths.shape()
+            ),
+        });
+    }
+
+    unsafe {
+        check(launch_channel_mix_state_f16_masked(
+            x.as_ptr(),
+            state_in.as_ptr(),
+            x_k.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            lengths.as_ptr() as *const c_int,
+            c as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Compute channel-mix state on host data, returning (output, state_out).
 pub fn hip_channel_mix_state(
     x: &[f32],
@@ -1084,6 +1574,47 @@ pub fn wkv_bonus_f32(
 
     unsafe {
         check(launch_wkv_bonus_f32(
+            r.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            r_k.as_ptr(),
+            output.as_mut_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn wkv_bonus_f16(
+    r: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    v: &TensorHip<f16>,
+    r_k: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    let n = r.shape()[0];
+    let h = r.shape()[1];
+    let t = r.shape()[2];
+    let b = r.shape()[3];
+
+    if !r.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !r_k.is_contiguous()
+        || !output.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv_bonus_f16 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv_bonus_f16(
             r.as_ptr(),
             k.as_ptr(),
             v.as_ptr(),
@@ -1213,6 +1744,50 @@ pub fn control_k_f32(
 
     unsafe {
         check(launch_control_k_f32(
+            k_a.as_ptr(),
+            a.as_ptr(),
+            k.as_ptr(),
+            output.as_mut_ptr(),
+            c as c_int,
+            t as c_int,
+            b as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn control_k_f16(
+    k_a: &TensorHip<f16>,
+    a: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    let c = a.shape()[0];
+    let t = a.shape()[1];
+    let b = a.shape()[2];
+
+    if k_a.shape()[0] != c || k.shape() != a.shape() || output.shape() != a.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "control_k_f16 shape mismatch: k_a={}, a={}, k={}, output={}",
+                k_a.shape(),
+                a.shape(),
+                k.shape(),
+                output.shape()
+            ),
+        });
+    }
+    if !k_a.is_contiguous() || !a.is_contiguous() || !k.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "control_k_f16 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_control_k_f16(
             k_a.as_ptr(),
             a.as_ptr(),
             k.as_ptr(),
@@ -1581,6 +2156,110 @@ pub fn wkv7_f32_masked(
     }
 }
 
+pub fn wkv7_f16_masked(
+    w_decay: &TensorHip<f16>,
+    q: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    v: &TensorHip<f16>,
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f16>,
+    state_out: &mut TensorHip<f32>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    let n = w_decay.shape()[0];
+    let h = w_decay.shape()[1];
+    let t = w_decay.shape()[2];
+    let b_size = w_decay.shape()[3];
+
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape || k.shape() != input_shape || v.shape() != input_shape
+        || a.shape() != input_shape || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
+                w_decay.shape(), q.shape(), k.shape(), v.shape(), a.shape(), b.shape()
+            ),
+        });
+    }
+
+    if output.shape() != input_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                input_shape, output.shape()
+            ),
+        });
+    }
+
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_in shape mismatch: expected {}, got {}",
+                state_shape, state_in.shape()
+            ),
+        });
+    }
+    if state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_out shape mismatch: expected {}, got {}",
+                state_shape, state_out.shape()
+            ),
+        });
+    }
+
+    let lengths_len = lengths.shape().len();
+    if lengths_len != b_size {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "lengths size mismatch: expected {}, got {}",
+                b_size, lengths_len
+            ),
+        });
+    }
+
+    if !w_decay.is_contiguous() || !q.is_contiguous() || !k.is_contiguous()
+        || !v.is_contiguous() || !a.is_contiguous() || !b.is_contiguous()
+        || !state_in.is_contiguous() || !output.is_contiguous() || !state_out.is_contiguous()
+        || !lengths.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_f16_masked requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_f16_masked(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            lengths.as_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Extract shift states at the correct positions based on per-batch lengths.
 ///
 /// For each batch element b, extracts x[:, length[b]-1, b] instead of x[:, T-1, b].
@@ -1930,3 +2609,210 @@ pub fn broadcast_mul_f32(
     }
 }
 
+pub fn add_f16(
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if a.len() != b.len() || a.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: a={}, b={}, output={}",
+                a.len(), b.len(), output.len()
+            ),
+        });
+    }
+    if !a.is_contiguous() || !b.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "add_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_add_f16(
+            a.as_ptr(),
+            b.as_ptr(),
+            output.as_mut_ptr(),
+            a.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn mul_f16(
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if a.len() != b.len() || a.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: a={}, b={}, output={}",
+                a.len(), b.len(), output.len()
+            ),
+        });
+    }
+    if !a.is_contiguous() || !b.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "mul_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_mul_f16(
+            a.as_ptr(),
+            b.as_ptr(),
+            output.as_mut_ptr(),
+            a.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn negate_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "negate_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_negate_f16(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn exp_f16(
+    input: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "exp_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_exp_f16(
+            input.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn broadcast_add_f16(
+    input: &TensorHip<f16>,
+    bias: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if input.len() % bias.len() != 0 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Broadcast incompatible: input len {} not divisible by bias len {}",
+                input.len(), bias.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !bias.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "broadcast_add_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_broadcast_add_f16(
+            input.as_ptr(),
+            bias.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            bias.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+pub fn broadcast_mul_f16(
+    input: &TensorHip<f16>,
+    scale: &TensorHip<f16>,
+    output: &mut TensorHip<f16>,
+    stream: &Stream,
+) -> Result<()> {
+    if input.len() != output.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Size mismatch: input={}, output={}",
+                input.len(), output.len()
+            ),
+        });
+    }
+    if input.len() % scale.len() != 0 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Broadcast incompatible: input len {} not divisible by scale len {}",
+                input.len(), scale.len()
+            ),
+        });
+    }
+    if !input.is_contiguous() || !scale.is_contiguous() || !output.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "broadcast_mul_f16 requires contiguous tensors".to_string(),
+        });
+    }
+    unsafe {
+        check(launch_broadcast_mul_f16(
+            input.as_ptr(),
+            scale.as_ptr(),
+            output.as_mut_ptr(),
+            input.len() as c_int,
+            scale.len() as c_int,
+            stream.handle(),
+        ))
+    }
+}

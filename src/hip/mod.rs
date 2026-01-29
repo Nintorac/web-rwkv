@@ -95,6 +95,7 @@ pub use model::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::f16;
 
     #[test]
     fn test_hip_feature_compiles() {
@@ -1428,15 +1429,15 @@ mod tests {
 
         // Fill with values
         for s in &mut state.att_states { s.as_slice_mut().fill(1.0); }
-        for s in &mut state.att_shift_states { s.as_slice_mut().fill(2.0); }
-        for s in &mut state.ffn_states { s.as_slice_mut().fill(3.0); }
+        for s in &mut state.att_shift_states { s.as_slice_mut().fill(f16::from_f32(2.0)); }
+        for s in &mut state.ffn_states { s.as_slice_mut().fill(f16::from_f32(3.0)); }
 
         state.reset();
 
         // All should be zero
         assert!(state.att_states.iter().all(|s| s.as_slice().iter().all(|&x| x == 0.0)));
-        assert!(state.att_shift_states.iter().all(|s| s.as_slice().iter().all(|&x| x == 0.0)));
-        assert!(state.ffn_states.iter().all(|s| s.as_slice().iter().all(|&x| x == 0.0)));
+        assert!(state.att_shift_states.iter().all(|s| s.as_slice().iter().all(|&x| x == f16::from_f32(0.0))));
+        assert!(state.ffn_states.iter().all(|s| s.as_slice().iter().all(|&x| x == f16::from_f32(0.0))));
         assert!(state.v_first.is_none());
 
         println!("HipState reset test PASSED");
@@ -1459,8 +1460,8 @@ mod tests {
         assert!(state.v_first.is_none(), "New state should have v_first = None");
 
         // Set v_first and verify it persists
-        let mut v_first_buf = PinnedBuffer::new(64).expect("Failed to allocate v_first");
-        v_first_buf.as_slice_mut().fill(1.0);
+        let mut v_first_buf = PinnedBuffer::<f16>::new(64).expect("Failed to allocate v_first");
+        v_first_buf.as_slice_mut().fill(f16::from_f32(1.0));
         state.v_first = Some(v_first_buf);
         assert!(state.v_first.is_some(), "v_first should persist after assignment");
         assert_eq!(state.v_first.as_ref().unwrap().len(), 64);

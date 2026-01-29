@@ -1087,7 +1087,7 @@ mod tests {
             let att_unpadded = state_unpadded.att_shift_states[layer].as_slice();
             let att_padded = state_padded.att_shift_states[layer].as_slice();
             for i in 0..n_embd {
-                let diff = (att_unpadded[i] - att_padded[i]).abs();
+                let diff = (att_unpadded[i].to_f32() - att_padded[i].to_f32()).abs();
                 max_att_diff = max_att_diff.max(diff);
             }
 
@@ -1095,7 +1095,7 @@ mod tests {
             let ffn_unpadded = state_unpadded.ffn_states[layer].as_slice();
             let ffn_padded = state_padded.ffn_states[layer].as_slice();
             for i in 0..n_embd {
-                let diff = (ffn_unpadded[i] - ffn_padded[i]).abs();
+                let diff = (ffn_unpadded[i].to_f32() - ffn_padded[i].to_f32()).abs();
                 max_ffn_diff = max_ffn_diff.max(diff);
             }
         }

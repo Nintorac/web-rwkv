@@ -1,4 +1,5 @@
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use half::f16;
 
 /// HIP error codes
 pub type HipError = c_int;
@@ -113,16 +114,32 @@ extern "C" {
     pub fn hip_event_query(event: HipEvent) -> HipError;
     pub fn hip_get_error_string(error: HipError) -> *const c_char;
     pub fn launch_copy_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_copy_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_decay_exp_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_lerp_f32(a: *const f32, b: *const f32, t: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_lerp_f16(a: *const f16, b: *const f16, t: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_sigmoid_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_sigmoid_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_squared_relu_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_squared_relu_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_softplus_decay_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_softplus_decay_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_layer_norm_f32(
         input: *const f32,
         weight: *const f32,
         bias: *const f32,
         output: *mut f32,
+        c: c_int,
+        n: c_int,
+        eps: f32,
+        stream: HipStream
+    ) -> HipError;
+    pub fn launch_layer_norm_f16(
+        input: *const f16,
+        weight: *const f16,
+        bias: *const f16,
+        output: *mut f16,
         c: c_int,
         n: c_int,
         eps: f32,
@@ -139,6 +156,17 @@ extern "C" {
         eps: f32,
         stream: HipStream
     ) -> HipError;
+    pub fn launch_group_norm_f16(
+        input: *const f16,
+        weight: *const f16,
+        bias: *const f16,
+        output: *mut f16,
+        c: c_int,
+        n: c_int,
+        g: c_int,
+        eps: f32,
+        stream: HipStream
+    ) -> HipError;
     pub fn launch_l2_norm_f32(
         input: *const f32,
         output: *mut f32,
@@ -148,7 +176,17 @@ extern "C" {
         eps: f32,
         stream: HipStream
     ) -> HipError;
+    pub fn launch_l2_norm_f16(
+        input: *const f16,
+        output: *mut f16,
+        c: c_int,
+        n: c_int,
+        head_size: c_int,
+        eps: f32,
+        stream: HipStream
+    ) -> HipError;
     pub fn launch_tanh_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_tanh_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_token_shift_f32(
         x: *const f32,
         state_in: *const f32,
@@ -170,12 +208,35 @@ extern "C" {
         b: c_int,
         stream: HipStream
     ) -> HipError;
+    pub fn launch_channel_mix_state_f16(
+        x: *const f16,
+        state_in: *const f16,
+        x_k: *const f16,
+        output: *mut f16,
+        state_out: *mut f16,
+        c: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
     pub fn launch_channel_mix_state_f32_masked(
         x: *const f32,
         state_in: *const f32,
         x_k: *const f32,
         output: *mut f32,
         state_out: *mut f32,
+        lengths: *const c_int,
+        c: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
+    pub fn launch_channel_mix_state_f16_masked(
+        x: *const f16,
+        state_in: *const f16,
+        x_k: *const f16,
+        output: *mut f16,
+        state_out: *mut f16,
         lengths: *const c_int,
         c: c_int,
         t: c_int,
@@ -194,11 +255,33 @@ extern "C" {
         b: c_int,    // batch
         stream: HipStream
     ) -> HipError;
+    pub fn launch_wkv_bonus_f16(
+        r: *const f16,
+        k: *const f16,
+        v: *const f16,
+        r_k: *const f16,
+        output: *mut f16,
+        n: c_int,
+        h: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
     pub fn launch_control_k_f32(
         k_a: *const f32,   // per-channel weight [C, 1, 1, 1]
         a: *const f32,     // attention [C, T, B, 1]
         k: *const f32,     // key [C, T, B, 1]
         output: *mut f32,  // output [C, T, B, 1]
+        c: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
+    pub fn launch_control_k_f16(
+        k_a: *const f16,
+        a: *const f16,
+        k: *const f16,
+        output: *mut f16,
         c: c_int,
         t: c_int,
         b: c_int,
@@ -237,14 +320,37 @@ extern "C" {
         b: c_int,    // batch
         stream: HipStream
     ) -> HipError;
+    pub fn launch_wkv7_f16_masked(
+        w_decay: *const f16,
+        q: *const f16,
+        k: *const f16,
+        v: *const f16,
+        a: *const f16,
+        b: *const f16,
+        state_in: *const f32,
+        output: *mut f16,
+        state_out: *mut f32,
+        lengths: *const c_int,
+        n: c_int,
+        h: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream
+    ) -> HipError;
 
     // Elementwise operations for GPU-native forward pass
     pub fn launch_add_f32(a: *const f32, b: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_add_f16(a: *const f16, b: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_mul_f32(a: *const f32, b: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_mul_f16(a: *const f16, b: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_negate_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_negate_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_exp_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
     pub fn launch_broadcast_add_f32(input: *const f32, bias: *const f32, output: *mut f32, n: c_int, bias_len: c_int, stream: HipStream) -> HipError;
+    pub fn launch_broadcast_add_f16(input: *const f16, bias: *const f16, output: *mut f16, n: c_int, bias_len: c_int, stream: HipStream) -> HipError;
     pub fn launch_broadcast_mul_f32(input: *const f32, scale: *const f32, output: *mut f32, n: c_int, scale_len: c_int, stream: HipStream) -> HipError;
+    pub fn launch_broadcast_mul_f16(input: *const f16, scale: *const f16, output: *mut f16, n: c_int, scale_len: c_int, stream: HipStream) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     pub fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
@@ -461,4 +567,3 @@ pub fn device_supports_cooperative_launch(device_id: i32) -> Result<bool> {
     unsafe { check(hip_supports_cooperative_launch(device_id, &mut supported))? };
     Ok(supported != 0)
 }
-

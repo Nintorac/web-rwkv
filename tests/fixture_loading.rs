@@ -8,6 +8,7 @@
 mod common;
 
 use common::{assert_tensors_close, TestFixture};
+use half::f16;
 use std::path::Path;
 
 /// Check if fixtures have been generated
@@ -2164,9 +2165,11 @@ fn debug_hip_forward_extended() {
     let head_size = model.info.head_size;
     let t = tokens.len();
     let b = 1;
+
+    let to_f32 = |data: Vec<f16>| data.into_iter().map(|v| v.to_f32()).collect::<Vec<f32>>();
     
     // Get embedding data (CPU storage - no GPU transfer needed)
-    let emb_data = &model.embed.w;
+    let emb_data: Vec<f32> = model.embed.w.iter().map(|v| v.to_f32()).collect();
     
     // Manual embedding lookup
     let mut x = vec![0.0f32; n_embd * t * b];
@@ -2180,8 +2183,8 @@ fn debug_hip_forward_extended() {
     println!("After embedding x[0:10]: {:?}", &x[0..10]);
     
     // ln0
-    let ln0_w = model.embed.ln.weight.to_vec(&stream).unwrap();
-    let ln0_b = model.embed.ln.bias.to_vec(&stream).unwrap();
+    let ln0_w = to_f32(model.embed.ln.weight.to_vec(&stream).unwrap());
+    let ln0_b = to_f32(model.embed.ln.bias.to_vec(&stream).unwrap());
     x = hip_layer_norm(&x, &ln0_w, &ln0_b, n_embd, t * b, 1e-5).unwrap();
     println!("After ln0 x[0:10]: {:?}", &x[0..10]);
     
@@ -2189,21 +2192,21 @@ fn debug_hip_forward_extended() {
     let layer = &model.layers[0];
     
     // ln1
-    let ln1_w = layer.att_ln.weight.to_vec(&stream).unwrap();
-    let ln1_b = layer.att_ln.bias.to_vec(&stream).unwrap();
+    let ln1_w = to_f32(layer.att_ln.weight.to_vec(&stream).unwrap());
+    let ln1_b = to_f32(layer.att_ln.bias.to_vec(&stream).unwrap());
     let x_ln1 = hip_layer_norm(&x, &ln1_w, &ln1_b, n_embd, t * b, 1e-5).unwrap();
     println!("After ln1 x[0:10]: {:?}", &x_ln1[0..10]);
     
     // Token shift for xr
     let att_shift_state = vec![0.0f32; n_embd * b];
-    let x_r = layer.att.x_r.to_vec(&stream).unwrap();
+    let x_r = to_f32(layer.att.x_r.to_vec(&stream).unwrap());
     println!("x_r[0:10]: {:?}", &x_r[0..10]);
     
     let (xr, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_r, n_embd, t, b).unwrap();
     println!("After token shift xr[0:10]: {:?}", &xr[0..10]);
     
     // r projection
-    let w_r = layer.att.w_r.to_vec(&stream).unwrap();
+    let w_r = to_f32(layer.att.w_r.to_vec(&stream).unwrap());
     println!("w_r shape: [{}, {}]", model.info.n_embd, model.info.n_embd);
     println!("w_r[0:10]: {:?}", &w_r[0..10]);
     
@@ -2211,27 +2214,27 @@ fn debug_hip_forward_extended() {
     println!("After r projection r[0:10]: {:?}", &r[0..10]);
     
     // Also check k, v projections
-    let x_k = layer.att.x_k.to_vec(&stream).unwrap();
+    let x_k = to_f32(layer.att.x_k.to_vec(&stream).unwrap());
     let (xk, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_k, n_embd, t, b).unwrap();
-    let w_k = layer.att.w_k.to_vec(&stream).unwrap();
+    let w_k = to_f32(layer.att.w_k.to_vec(&stream).unwrap());
     let k = hip_sgemm(&w_k, &xk, n_embd, n_embd, t * b).unwrap();
     println!("After k projection k[0:10]: {:?}", &k[0..10]);
     
-    let x_v = layer.att.x_v.to_vec(&stream).unwrap();
+    let x_v = to_f32(layer.att.x_v.to_vec(&stream).unwrap());
     let (xv, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_v, n_embd, t, b).unwrap();
-    let w_v = layer.att.w_v.to_vec(&stream).unwrap();
+    let w_v = to_f32(layer.att.w_v.to_vec(&stream).unwrap());
     let v = hip_sgemm(&w_v, &xv, n_embd, n_embd, t * b).unwrap();
     println!("After v projection v[0:10]: {:?}", &v[0..10]);
     
     // w computation
-    let w0 = layer.att.w0.to_vec(&stream).unwrap();
-    let w1 = layer.att.w1.to_vec(&stream).unwrap();
-    let w2 = layer.att.w2.to_vec(&stream).unwrap();
+    let w0 = to_f32(layer.att.w0.to_vec(&stream).unwrap());
+    let w1 = to_f32(layer.att.w1.to_vec(&stream).unwrap());
+    let w2 = to_f32(layer.att.w2.to_vec(&stream).unwrap());
     println!("w0[0:10]: {:?}", &w0[0..10]);
     println!("w1 len: {} (expect {})", w1.len(), 64 * 768);
     println!("w2 len: {} (expect {})", w2.len(), 768 * 64);
     
-    let x_w = layer.att.x_w.to_vec(&stream).unwrap();
+    let x_w = to_f32(layer.att.x_w.to_vec(&stream).unwrap());
     let (xw, _) = hip_channel_mix_state(&x_ln1, &att_shift_state, &x_w, n_embd, t, b).unwrap();
     
     // w_lora1 = tanh(xw @ w1.T)
