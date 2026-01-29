@@ -26,9 +26,8 @@
 //! ```
 
 use half::f16;
-use ndarray_npy::NpzReader;
+use npyz::npz::NpzArchive;
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::Path;
 
 /// Tolerance specifications for different tensor types.
@@ -69,8 +68,8 @@ impl Tolerances {
 
 /// Supported array types in fixtures.
 ///
-/// Note: f16 arrays are stored as f32 in the fixtures for compatibility.
-/// The original dtype is tracked via the `{name}_dtype` field.
+/// Note: f16 arrays are stored natively in fixtures; we upcast to f32 when loading
+/// for compatibility with existing test helpers.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants are used by future HIP kernel tests
 pub enum FixtureArray {
@@ -97,44 +96,56 @@ impl TestFixture {
     /// - i64 arrays (shape arrays)
     /// - String arrays (dtype metadata)
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(path.as_ref())?;
-        let mut npz = NpzReader::new(file)?;
+        let mut npz = NpzArchive::open(path.as_ref())?;
 
         let mut data = HashMap::new();
 
-        for name in npz.names()? {
-            let name_clone = name.clone();
+        let names: Vec<String> = npz.array_names().map(|name| name.to_string()).collect();
 
-            // First try to read as f32 (most common for tensor data)
-            if let Ok(arr) = npz.by_name::<ndarray::OwnedRepr<f32>, ndarray::IxDyn>(&name) {
-                let (vec, _offset) = arr.into_raw_vec_and_offset();
-                data.insert(name_clone, FixtureArray::F32(vec));
+        for name in names {
+            let Some(npy) = npz.by_name(&name)? else {
+                continue;
+            };
+
+            let dtype = npy.dtype().descr();
+
+            if dtype.contains("f2") {
+                let vec = npy.into_vec::<f16>()?;
+                let vec_f32: Vec<f32> = vec.iter().map(|v| v.to_f32()).collect();
+                data.insert(name, FixtureArray::F32(vec_f32));
                 continue;
             }
 
-            // Try i32 (for token arrays)
-            if let Ok(arr) = npz.by_name::<ndarray::OwnedRepr<i32>, ndarray::IxDyn>(&name) {
-                let (vec, _offset) = arr.into_raw_vec_and_offset();
-                data.insert(name_clone, FixtureArray::I32(vec));
+            if dtype.contains("f4") {
+                let vec = npy.into_vec::<f32>()?;
+                data.insert(name, FixtureArray::F32(vec));
                 continue;
             }
 
-            // Try i64 (for shape arrays)
-            if let Ok(arr) = npz.by_name::<ndarray::OwnedRepr<i64>, ndarray::IxDyn>(&name) {
-                let (vec, _offset) = arr.into_raw_vec_and_offset();
-                data.insert(name_clone, FixtureArray::I64(vec));
+            if dtype.contains("i4") {
+                let vec = npy.into_vec::<i32>()?;
+                data.insert(name, FixtureArray::I32(vec));
                 continue;
             }
 
-            // Try u32 (for cursor arrays and token IDs)
-            if let Ok(arr) = npz.by_name::<ndarray::OwnedRepr<u32>, ndarray::IxDyn>(&name) {
-                let (vec, _offset) = arr.into_raw_vec_and_offset();
-                data.insert(name_clone, FixtureArray::U32(vec));
+            if dtype.contains("i8") {
+                let vec = npy.into_vec::<i64>()?;
+                data.insert(name, FixtureArray::I64(vec));
                 continue;
             }
 
-            // Skip string arrays (dtype metadata) - they're not critical for loading
-            // but we note them for debugging
+            if dtype.contains("u4") {
+                let vec = npy.into_vec::<u32>()?;
+                data.insert(name, FixtureArray::U32(vec));
+                continue;
+            }
+
+            if dtype.contains("|S") || dtype.contains("<U") || dtype.contains("|U") {
+                let vec = npy.into_vec::<String>()?;
+                let value = vec.join(",");
+                data.insert(name, FixtureArray::Str(value));
+                continue;
+            }
         }
 
         Ok(Self { data })

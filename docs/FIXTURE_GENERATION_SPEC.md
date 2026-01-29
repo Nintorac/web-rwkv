@@ -572,7 +572,7 @@ use std::io::Read;
 use std::path::Path;
 
 use half::f16;
-use ndarray_npy::NpzReader;
+use npyz::npz::NpzArchive;
 
 pub struct TestFixture {
     pub data: HashMap<String, FixtureArray>,
@@ -587,7 +587,7 @@ pub enum FixtureArray {
 
 impl TestFixture {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(path)?;
+        let mut npz = NpzArchive::open(path)?;
         let mut npz = NpzReader::new(file)?;
 
         let mut data = HashMap::new();

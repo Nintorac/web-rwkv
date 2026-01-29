@@ -90,12 +90,12 @@ def save_fixture(path: Path, **tensors: Dict[str, Tuple[np.ndarray, Tuple[int, .
     Save tensors to NPZ with flattened data and explicit 4D shapes.
 
     Convention: for each key 'x', store:
-    - 'x' (1D flattened as float32 for Rust compatibility)
+    - 'x' (1D flattened, stored in native dtype)
     - 'x_shape' (i64[4])
     - 'x_dtype' (string like "float16" or "float32")
 
     This matches the web-rwkv tensor layout where shape[0] is the fastest axis.
-    Arrays are saved as float32 because ndarray-npy doesn't support float16.
+    Arrays are saved with their native dtype.
 
     Args:
         path: Output .npz file path
@@ -118,12 +118,7 @@ def save_fixture(path: Path, **tensors: Dict[str, Tuple[np.ndarray, Tuple[int, .
 
         flat = arr.reshape(-1)
 
-        # Save as float32 for Rust compatibility (ndarray-npy doesn't support f16)
-        # Record original dtype so it can be converted back if needed
-        if flat.dtype == np.float16:
-            flat = flat.astype(np.float32)
-        elif flat.dtype == np.float64:
-            flat = flat.astype(np.float32)
+        # Keep native dtype in NPZ payload
 
         payload[name] = flat
         payload[f"{name}_shape"] = np.array(shape4, dtype=np.int64)

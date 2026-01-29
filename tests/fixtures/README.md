@@ -46,27 +46,25 @@ Each `.npz` file contains NumPy arrays with this convention:
 - `{name}_shape`: 4-element int64 array with web-rwkv Shape(d0, d1, d2, d3)
 - `{name}_dtype`: Original dtype string (e.g., "float16", "float32")
 
-**Note**: Arrays are stored as float32 because `ndarray-npy` doesn't support float16.
+**Note**: Arrays are stored in their native dtype (e.g., float16 for activations).
 The original dtype is recorded so tests can convert back if needed.
 
 Example loading in Python:
 ```python
 import numpy as np
 data = np.load('kernels/sigmoid/basic.npz')
-input_flat = data['input']           # float32 array
+input_flat = data['input']           # float16 array
 input_shape = data['input_shape']    # [768, 512, 1, 1] = Shape(C, A, 1, 1)
 input_dtype = data['input_dtype'][0] # "float16" - original dtype
 ```
 
-Example loading in Rust (with ndarray-npy):
+Example loading in Rust (with npyz):
 ```rust
-use ndarray_npy::NpzReader;
+use npyz::npz::NpzArchive;
 
-let file = File::open("kernels/sigmoid/basic.npz")?;
-let mut npz = NpzReader::new(file)?;
-let input: Vec<f32> = npz.by_name("input")?.into_raw_vec();
-let shape: Vec<i64> = npz.by_name("input_shape")?.into_raw_vec();
-// Convert to f16 if needed using the half crate
+let mut npz = NpzArchive::open("kernels/sigmoid/basic.npz")?;
+let input = npz.by_name("input")?.unwrap().into_vec::<half::f16>()?;
+let shape = npz.by_name("input_shape")?.unwrap().into_vec::<i64>()?;
 ```
 
 ## Tolerance Guidelines
