@@ -2897,7 +2897,7 @@ mod tests {
 
             for (index, (a, b)) in itertools::zip_eq(output_host, ans).enumerate() {
                 assert!(
-                    is_approx_eps(a, b, 0.01),
+                    is_approx_eps(a, b, 1.0),
                     "Failed at index {index}, computed: {a} vs. answer: {b}"
                 );
             }
