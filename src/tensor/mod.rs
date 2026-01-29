@@ -20,6 +20,7 @@ use crate::{
 pub mod cache;
 pub mod matrix;
 pub mod ops;
+pub mod prof;
 pub mod serialization;
 pub mod shape;
 

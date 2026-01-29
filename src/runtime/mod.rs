@@ -9,6 +9,7 @@ use thiserror::Error;
 pub mod infer;
 pub mod loader;
 pub mod model;
+pub mod profiling;
 pub mod softmax;
 pub mod v4;
 pub mod v5;
