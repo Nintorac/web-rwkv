@@ -509,6 +509,8 @@ pub struct Bundle<F: Float> {
     buffers: ResourceCache<usize, Runtime<F>>,
     headers: ResourceCache<usize, Header<F>>,
     phantom: PhantomData<F>,
+    #[cfg(feature = "wgpu-prof")]
+    profiler: std::sync::Arc<std::sync::Mutex<crate::tensor::prof::WgpuProf>>,
 }
 
 impl<F: Float> Bundle<F> {
@@ -520,10 +522,15 @@ impl<F: Float> Bundle<F> {
             let shape = Shape::new(info.num_emb, head_size + 2, num_batch, 1);
             let data = (0..info.num_layer).map(|_| context.zeros(shape)).collect();
             State {
-                context,
+                context: context.clone(),
                 info,
                 data,
             }
+        };
+        #[cfg(feature = "wgpu-prof")]
+        let profiler = {
+            let prof = crate::tensor::prof::WgpuProf::new("v7", &model.context.device, &model.context.queue);
+            std::sync::Arc::new(std::sync::Mutex::new(prof))
         };
         Self {
             model,
@@ -532,6 +539,8 @@ impl<F: Float> Bundle<F> {
             buffers: ResourceCache::new(4),
             headers: ResourceCache::new(4),
             phantom: PhantomData,
+            #[cfg(feature = "wgpu-prof")]
+            profiler,
         }
     }
 
@@ -540,6 +549,13 @@ impl<F: Float> Bundle<F> {
             hooks: Arc::new(hooks),
             ..Self::new(model, num_batch)
         }
+    }
+
+    /// Get access to the profiler (when `wgpu-prof` feature is enabled).
+    /// Use this to call `resolve`, `accumulate`, and `print` methods after inference.
+    #[cfg(feature = "wgpu-prof")]
+    pub fn profiler(&self) -> std::sync::Arc<std::sync::Mutex<crate::tensor::prof::WgpuProf>> {
+        self.profiler.clone()
     }
 
     fn checkout_buffer(
@@ -646,17 +662,18 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
             #[cfg(feature = "trace")]
             let _span = tracing::trace_span!("embed").entered();
 
-            ops.extend([
+            let embed_ops = TensorOp::List(vec![
                 hook_op(Hook::PostEmbedLoaded)?,
-                TensorOp::layer_norm(
+                TensorOp::labeled("embed_ln", TensorOp::layer_norm(
                     &tensor.embed.ln.w,
                     &tensor.embed.ln.b,
                     &buffer.input,
                     Model::LN_EPS,
-                )?,
+                )?),
                 TensorOp::blit(&buffer.input, &buffer.x)?,
                 hook_op(Hook::PostEmbedLayerNorm)?,
             ]);
+            ops.push(TensorOp::labeled("embed", embed_ops));
         };
 
         for (index, layer) in tensor.layers.iter().enumerate() {
@@ -676,7 +693,8 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
                 head_size,
                 model.rescale,
             )?;
-            ops.push(op);
+            // Label each layer for profiling
+            ops.push(TensorOp::labeled("layer", op));
 
             if (index + 1) % model.sep == 0 {
                 ops.push(TensorOp::Sep);
@@ -692,13 +710,21 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
             let head = model.tensor.head.clone();
 
             let op = dispatch_header(hooks, frame, head, head_x, num_header, head_op)?;
-            ops.push(op);
+            ops.push(TensorOp::labeled("head", op));
         }
 
         let commands = {
             #[cfg(feature = "trace")]
             let _span = tracing::trace_span!("encode").entered();
-            context.encode(&TensorOp::List(ops))
+            #[cfg(feature = "wgpu-prof")]
+            {
+                let mut profiler = self.profiler.lock().unwrap();
+                context.encode_profiled(&TensorOp::List(ops), &mut profiler)
+            }
+            #[cfg(not(feature = "wgpu-prof"))]
+            {
+                context.encode(&TensorOp::List(ops))
+            }
         };
 
         Ok(RnnJob {
@@ -758,174 +784,217 @@ fn dispatch_layer<F: Float>(
 
     let mut ops = vec![];
 
+    // att_ln: attention layer norm
     ops.extend([
         TensorOp::blit(&buffer.x, &buffer.att_x)?,
         hook_op(Hook::PreAtt(index))?,
+    ]);
+    ops.push(TensorOp::labeled(
+        "att_ln",
         TensorOp::layer_norm(
             &layer.att_ln.w,
             &layer.att_ln.b,
             &buffer.att_x,
             Model::LN_EPS,
         )?,
-        hook_op(Hook::PostAttLayerNorm(index))?,
-        hook_op(Hook::PreAttTokenShift(index))?,
-        TensorOp::token_shift(
-            &buffer.cursors,
-            &layer.att.x_r,
-            state.att(index)?,
-            &buffer.att_x,
-            &buffer.att_rx,
-            true,
-        )?,
-        TensorOp::token_shift(
-            &buffer.cursors,
-            &layer.att.x_w,
-            state.att(index)?,
-            &buffer.att_x,
-            &buffer.att_wx,
-            true,
-        )?,
-        TensorOp::token_shift(
-            &buffer.cursors,
-            &layer.att.x_k,
-            state.att(index)?,
-            &buffer.att_x,
-            &buffer.att_kx,
-            true,
-        )?,
-        TensorOp::token_shift(
-            &buffer.cursors,
-            &layer.att.x_v,
-            state.att(index)?,
-            &buffer.att_x,
-            &buffer.att_vx,
-            true,
-        )?,
-        TensorOp::token_shift(
-            &buffer.cursors,
-            &layer.att.x_a,
-            state.att(index)?,
-            &buffer.att_x,
-            &buffer.att_ax,
-            true,
-        )?,
-        TensorOp::token_shift(
-            &buffer.cursors,
-            &layer.att.x_g,
-            state.att(index)?,
-            &buffer.att_x,
-            &buffer.att_gx,
-            true,
-        )?,
-        hook_op(Hook::PostAttTokenShift(index))?,
-        hook_op(Hook::PreAttLinear(index))?,
-        layer.att.w_r.matmul_op(
-            &buffer.att_rx,
-            &buffer.att_r,
-            Activation::None,
-            turbo(num_token),
-        )?,
-        layer.att.w_k.matmul_op(
-            &buffer.att_kx,
-            &buffer.att_k,
-            Activation::None,
-            turbo(num_token),
-        )?,
-        layer.att.w_v.matmul_op(
-            &buffer.att_vx,
-            &buffer.att_v,
-            Activation::None,
-            turbo(num_token),
-        )?,
-        hook_op(Hook::PostAttLinear(index))?,
-        hook_op(Hook::PreAttAdapt(index))?,
-        layer.att.w1.matmul_op(
-            &buffer.att_wx,
-            &buffer.aux_w,
-            Activation::Tanh,
-            turbo(num_token),
-        )?,
-        layer.att.w2.matmul_op(
-            &buffer.aux_w,
-            &buffer.att_w,
-            Activation::None,
-            turbo(num_token),
-        )?,
-        TensorOp::add(&layer.att.w0, &buffer.att_w)?,
-        layer.att.a1.matmul_op(
-            &buffer.att_ax,
-            &buffer.aux_a,
-            Activation::None,
-            turbo(num_token),
-        )?,
-        layer.att.a2.matmul_op(
-            &buffer.aux_a,
-            &buffer.att_a,
-            Activation::None,
-            turbo(num_token),
-        )?,
-        TensorOp::add_activate(
-            &layer.att.a0,
-            &buffer.att_a,
-            Activation::None,
-            Activation::None,
-            Activation::Sigmoid,
-        )?,
-        layer.att.g1.matmul_op(
-            &buffer.att_gx,
-            &buffer.aux_g,
-            Activation::Sigmoid,
-            turbo(num_token),
-        )?,
-        layer.att.g2.matmul_op(
-            &buffer.aux_g,
-            &buffer.att_g,
-            Activation::None,
-            turbo(num_token),
-        )?,
-        hook_op(Hook::PostAttAdapt(index))?,
-        hook_op(Hook::PreAttControl(index))?,
-        TensorOp::blit(&buffer.att_k, &buffer.att_kk)?,
-        TensorOp::mul(&layer.att.k_k, &buffer.att_kk)?,
-        TensorOp::l2_norm(&att_kk, Model::L2_EPS)?,
-        TensorOp::control_k_v7(&layer.att.k_a, &buffer.att_a, &buffer.att_k)?,
-        hook_op(Hook::PostAttControl(index))?,
-    ]);
+    ));
+    ops.push(hook_op(Hook::PostAttLayerNorm(index))?);
 
-    ops.push(hook_op(Hook::PreAttValueResidual(index))?);
-    match index {
-        0 => ops.push(TensorOp::blit(&buffer.att_v, &buffer.att_v0)?),
-        _ => ops.extend([
-            layer.att.v1.matmul_op(
+    // att_shift: token shift operations for attention
+    ops.push(hook_op(Hook::PreAttTokenShift(index))?);
+    ops.push(TensorOp::labeled(
+        "att_shift",
+        TensorOp::List(vec![
+            TensorOp::token_shift(
+                &buffer.cursors,
+                &layer.att.x_r,
+                state.att(index)?,
+                &buffer.att_x,
+                &buffer.att_rx,
+                true,
+            )?,
+            TensorOp::token_shift(
+                &buffer.cursors,
+                &layer.att.x_w,
+                state.att(index)?,
+                &buffer.att_x,
+                &buffer.att_wx,
+                true,
+            )?,
+            TensorOp::token_shift(
+                &buffer.cursors,
+                &layer.att.x_k,
+                state.att(index)?,
+                &buffer.att_x,
+                &buffer.att_kx,
+                true,
+            )?,
+            TensorOp::token_shift(
+                &buffer.cursors,
+                &layer.att.x_v,
+                state.att(index)?,
+                &buffer.att_x,
                 &buffer.att_vx,
-                &buffer.aux_v,
+                true,
+            )?,
+            TensorOp::token_shift(
+                &buffer.cursors,
+                &layer.att.x_a,
+                state.att(index)?,
+                &buffer.att_x,
+                &buffer.att_ax,
+                true,
+            )?,
+            TensorOp::token_shift(
+                &buffer.cursors,
+                &layer.att.x_g,
+                state.att(index)?,
+                &buffer.att_x,
+                &buffer.att_gx,
+                true,
+            )?,
+        ]),
+    ));
+    ops.push(hook_op(Hook::PostAttTokenShift(index))?);
+
+    // att_proj: w_r, w_k, w_v matmuls
+    ops.push(hook_op(Hook::PreAttLinear(index))?);
+    ops.push(TensorOp::labeled(
+        "att_proj",
+        TensorOp::List(vec![
+            layer.att.w_r.matmul_op(
+                &buffer.att_rx,
+                &buffer.att_r,
                 Activation::None,
                 turbo(num_token),
             )?,
-            layer.att.v2.matmul_op(
-                &buffer.aux_v,
-                &buffer.att_vv,
+            layer.att.w_k.matmul_op(
+                &buffer.att_kx,
+                &buffer.att_k,
+                Activation::None,
+                turbo(num_token),
+            )?,
+            layer.att.w_v.matmul_op(
+                &buffer.att_vx,
+                &buffer.att_v,
+                Activation::None,
+                turbo(num_token),
+            )?,
+        ]),
+    ));
+    ops.push(hook_op(Hook::PostAttLinear(index))?);
+
+    // att_adapt: w1/w2, a1/a2, g1/g2 matmuls (decay/adapt/gate computations)
+    ops.push(hook_op(Hook::PreAttAdapt(index))?);
+    ops.push(TensorOp::labeled(
+        "att_adapt",
+        TensorOp::List(vec![
+            layer.att.w1.matmul_op(
+                &buffer.att_wx,
+                &buffer.aux_w,
+                Activation::Tanh,
+                turbo(num_token),
+            )?,
+            layer.att.w2.matmul_op(
+                &buffer.aux_w,
+                &buffer.att_w,
+                Activation::None,
+                turbo(num_token),
+            )?,
+            TensorOp::add(&layer.att.w0, &buffer.att_w)?,
+            layer.att.a1.matmul_op(
+                &buffer.att_ax,
+                &buffer.aux_a,
+                Activation::None,
+                turbo(num_token),
+            )?,
+            layer.att.a2.matmul_op(
+                &buffer.aux_a,
+                &buffer.att_a,
                 Activation::None,
                 turbo(num_token),
             )?,
             TensorOp::add_activate(
-                &layer.att.v0,
-                &buffer.att_vv,
+                &layer.att.a0,
+                &buffer.att_a,
                 Activation::None,
                 Activation::None,
                 Activation::Sigmoid,
             )?,
-            TensorOp::lerp(&buffer.att_v0, &buffer.att_v, &buffer.att_vv, true)?,
+            layer.att.g1.matmul_op(
+                &buffer.att_gx,
+                &buffer.aux_g,
+                Activation::Sigmoid,
+                turbo(num_token),
+            )?,
+            layer.att.g2.matmul_op(
+                &buffer.aux_g,
+                &buffer.att_g,
+                Activation::None,
+                turbo(num_token),
+            )?,
         ]),
+    ));
+    ops.push(hook_op(Hook::PostAttAdapt(index))?);
+
+    // att_ctrl_k: control_k operation
+    ops.push(hook_op(Hook::PreAttControl(index))?);
+    ops.push(TensorOp::labeled(
+        "att_ctrl_k",
+        TensorOp::List(vec![
+            TensorOp::blit(&buffer.att_k, &buffer.att_kk)?,
+            TensorOp::mul(&layer.att.k_k, &buffer.att_kk)?,
+            TensorOp::l2_norm(&att_kk, Model::L2_EPS)?,
+            TensorOp::control_k_v7(&layer.att.k_a, &buffer.att_a, &buffer.att_k)?,
+        ]),
+    ));
+    ops.push(hook_op(Hook::PostAttControl(index))?);
+
+    // att_vres: value residual operations
+    ops.push(hook_op(Hook::PreAttValueResidual(index))?);
+    match index {
+        0 => ops.push(TensorOp::labeled(
+            "att_vres",
+            TensorOp::blit(&buffer.att_v, &buffer.att_v0)?,
+        )),
+        _ => ops.push(TensorOp::labeled(
+            "att_vres",
+            TensorOp::List(vec![
+                layer.att.v1.matmul_op(
+                    &buffer.att_vx,
+                    &buffer.aux_v,
+                    Activation::None,
+                    turbo(num_token),
+                )?,
+                layer.att.v2.matmul_op(
+                    &buffer.aux_v,
+                    &buffer.att_vv,
+                    Activation::None,
+                    turbo(num_token),
+                )?,
+                TensorOp::add_activate(
+                    &layer.att.v0,
+                    &buffer.att_vv,
+                    Activation::None,
+                    Activation::None,
+                    Activation::Sigmoid,
+                )?,
+                TensorOp::lerp(&buffer.att_v0, &buffer.att_v, &buffer.att_vv, true)?,
+            ]),
+        )),
     };
     ops.push(hook_op(Hook::PostAttValueResidual(index))?);
 
+    // wkv: time_mix_v7 operation
+    ops.push(hook_op(Hook::PreAttTimeMix(index))?);
     ops.extend([
-        hook_op(Hook::PreAttTimeMix(index))?,
         TensorOp::blit(&buffer.att_k, buffer.att_n.view(.., .., 0, ..)?)?,
         TensorOp::blit(&buffer.att_v, buffer.att_n.view(.., .., 1, ..)?)?,
         TensorOp::blit(&buffer.att_a, buffer.att_n.view(.., .., 2, ..)?)?,
         TensorOp::blit(&buffer.att_kk, buffer.att_n.view(.., .., 3, ..)?)?,
+    ]);
+    ops.push(TensorOp::labeled(
+        "wkv",
         TensorOp::time_mix_v7(
             &buffer.cursors,
             state.att(index)?,
@@ -934,35 +1003,69 @@ fn dispatch_layer<F: Float>(
             &att_n,
             &att_x,
         )?,
+    ));
+
+    // wkv_norm: group_norm after wkv
+    ops.push(TensorOp::labeled(
+        "wkv_norm",
         TensorOp::group_norm(&layer.att.gn.w, &layer.att.gn.b, &att_x, Model::GN_EPS)?,
+    ));
+
+    // wkv_bonus: time_first_v7 operation
+    ops.push(TensorOp::labeled(
+        "wkv_bonus",
         TensorOp::time_first_v7(&layer.att.r_k, &att_r, &att_n, &att_x)?,
-        hook_op(Hook::PostAttTimeMix(index))?,
-        hook_op(Hook::PreAttGate(index))?,
+    ));
+    ops.push(hook_op(Hook::PostAttTimeMix(index))?);
+
+    // att_gate: gate multiplication
+    ops.push(hook_op(Hook::PreAttGate(index))?);
+    ops.push(TensorOp::labeled(
+        "att_gate",
         TensorOp::mul(&buffer.att_g, &buffer.att_x)?,
-        hook_op(Hook::PostAttGate(index))?,
-        hook_op(Hook::PreAttOut(index))?,
+    ));
+    ops.push(hook_op(Hook::PostAttGate(index))?);
+
+    // att_out: output projection matmul
+    ops.push(hook_op(Hook::PreAttOut(index))?);
+    ops.push(TensorOp::labeled(
+        "att_out",
         layer.att.w_o.matmul_op(
             &buffer.att_x,
             &buffer.att_o,
             Activation::None,
             turbo(num_token),
         )?,
-        hook_op(Hook::PostAttOut(index))?,
-        TensorOp::add(&buffer.att_o, &buffer.x)?,
-        hook_op(Hook::PostAtt(index))?,
-    ]);
+    ));
+    ops.push(hook_op(Hook::PostAttOut(index))?);
 
+    // att_resid: attention residual add
+    ops.push(TensorOp::labeled(
+        "att_resid",
+        TensorOp::add(&buffer.att_o, &buffer.x)?,
+    ));
+    ops.push(hook_op(Hook::PostAtt(index))?);
+
+    // ffn_ln: FFN layer norm
     ops.extend([
         TensorOp::blit(&buffer.x, &buffer.ffn_x)?,
         hook_op(Hook::PreFfn(index))?,
+    ]);
+    ops.push(TensorOp::labeled(
+        "ffn_ln",
         TensorOp::layer_norm(
             &layer.ffn_ln.w,
             &layer.ffn_ln.b,
             &buffer.ffn_x,
             Model::LN_EPS,
         )?,
-        hook_op(Hook::PostFfnLayerNorm(index))?,
-        hook_op(Hook::PreFfnTokenShift(index))?,
+    ));
+    ops.push(hook_op(Hook::PostFfnLayerNorm(index))?);
+
+    // ffn_shift: FFN token shift
+    ops.push(hook_op(Hook::PreFfnTokenShift(index))?);
+    ops.push(TensorOp::labeled(
+        "ffn_shift",
         TensorOp::token_shift(
             &buffer.cursors,
             &layer.ffn.x_k,
@@ -971,33 +1074,50 @@ fn dispatch_layer<F: Float>(
             &buffer.ffn_kx,
             true,
         )?,
-        hook_op(Hook::PostFfnTokenShift(index))?,
-        hook_op(Hook::PreFfnLinear(index))?,
+    ));
+    ops.push(hook_op(Hook::PostFfnTokenShift(index))?);
+
+    // ffn_k: FFN key matmul (with squared relu)
+    ops.push(hook_op(Hook::PreFfnLinear(index))?);
+    ops.push(TensorOp::labeled(
+        "ffn_k",
         layer.ffn.w_k.matmul_op(
             &buffer.ffn_kx,
             &buffer.ffn_k,
             Activation::SquaredRelu,
             turbo(num_token),
         )?,
-        hook_op(Hook::PostFfnActivate(index))?,
+    ));
+    ops.push(hook_op(Hook::PostFfnActivate(index))?);
+
+    // ffn_v: FFN value matmul
+    ops.push(TensorOp::labeled(
+        "ffn_v",
         layer.ffn.w_v.matmul_op_sparse(
             &buffer.ffn_k,
             &buffer.ffn_v,
             Activation::None,
             turbo(num_token),
         )?,
-        hook_op(Hook::PostFfnLinear(index))?,
-        hook_op(Hook::PreFfnChannelMix(index))?,
-        TensorOp::channel_mix_v7(
-            &buffer.cursors,
-            state.ffn(index)?,
-            &buffer.ffn_v,
-            &buffer.ffn_x,
-        )?,
-        hook_op(Hook::PostFfnChannelMix(index))?,
-        TensorOp::add(&buffer.ffn_x, &buffer.x)?,
-        hook_op(Hook::PostFfn(index))?,
-    ]);
+    ));
+    ops.push(hook_op(Hook::PostFfnLinear(index))?);
+
+    // ffn_resid: FFN residual (channel_mix + add)
+    ops.push(hook_op(Hook::PreFfnChannelMix(index))?);
+    ops.push(TensorOp::labeled(
+        "ffn_resid",
+        TensorOp::List(vec![
+            TensorOp::channel_mix_v7(
+                &buffer.cursors,
+                state.ffn(index)?,
+                &buffer.ffn_v,
+                &buffer.ffn_x,
+            )?,
+            TensorOp::add(&buffer.ffn_x, &buffer.x)?,
+        ]),
+    ));
+    ops.push(hook_op(Hook::PostFfnChannelMix(index))?);
+    ops.push(hook_op(Hook::PostFfn(index))?);
 
     if (index + 1).is_multiple_of(rescale) {
         ops.push(TensorOp::affine(&buffer.x, 0.5, 0.0)?);
@@ -1021,14 +1141,14 @@ fn dispatch_header<F: Float>(
     if num_header > 0 {
         ops.extend([
             hook_op(Hook::PreHead)?,
-            TensorOp::layer_norm(&head.ln.w, &head.ln.b, &head_x, Model::LN_EPS)?,
+            TensorOp::labeled("head_ln", TensorOp::layer_norm(&head.ln.w, &head.ln.b, &head_x, Model::LN_EPS)?),
             hook_op(Hook::PostHeadLayerNorm)?,
-            head.w.matmul_op(
+            TensorOp::labeled("head", head.w.matmul_op(
                 head_x.view(.., .., .., ..)?,
                 header.head_o.view(.., .., .., ..)?,
                 Activation::None,
                 turbo(num_header),
-            )?,
+            )?),
             hook_op(Hook::PostHead)?,
         ]);
     }
