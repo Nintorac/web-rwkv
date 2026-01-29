@@ -1,6 +1,7 @@
 //! RWKV7 HIP model loading and forward pass implementation.
 
 use half::f16;
+use half::slice::HalfFloatSliceExt;
 use std::sync::Mutex;
 use std::path::Path;
 
@@ -21,6 +22,20 @@ use super::kernels::{
 use super::blas::HipBlasContext;
 use super::scratch::HipScratch;
 use super::HipProf;
+
+/// Sync stream only when hip-prof feature is enabled.
+/// This gives accurate per-operation GPU timings at the cost of serialization.
+#[cfg(feature = "hip-prof")]
+#[inline]
+fn prof_sync(stream: &Stream) -> Result<()> {
+    stream.synchronize()
+}
+
+#[cfg(not(feature = "hip-prof"))]
+#[inline]
+fn prof_sync(_stream: &Stream) -> Result<()> {
+    Ok(())
+}
 
 #[cfg(feature = "hip-probes")]
 use crate::hip_probe;
@@ -1270,6 +1285,7 @@ impl Rwkv7Hip {
             unsafe {
                 scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
             }
+            prof_sync(stream)?;
             Ok(())
         })?;
 
@@ -1343,6 +1359,7 @@ impl Rwkv7Hip {
                     &x, &layer.att_ln.weight, &layer.att_ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1374,6 +1391,7 @@ impl Rwkv7Hip {
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
                     &mut att_xg, &mut temp1, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1385,6 +1403,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
                 ctx.hgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
                 ctx.hgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1395,6 +1414,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
                 broadcast_add_f16(&att_w, &layer.att.w0, &mut temp1, stream)?;
                 softplus_decay_f16(&temp1, &mut att_w, stream)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1404,6 +1424,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
                 broadcast_add_f16(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
                 sigmoid_f16(&temp1, &mut att_a, stream)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1412,6 +1433,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
                 sigmoid_f16(&lora_g, &mut lora_g_sig, stream)?;
                 ctx.hgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1472,6 +1494,7 @@ impl Rwkv7Hip {
                     &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
                     &lens_gpu, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
             std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
@@ -1504,6 +1527,7 @@ impl Rwkv7Hip {
             // Output projection
             prof.time("att_out", || {
                 ctx.hgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1529,6 +1553,7 @@ impl Rwkv7Hip {
                     &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
                     &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1538,6 +1563,7 @@ impl Rwkv7Hip {
             // Key projection
             prof.time("ffn_k", || {
                 ctx.hgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1550,6 +1576,7 @@ impl Rwkv7Hip {
             // Value projection
             prof.time("ffn_v", || {
                 ctx.hgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1569,13 +1596,16 @@ impl Rwkv7Hip {
             )?;
 
             ctx.hgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            prof_sync(stream)?;
             Ok(())
         })?;
 
-            // Download logits and return
-            logits
-                .to_vec(stream)
-                .map(|vals| vals.into_iter().map(|v| v.to_f32()).collect())
+            // Download logits and return (use SIMD bulk conversion)
+            prof.time("logits_dl", || {
+                logits
+                    .to_vec(stream)
+                    .map(|vals| vals.to_f32_vec())
+            })
         })();
 
         if use_resident_state {
@@ -1721,6 +1751,7 @@ impl Rwkv7Hip {
             unsafe {
                 scratch.emb_staging.copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
             }
+            prof_sync(stream)?;
             Ok(())
         })?;
 
@@ -1794,6 +1825,7 @@ impl Rwkv7Hip {
                     &x, &layer.att_ln.weight, &layer.att_ln.bias,
                     &mut x_ln, 1e-5, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1825,6 +1857,7 @@ impl Rwkv7Hip {
                     &x_ln, &att_shift_gpu[layer_idx], &layer.att.x_g,
                     &mut att_xg, &mut temp1, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1836,6 +1869,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
                 ctx.hgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
                 ctx.hgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1846,6 +1880,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
                 broadcast_add_f16(&att_w, &layer.att.w0, &mut temp1, stream)?;
                 softplus_decay_f16(&temp1, &mut att_w, stream)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1855,6 +1890,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
                 broadcast_add_f16(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
                 sigmoid_f16(&temp1, &mut att_a, stream)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1863,6 +1899,7 @@ impl Rwkv7Hip {
                 ctx.hgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
                 sigmoid_f16(&lora_g, &mut lora_g_sig, stream)?;
                 ctx.hgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1923,6 +1960,7 @@ impl Rwkv7Hip {
                     &wkv_state_gpu[layer_idx], &mut wkv_out_wkv, &mut new_wkv_state,
                     &lens_gpu, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
             std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
@@ -1955,6 +1993,7 @@ impl Rwkv7Hip {
             // Output projection
             prof.time("att_out", || {
                 ctx.hgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1980,6 +2019,7 @@ impl Rwkv7Hip {
                     &x_ln, &ffn_shift_gpu[layer_idx], &layer.ffn.x_k,
                     &mut ffn_xk, &mut new_ffn_shift, &lens_gpu, stream
                 )?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -1989,6 +2029,7 @@ impl Rwkv7Hip {
             // Key projection
             prof.time("ffn_k", || {
                 ctx.hgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -2001,6 +2042,7 @@ impl Rwkv7Hip {
             // Value projection
             prof.time("ffn_v", || {
                 ctx.hgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
+                prof_sync(stream)?;
                 Ok(())
             })?;
 
@@ -2020,6 +2062,7 @@ impl Rwkv7Hip {
             )?;
 
             ctx.hgemm_into(&self.head.w, &x_ln, &mut logits)?;
+            prof_sync(stream)?;
             Ok(())
         })?;
 
