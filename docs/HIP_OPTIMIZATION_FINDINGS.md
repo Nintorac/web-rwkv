@@ -112,6 +112,40 @@ The custom kernel wins because:
 
 **Result**: No improvement - shared memory staging (17.9 KB) killed occupancy (3 blocks/CU vs 51).
 
+### 8. Row-Owned Column-Major Kernel (colmajor_t1) ❌ REGRESSION
+
+**Problem**: The wave_reduce_t1 kernel uses row-major decomposition requiring `__shfl_down` cross-lane reductions + `__syncthreads()` barriers, and separate state_in/state_out buffers doubling L2 pressure. WGPU uses a column-major decomposition that avoids these overheads.
+
+**Attempted**: Row-owned decomposition with in-place state (bd-2eg.1 through bd-2eg.3):
+- 64 threads (2 waves), each thread owns one row, iterates all 64 columns
+- In-place state update (single buffer, halves L2 footprint)
+- No `__shfl_down`, no `__syncthreads()` between sa and update passes
+- Params loaded to LDS as f32 (6 × 64 × 4 = 1536 bytes)
+- `__launch_bounds__(64, 8)` targeting 8 blocks/CU
+
+**rocprofv3 Results (0.1b, B=256, T=1 decode):**
+
+| Metric | wave_reduce_t1 (baseline) | colmajor_t1 | Delta |
+|--------|--------------------------|-------------|-------|
+| Avg kernel time | **441 μs** | **775 μs** | **1.76x slower** |
+| Total (420 launches) | 185.4 ms | 325.4 ms | +140 ms |
+| VGPRs | 40 | 56 | +40% |
+| SGPRs | 128 | 128 | same |
+| LDS | 17,792 B | 1,536 B | -91% |
+| Workgroup size | 256 | 64 | -75% |
+
+**Correctness**: All tests pass (Spearman ρ=0.9998, Top-1=100%, Top-5=95.7%, Top-10=99.3%).
+
+**Root cause analysis**:
+1. **Insufficient memory-level parallelism**: 64 threads issue 64 concurrent memory ops vs 256 for the baseline. WKV is memory-bound (reading 64×64 state matrix = 16KB per head per batch), so 4x fewer concurrent memory requests severely limits throughput.
+2. **56 VGPRs** (higher than expected): The f32 accumulators for sa, y, plus loop variables and state values consume more registers than anticipated. Target was ≤24 VGPRs for 8 blocks/CU.
+3. **Two full state passes**: Each thread reads all 64 state columns twice (sa pass + y pass). The baseline's wave-cooperative approach distributes state reads across 256 threads, requiring fewer reads per thread despite the shuffle overhead.
+4. **Grid underutilization**: Grid is (H=32, B=1_per_head_group) = 32 blocks on 20 CUs. With 64 threads/block, only 2048 threads active. The 256-thread baseline puts 8192 threads on the same grid.
+
+**Key insight**: Eliminating `__shfl_down` and `__syncthreads()` saves ~5% of ALU time, but the 4x reduction in memory concurrency costs ~76% more wall time. For a memory-bound 64×64 kernel, memory-level parallelism dominates over ALU efficiency.
+
+**Decision gate**: Phase B (WMMA) should NOT be layered on top of this decomposition — the row-owned approach is fundamentally memory-starved. Alternative approaches needed.
+
 ## WKV Kernel Analysis
 
 ### Corrected Performance Analysis
@@ -295,6 +329,207 @@ HIP's advantage diminishes at higher batch sizes because:
 
 2. **Logits transfer** - Currently 7.2ms for 51MB (~7 GB/s).
    - Options: fuse sampling on GPU, async pipelining, or investigate PCIe utilization
+
+## WKV Kernel Deep Dive (January 2026)
+
+### Root Cause: Register Pressure Killing Occupancy
+
+The paradox: HIP WKV is 1.7x slower than WGPU (6.9ms vs 4.0ms) despite HIP keeping state in registers (minimal memory traffic) while WGPU keeps state in global memory (more traffic).
+
+**rocprofv3 kernel stats reveal the problem:**
+
+| Attribute | Value |
+|-----------|-------|
+| Total GPU time | 220 ms (over 420 launches) |
+| Per-launch | 524 μs |
+| **VGPRs** | **144** (very high) |
+| SGPRs | 128 |
+| Workgroup size | 64 (1 wave) |
+| Grid size | 768 × 256 = 196,608 workgroups |
+| Shared memory | 1.28 KB |
+
+**Why 144 VGPRs is catastrophic for RDNA3:**
+
+```
+RDNA3 gfx1151 has:
+- 192 KB VGPRs per SIMD (6144 32-bit registers)
+- 4 SIMDs per CU
+- Wave32 mode
+
+With 64 threads/block using 144 VGPRs each:
+- Per-block VGPRs = 64 × 144 = 9216 registers
+- But SIMD only has 6144 registers!
+- Must spill to memory OR limit to 1 partial wave
+
+Result: Starved for parallelism, poor latency hiding
+```
+
+### Implementation Comparison
+
+| Aspect | HIP (`kernel_wkv7_f16_masked`) | WGPU (`time_mix_v7.wgsl`) |
+|--------|-------------------------------|--------------------------|
+| **State storage** | Registers (64 floats/thread) | Global memory |
+| **Grid** | (H, B) = heads × batch | Different decomposition |
+| **Block size** | 64 threads (N = head_size) | BLOCK_SIZE (configurable) |
+| **VGPRs** | 144 (from rocprofv3) | N/A |
+| **Shared mem** | 1.28KB (5×64 floats) | ~1.5KB (6×BLOCK_SIZE vec4s) |
+| **Per-thread state** | 64 floats (256 bytes) | 0 (in global memory) |
+
+**Why WGPU wins despite more memory traffic:**
+
+1. **Higher occupancy** - more waves in flight hiding latency
+2. **Coalesced access** - threads access consecutive addresses
+3. **L2 cache reuse** - state fits in L2 (256×64×64×4 = 4MB at batch=256)
+
+### WKV Computation Structure
+
+The WKV7 computation per timestep is:
+
+```
+For each thread i (row of state), for each column j:
+1. sa[i] = Σⱼ a[j] * state[i,j]      // Dot product: 64 FMAs
+2. state[i,j] = w[j]*state[i,j] + b[j]*sa[i] + k[j]*v[i]  // Element-wise update
+3. y[i] = Σⱼ q[j] * state[i,j]       // Dot product: 64 FMAs
+```
+
+This is NOT a standard GEMM - it's two matrix-vector products plus element-wise updates. WMMA doesn't directly apply, but we can restructure for better parallelism.
+
+### Optimization Strategies Implemented
+
+#### Strategy 1: Global State with High Occupancy (`kernel_wkv7_tiled`)
+
+Match WGPU's approach: keep state in global memory, use 256 threads per block.
+
+```cpp
+__launch_bounds__(256, 8)  // 256 threads, aim for 8 waves/CU
+void kernel_wkv7_tiled(...)
+```
+
+- **State**: Global memory (in-place update)
+- **Parameters**: Shared memory (cooperative load)
+- **Reductions**: Atomic adds to shared memory
+- **Benefits**: Much higher occupancy, coalesced memory access
+
+#### Strategy 2: LDS State with Atomics (`kernel_wkv7_lds`)
+
+State in Local Data Share (shared memory) - 16KB fits 64×64 floats.
+
+```cpp
+__shared__ float sh_state[64][64 + 1];  // +1 padding for bank conflicts
+```
+
+- **State**: LDS (fast, but limited capacity)
+- **Load once, update in-place** per timestep
+- **Trade-off**: LDS bandwidth vs global memory bandwidth
+
+#### Strategy 3: Wave-Cooperative Reductions (`kernel_wkv7_wave_reduce`)
+
+Avoid slow atomics by using wave shuffle reductions.
+
+```cpp
+// Each wave (32 threads) handles one row of state
+for (int offset = 16; offset > 0; offset >>= 1) {
+    partial_sa += __shfl_down(partial_sa, offset, 32);
+}
+```
+
+- **8 waves process 8 rows in parallel** (64 rows / 8 iterations)
+- **Explicit wave reductions** using `__shfl_down`
+- **No atomics** - deterministic, faster on RDNA3
+
+### WMMA Intrinsics Analysis
+
+For reference, AMD RDNA3 WMMA intrinsics:
+
+```cpp
+// F16 inputs, F32 accumulator, wave32
+__builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_frag, b_frag, c_frag, false)
+
+// Fragment types
+typedef _Float16 half16 __attribute__((ext_vector_type(16)));
+typedef float float8 __attribute__((ext_vector_type(8)));
+```
+
+**WMMA requires 16×16×16 GEMM** - our matrix-vector products (64×64 @ 64×1) don't fit naturally. However, we could:
+
+1. Batch 16 timesteps and process SA = state @ A (64×64 @ 64×16)
+2. Use WMMA for tiled 16×16 blocks
+
+**Challenge**: State changes between timesteps, can't trivially batch.
+
+### Environment Variables to Try
+
+```bash
+# Enable hipBLASLt preference (for GEMM ops)
+export ROCBLAS_USE_HIPBLASLT=1
+
+# PyTorch TunableOp (if using PyTorch benchmarks)
+export PYTORCH_TUNABLEOP_ENABLED=1
+
+# hipBLASLt tuning
+export HIPBLASLT_TUNING_FILE=/tmp/hipblaslt_tuning.txt
+```
+
+### Build Flags Considered
+
+Current: `-O3 --offload-arch=gfx1151`
+
+Additional options:
+```bash
+"-ffast-math"                    # Aggressive FP optimization
+"-mwavefrontsize64=false"        # Force wave32 (default on RDNA3)
+"-Rpass-analysis=kernel-resource-usage"  # Show register usage
+"-save-temps"                    # Keep intermediate files
+```
+
+### New Kernel FFI Bindings
+
+Added to `src/hip/kernels/copy.hip`:
+
+| Kernel | Strategy | Threads | State Location |
+|--------|----------|---------|----------------|
+| `kernel_wkv7_f16_masked` | Original | 64 | Registers |
+| `kernel_wkv7_tiled` | Global state | 256 | Global memory |
+| `kernel_wkv7_lds` | LDS + atomics | 256 | Shared memory |
+| `kernel_wkv7_wave_reduce` | Wave shuffle | 256 | Shared memory |
+| `kernel_wkv7_wave_reduce_t1` | Wave shuffle (T=1 specialized) | 256 | Shared memory |
+| `kernel_wkv7_colmajor_t1` | Row-owned, in-place state (T=1) | 64 | Global (in-place) |
+
+**Runtime toggle:** `WEB_RWKV_HIP_WKV_KERNEL` selects the implementation (`register`, `wave`, `wave_t1`, `colmajor_t1`, `tiled`, `lds`, `auto`). `auto` now prefers the T=1 specialized kernel for decode; otherwise wave-reduce for `batch >= 32` or `T <= 2`, else register.
+
+### Expected Results
+
+| Kernel | Expected Occupancy | Expected Time |
+|--------|-------------------|---------------|
+| Original (register state) | ~1 wave/CU | 6.9ms (baseline) |
+| Tiled (global state) | ~8 waves/CU | TBD |
+| LDS + atomics | ~4 waves/CU | TBD |
+| Wave reduce | ~4 waves/CU | TBD (likely fastest) |
+| Wave reduce T=1 | ~4 waves/CU | TBD (decode-only) |
+
+### January 2026 Update (gfx1151 Strix Halo, T=1 decode, B=256, 0.1b)
+
+All runs use the hip-prof harness with three warmup iterations excluded from the metrics.
+
+| Kernel (strategy) | Mean step (ms) | Throughput (tok/s) | WKV per-step (ms) | Notes |
+|-------------------|----------------|--------------------|-------------------|-------|
+| Register (baseline) | 61.36 | 4,172 | ~6.9–7.2 | Original register-resident state |
+| Wave reduce | 61.31 | 4,176 | ~6.1–6.4 | Wave shuffle reductions |
+| **Wave reduce T=1** | **61.22** | **4,182** | ~6.1–6.3 | Decode-specialized path; now stores params in LDS as f16 to cut LDS bandwidth (no perf gain) |
+| Wave reduce T=1 (global state, params in LDS) | **60.35** | **4,242** | ~6.1–6.2 | State stays in global; LDS only for params; avoids LDS size pressure, slight gain |
+| Tiled / global state | 71.19 | 3,596 | ~16.0 | High occupancy but global-state traffic dominates |
+| LDS (state in shared) | 73.79 | 3,470 | ~18.4 | LDS bandwidth + atomics remain bottlenecks |
+| **Row-owned colmajor_t1** | **63.9** | **4,005** | **~9.3** | In-place state, 64 threads; 1.76x slower WKV kernel due to low memory concurrency |
+
+WGPU reference (decode, same point): **~4.0 ms WKV**, still ~1.5× faster than our best HIP kernel.
+
+**Notes on recent experiments**
+- Parameter vectors (`q,k,w,a,b`) are now staged into LDS as **f16** (not f4) to halve LDS bandwidth in the T=1 kernel; converting to f32 on use preserved correctness but delivered no measurable speedup.
+- A “persistent per-layer launch” was considered (one long-lived grid that loops timesteps), but decode uses **T=1** so there is no inner loop to amortize; it would just idle the grid between steps without benefit.
+- Warmup: the profiling harness performs 3 warmup iterations that are **not included** in the reported means.
+- Removing LDS state entirely (streaming state from global in two 32-column passes) reduced LDS to ~1 KB but regressed WKV to ~6.5 ms and ~4,155 tok/s; the extra global reads outweighed the occupancy gain, so this variant was reverted.
+
+Target: Match or exceed WGPU's 4.0ms.
 
 ## Recommendations
 

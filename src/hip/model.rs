@@ -1001,6 +1001,10 @@ impl Rwkv7Hip {
                     WkvKernelKind::Register
                 }
             }
+            // T=1 only kernels fall back to wave_reduce for T>1
+            WkvKernelKind::WaveReduceT1 | WkvKernelKind::ColmajorT1 if tokens != 1 => {
+                WkvKernelKind::WaveReduce
+            }
             other => other,
         }
     }
