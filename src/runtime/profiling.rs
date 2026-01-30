@@ -68,7 +68,10 @@ mod enabled {
         /// Resolve timestamps after GPU work submission.
         /// Call this after submitting commands but before reading results.
         pub fn resolve_timestamps(&self) {
-            let mut encoder = self.context.device.create_command_encoder(&Default::default());
+            let mut encoder = self
+                .context
+                .device
+                .create_command_encoder(&Default::default());
             if let Ok(prof) = self.profiler.lock() {
                 prof.resolve(&mut encoder);
             }

@@ -46,7 +46,11 @@ impl HipProf {
         }
         eprintln!("[hip-prof] {} {}", self.label, context);
         for (label, dur) in &self.totals {
-            eprintln!("[hip-prof]   {:<16} {:>8.3} ms", label, dur.as_secs_f64() * 1000.0);
+            eprintln!(
+                "[hip-prof]   {:<16} {:>8.3} ms",
+                label,
+                dur.as_secs_f64() * 1000.0
+            );
         }
     }
 }

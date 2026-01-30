@@ -1,5 +1,5 @@
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use half::f16;
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 
 /// HIP error codes
 pub type HipError = c_int;
@@ -9,6 +9,28 @@ pub type HipStream = *mut c_void;
 
 /// HIP event handle (opaque pointer)
 pub type HipEvent = *mut c_void;
+
+/// rocBLAS handle type (opaque pointer)
+pub type RocblasHandle = *mut c_void;
+
+/// rocBLAS status code
+pub type RocblasStatus = c_int;
+
+/// rocBLAS success status
+pub const ROCBLAS_STATUS_SUCCESS: RocblasStatus = 0;
+
+/// hipBLASLt handle type (opaque pointer)
+pub type HipblasLtHandle = *mut c_void;
+
+/// hipBLAS status code (same enum as rocBLAS status for API consistency)
+pub type HipblasStatus = c_int;
+
+/// hipBLAS success status
+pub const HIPBLAS_STATUS_SUCCESS: HipblasStatus = 0;
+/// hipBLAS not supported status
+pub const HIPBLAS_STATUS_NOT_SUPPORTED: HipblasStatus = 3;
+/// hipBLAS allocation failed status
+pub const HIPBLAS_STATUS_ALLOC_FAILED: HipblasStatus = 4;
 
 /// HIP device properties structure
 #[repr(C)]
@@ -94,8 +116,18 @@ extern "C" {
     pub fn hip_malloc_managed(ptr: *mut *mut c_void, size: usize) -> HipError;
     pub fn hip_free(ptr: *mut c_void) -> HipError;
     pub fn hip_memset(ptr: *mut c_void, value: c_int, size: usize) -> HipError;
-    pub fn hip_memcpy_h2d(dst: *mut c_void, src: *const c_void, size: usize, stream: HipStream) -> HipError;
-    pub fn hip_memcpy_d2h(dst: *mut c_void, src: *const c_void, size: usize, stream: HipStream) -> HipError;
+    pub fn hip_memcpy_h2d(
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn hip_memcpy_d2h(
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        stream: HipStream,
+    ) -> HipError;
     pub fn hip_stream_create(stream: *mut HipStream) -> HipError;
     pub fn hip_stream_destroy(stream: HipStream) -> HipError;
     pub fn hip_stream_synchronize(stream: HipStream) -> HipError;
@@ -113,19 +145,88 @@ extern "C" {
     pub fn hip_event_synchronize(event: HipEvent) -> HipError;
     pub fn hip_event_query(event: HipEvent) -> HipError;
     pub fn hip_get_error_string(error: HipError) -> *const c_char;
-    pub fn launch_copy_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_copy_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_copy_f16_to_f32(input: *const f16, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_decay_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_decay_exp_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_lerp_f32(a: *const f32, b: *const f32, t: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_lerp_f16(a: *const f16, b: *const f16, t: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_sigmoid_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_sigmoid_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_squared_relu_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_squared_relu_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_softplus_decay_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_softplus_decay_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_copy_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_copy_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_copy_f16_to_f32(
+        input: *const f16,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_decay_exp_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_decay_exp_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_lerp_f32(
+        a: *const f32,
+        b: *const f32,
+        t: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_lerp_f16(
+        a: *const f16,
+        b: *const f16,
+        t: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_sigmoid_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_sigmoid_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_squared_relu_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_squared_relu_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_softplus_decay_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_softplus_decay_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
     pub fn launch_layer_norm_f32(
         input: *const f32,
         weight: *const f32,
@@ -134,7 +235,7 @@ extern "C" {
         c: c_int,
         n: c_int,
         eps: f32,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_layer_norm_f16(
         input: *const f16,
@@ -144,7 +245,7 @@ extern "C" {
         c: c_int,
         n: c_int,
         eps: f32,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_group_norm_f32(
         input: *const f32,
@@ -155,7 +256,7 @@ extern "C" {
         n: c_int,
         g: c_int,
         eps: f32,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_group_norm_f16(
         input: *const f16,
@@ -166,7 +267,7 @@ extern "C" {
         n: c_int,
         g: c_int,
         eps: f32,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_l2_norm_f32(
         input: *const f32,
@@ -175,7 +276,7 @@ extern "C" {
         n: c_int,
         head_size: c_int,
         eps: f32,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_l2_norm_f16(
         input: *const f16,
@@ -184,10 +285,20 @@ extern "C" {
         n: c_int,
         head_size: c_int,
         eps: f32,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
-    pub fn launch_tanh_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_tanh_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
+    pub fn launch_tanh_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_tanh_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
     pub fn launch_token_shift_f32(
         x: *const f32,
         state_in: *const f32,
@@ -196,7 +307,7 @@ extern "C" {
         state_out: *mut f32,
         c: c_int,
         t: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_channel_mix_state_f32(
         x: *const f32,
@@ -207,7 +318,7 @@ extern "C" {
         c: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_channel_mix_state_f16(
         x: *const f16,
@@ -218,7 +329,7 @@ extern "C" {
         c: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_channel_mix_state_f32_masked(
         x: *const f32,
@@ -230,7 +341,7 @@ extern "C" {
         c: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_channel_mix_state_f16_masked(
         x: *const f16,
@@ -242,7 +353,7 @@ extern "C" {
         c: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_wkv_bonus_f32(
         r: *const f32,
@@ -250,11 +361,11 @@ extern "C" {
         v: *const f32,
         r_k: *const f32,
         output: *mut f32,
-        n: c_int,    // head_size
-        h: c_int,    // n_heads
-        t: c_int,    // tokens
-        b: c_int,    // batch
-        stream: HipStream
+        n: c_int, // head_size
+        h: c_int, // n_heads
+        t: c_int, // tokens
+        b: c_int, // batch
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_wkv_bonus_f16(
         r: *const f16,
@@ -266,17 +377,17 @@ extern "C" {
         h: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_control_k_f32(
-        k_a: *const f32,   // per-channel weight [C, 1, 1, 1]
-        a: *const f32,     // attention [C, T, B, 1]
-        k: *const f32,     // key [C, T, B, 1]
-        output: *mut f32,  // output [C, T, B, 1]
+        k_a: *const f32,  // per-channel weight [C, 1, 1, 1]
+        a: *const f32,    // attention [C, T, B, 1]
+        k: *const f32,    // key [C, T, B, 1]
+        output: *mut f32, // output [C, T, B, 1]
         c: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_control_k_f16(
         k_a: *const f16,
@@ -286,23 +397,39 @@ extern "C" {
         c: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_wkv7_f32(
-        w_decay: *const f32,   // [N, H, T, B] - pre-computed decay
-        q: *const f32,         // [N, H, T, B]
-        k: *const f32,         // [N, H, T, B]
-        v: *const f32,         // [N, H, T, B]
-        a: *const f32,         // [N, H, T, B]
-        b: *const f32,         // [N, H, T, B]
-        state_in: *const f32,  // [N, N, H, B]
-        output: *mut f32,      // [N, H, T, B]
-        state_out: *mut f32,   // [N, N, H, B]
-        n: c_int,    // head_size
-        h: c_int,    // n_heads
-        t: c_int,    // tokens
-        b: c_int,    // batch
-        stream: HipStream
+        w_decay: *const f32,  // [N, H, T, B] - pre-computed decay
+        q: *const f32,        // [N, H, T, B]
+        k: *const f32,        // [N, H, T, B]
+        v: *const f32,        // [N, H, T, B]
+        a: *const f32,        // [N, H, T, B]
+        b: *const f32,        // [N, H, T, B]
+        state_in: *const f32, // [N, N, H, B]
+        output: *mut f32,     // [N, H, T, B]
+        state_out: *mut f32,  // [N, N, H, B]
+        n: c_int,             // head_size
+        h: c_int,             // n_heads
+        t: c_int,             // tokens
+        b: c_int,             // batch
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_wkv7_f32_coalesced(
+        w_decay: *const f32,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        a: *const f32,
+        b: *const f32,
+        state_in: *const f32,
+        output: *mut f32,
+        state_out: *mut f32,
+        n: c_int,
+        h: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_wkv7_f32_masked(
         w_decay: *const f32,   // [N, H, T, B] - pre-computed decay
@@ -315,11 +442,11 @@ extern "C" {
         output: *mut f32,      // [N, H, T, B]
         state_out: *mut f32,   // [N, N, H, B]
         lengths: *const c_int, // [B] - real sequence length per batch
-        n: c_int,    // head_size
-        h: c_int,    // n_heads
-        t: c_int,    // tokens (padded)
-        b: c_int,    // batch
-        stream: HipStream
+        n: c_int,              // head_size
+        h: c_int,              // n_heads
+        t: c_int,              // tokens (padded)
+        b: c_int,              // batch
+        stream: HipStream,
     ) -> HipError;
     pub fn launch_wkv7_f16_masked(
         w_decay: *const f16,
@@ -336,30 +463,189 @@ extern "C" {
         h: c_int,
         t: c_int,
         b: c_int,
-        stream: HipStream
+        stream: HipStream,
+    ) -> HipError;
+
+    // High-occupancy WKV7 variants (experimental)
+    // These kernels use different parallelization strategies to improve occupancy
+
+    /// Tiled WKV7 with state in global memory (in-place update)
+    /// Uses 256 threads per block, atomic reductions
+    pub fn launch_wkv7_tiled(
+        w_decay: *const f16,
+        q: *const f16,
+        k: *const f16,
+        v: *const f16,
+        a: *const f16,
+        b: *const f16,
+        state: *mut f32, // in-place update
+        output: *mut f16,
+        lengths: *const c_int,
+        n: c_int,
+        h: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream,
+    ) -> HipError;
+
+    /// LDS-based WKV7 with state in shared memory
+    /// Uses 256 threads per block, atomic reductions in LDS
+    pub fn launch_wkv7_lds(
+        w_decay: *const f16,
+        q: *const f16,
+        k: *const f16,
+        v: *const f16,
+        a: *const f16,
+        b: *const f16,
+        state_in: *const f32,
+        output: *mut f16,
+        state_out: *mut f32,
+        lengths: *const c_int,
+        n: c_int,
+        h: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream,
+    ) -> HipError;
+
+    /// Wave-cooperative WKV7 with explicit shuffle reductions
+    /// Uses 256 threads (8 waves), no atomics
+    pub fn launch_wkv7_wave_reduce(
+        w_decay: *const f16,
+        q: *const f16,
+        k: *const f16,
+        v: *const f16,
+        a: *const f16,
+        b: *const f16,
+        state_in: *const f32,
+        output: *mut f16,
+        state_out: *mut f32,
+        lengths: *const c_int,
+        n: c_int,
+        h: c_int,
+        t: c_int,
+        b: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    /// Wave-cooperative WKV7 specialized for T=1
+    pub fn launch_wkv7_wave_reduce_t1(
+        w_decay: *const f16,
+        q: *const f16,
+        k: *const f16,
+        v: *const f16,
+        a: *const f16,
+        b: *const f16,
+        state_in: *const f32,
+        output: *mut f16,
+        state_out: *mut f32,
+        lengths: *const c_int,
+        n: c_int,
+        h: c_int,
+        b: c_int,
+        stream: HipStream,
     ) -> HipError;
 
     // Elementwise operations for GPU-native forward pass
-    pub fn launch_add_f32(a: *const f32, b: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_add_f16(a: *const f16, b: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_mul_f32(a: *const f32, b: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_mul_f16(a: *const f16, b: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_negate_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_negate_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_exp_f32(input: *const f32, output: *mut f32, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_exp_f16(input: *const f16, output: *mut f16, n: c_int, stream: HipStream) -> HipError;
-    pub fn launch_broadcast_add_f32(input: *const f32, bias: *const f32, output: *mut f32, n: c_int, bias_len: c_int, stream: HipStream) -> HipError;
-    pub fn launch_broadcast_add_f16(input: *const f16, bias: *const f16, output: *mut f16, n: c_int, bias_len: c_int, stream: HipStream) -> HipError;
-    pub fn launch_broadcast_mul_f32(input: *const f32, scale: *const f32, output: *mut f32, n: c_int, scale_len: c_int, stream: HipStream) -> HipError;
-    pub fn launch_broadcast_mul_f16(input: *const f16, scale: *const f16, output: *mut f16, n: c_int, scale_len: c_int, stream: HipStream) -> HipError;
+    pub fn launch_add_f32(
+        a: *const f32,
+        b: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_add_f16(
+        a: *const f16,
+        b: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_mul_f32(
+        a: *const f32,
+        b: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_mul_f16(
+        a: *const f16,
+        b: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_negate_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_negate_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_exp_f32(
+        input: *const f32,
+        output: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_exp_f16(
+        input: *const f16,
+        output: *mut f16,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_broadcast_add_f32(
+        input: *const f32,
+        bias: *const f32,
+        output: *mut f32,
+        n: c_int,
+        bias_len: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_broadcast_add_f16(
+        input: *const f16,
+        bias: *const f16,
+        output: *mut f16,
+        n: c_int,
+        bias_len: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_broadcast_mul_f32(
+        input: *const f32,
+        scale: *const f32,
+        output: *mut f32,
+        n: c_int,
+        scale_len: c_int,
+        stream: HipStream,
+    ) -> HipError;
+    pub fn launch_broadcast_mul_f16(
+        input: *const f16,
+        scale: *const f16,
+        output: *mut f16,
+        n: c_int,
+        scale_len: c_int,
+        stream: HipStream,
+    ) -> HipError;
 
     // Safe property accessors (avoid struct layout issues)
     pub fn hip_get_device_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
-    pub fn hip_get_device_gcn_arch_name(device_id: c_int, name: *mut c_char, max_len: c_int) -> HipError;
+    pub fn hip_get_device_gcn_arch_name(
+        device_id: c_int,
+        name: *mut c_char,
+        max_len: c_int,
+    ) -> HipError;
     pub fn hip_get_device_total_memory(device_id: c_int, total_mem: *mut usize) -> HipError;
     pub fn hip_get_device_mp_count(device_id: c_int, count: *mut c_int) -> HipError;
     pub fn hip_get_device_warp_size(device_id: c_int, warp_size: *mut c_int) -> HipError;
-    pub fn hip_get_device_compute_capability(device_id: c_int, major: *mut c_int, minor: *mut c_int) -> HipError;
+    pub fn hip_get_device_compute_capability(
+        device_id: c_int,
+        major: *mut c_int,
+        minor: *mut c_int,
+    ) -> HipError;
     pub fn hip_is_device_integrated(device_id: c_int, integrated: *mut c_int) -> HipError;
     pub fn hip_supports_cooperative_launch(device_id: c_int, supported: *mut c_int) -> HipError;
 
@@ -369,55 +655,122 @@ extern "C" {
     pub fn rocblas_set_stream_wrapper(handle: RocblasHandle, stream: HipStream) -> RocblasStatus;
     pub fn launch_hgemm(
         handle: RocblasHandle,
-        m: c_int,       // rows of A and C
-        n: c_int,       // cols of B and C
-        k: c_int,       // cols of A, rows of B
-        a: *const u16,  // M×K matrix (FP16 as u16)
-        b: *const u16,  // K×N matrix (FP16 as u16)
-        c: *mut u16     // M×N matrix (FP16 as u16)
+        m: c_int,      // rows of A and C
+        n: c_int,      // cols of B and C
+        k: c_int,      // cols of A, rows of B
+        a: *const u16, // M×K matrix (FP16 as u16)
+        b: *const u16, // K×N matrix (FP16 as u16)
+        c: *mut u16,   // M×N matrix (FP16 as u16)
     ) -> RocblasStatus;
     pub fn launch_sgemm(
         handle: RocblasHandle,
-        m: c_int,       // rows of A and C
-        n: c_int,       // cols of B and C
-        k: c_int,       // cols of A, rows of B
+        m: c_int, // rows of A and C
+        n: c_int, // cols of B and C
+        k: c_int, // cols of A, rows of B
         alpha: f32,
-        a: *const f32,  // M×K matrix
-        b: *const f32,  // K×N matrix
+        a: *const f32, // M×K matrix
+        b: *const f32, // K×N matrix
         beta: f32,
-        c: *mut f32     // M×N matrix
+        c: *mut f32, // M×N matrix
     ) -> RocblasStatus;
     pub fn launch_sgemm_ta(
         handle: RocblasHandle,
-        m: c_int,       // rows of output C (output features)
-        n: c_int,       // cols of B and C (tokens)
-        k: c_int,       // input features
+        m: c_int, // rows of output C (output features)
+        n: c_int, // cols of B and C (tokens)
+        k: c_int, // input features
         alpha: f32,
-        a: *const f32,  // stored as K×M (row-major [M, K])
-        b: *const f32,  // K×N matrix
+        a: *const f32, // stored as K×M (row-major [M, K])
+        b: *const f32, // K×N matrix
         beta: f32,
-        c: *mut f32     // M×N matrix
+        c: *mut f32, // M×N matrix
     ) -> RocblasStatus;
     pub fn launch_hgemm_f32_out(
         handle: RocblasHandle,
-        m: c_int,       // rows of A and C (vocab size / output features)
-        n: c_int,       // cols of B and C (tokens)
-        k: c_int,       // cols of A, rows of B (embedding dim)
-        a: *const u16,  // M×K matrix (FP16 weights as u16)
-        b: *const u16,  // K×N matrix (FP16 input as u16)
-        c: *mut f32     // M×N matrix (FP32 output)
+        m: c_int,      // rows of A and C (vocab size / output features)
+        n: c_int,      // cols of B and C (tokens)
+        k: c_int,      // cols of A, rows of B (embedding dim)
+        a: *const u16, // M×K matrix (FP16 weights as u16)
+        b: *const u16, // K×N matrix (FP16 input as u16)
+        c: *mut f32,   // M×N matrix (FP32 output)
     ) -> RocblasStatus;
     pub fn rocblas_to_hip_error(status: RocblasStatus) -> HipError;
+
+    // rocBLAS batched GEMV for WKV7
+    pub fn launch_sgemv_strided_batched(
+        handle: RocblasHandle,
+        m: c_int,           // rows of each A matrix
+        n: c_int,           // cols of each A matrix
+        a: *const f32,      // batched M×N matrices
+        stride_a: i64,      // stride between matrices
+        x: *const f32,      // batched length-N vectors
+        stride_x: i64,      // stride between x vectors
+        y: *mut f32,        // batched length-M output vectors
+        stride_y: i64,      // stride between y vectors
+        batch_count: c_int, // number of batches
+    ) -> RocblasStatus;
+
+    // WKV7 state update kernel
+    pub fn launch_wkv7_state_update_flat(
+        state: *mut f32,    // [N, N, batch_count] state matrices
+        w: *const f32,      // [N, batch_count] decay values
+        sa: *const f32,     // [N, batch_count] state @ a result
+        b: *const f32,      // [N, batch_count] b vectors
+        v: *const f32,      // [N, batch_count] v vectors
+        k: *const f32,      // [N, batch_count] k vectors
+        n: c_int,           // head size (64)
+        batch_count: c_int, // total batches
+        stream: HipStream,
+    ) -> HipError;
+
+    // Full WKV7 GEMV implementation
+    pub fn launch_wkv7_gemv(
+        handle: RocblasHandle,
+        w_decay: *const f32,  // [N, H, T, B]
+        q: *const f32,        // [N, H, T, B]
+        k: *const f32,        // [N, H, T, B]
+        v: *const f32,        // [N, H, T, B]
+        a: *const f32,        // [N, H, T, B]
+        b: *const f32,        // [N, H, T, B]
+        state_in: *const f32, // [N, N, H, B]
+        output: *mut f32,     // [N, H, T, B]
+        state_out: *mut f32,  // [N, N, H, B]
+        sa_tmp: *mut f32,     // [N, H, B] scratch buffer
+        n: c_int,             // head_size (64)
+        h: c_int,             // n_heads
+        t: c_int,             // tokens
+        b_param: c_int,       // batch
+        stream: HipStream,
+    ) -> HipError;
+
+    // hipBLASLt functions
+    pub fn hipblaslt_handle_create(handle: *mut HipblasLtHandle) -> HipblasStatus;
+    pub fn hipblaslt_handle_destroy(handle: HipblasLtHandle) -> HipblasStatus;
+    pub fn launch_hipblaslt_hgemm_f32_out(
+        handle: HipblasLtHandle,
+        m: c_int,               // rows of A and C (vocab size / output features)
+        n: c_int,               // cols of B and C (tokens)
+        k: c_int,               // cols of A, rows of B (embedding dim)
+        a: *const u16,          // M×K matrix (FP16 weights as u16)
+        b: *const u16,          // K×N matrix (FP16 input as u16)
+        c: *mut f32,            // M×N matrix (FP32 output)
+        workspace: *mut c_void, // workspace buffer (can be null)
+        workspace_size: usize,  // workspace size in bytes (0 for auto)
+        stream: HipStream,      // HIP stream
+    ) -> HipblasStatus;
+    pub fn launch_hipblaslt_hgemm(
+        handle: HipblasLtHandle,
+        m: c_int,      // rows of A and C
+        n: c_int,      // cols of B and C
+        k: c_int,      // cols of A, rows of B
+        a: *const u16, // M×K matrix (FP16 as u16)
+        b: *const u16, // K×N matrix (FP16 as u16)
+        c: *mut u16,   // M×N matrix (FP16 as u16)
+        workspace: *mut c_void,
+        workspace_size: usize,
+        stream: HipStream,
+    ) -> HipblasStatus;
+    pub fn hipblaslt_to_hip_error(status: HipblasStatus) -> HipError;
 }
-
-/// rocBLAS handle type (opaque pointer)
-pub type RocblasHandle = *mut c_void;
-
-/// rocBLAS status code
-pub type RocblasStatus = c_int;
-
-/// rocBLAS success status
-pub const ROCBLAS_STATUS_SUCCESS: RocblasStatus = 0;
 
 /// HIP success error code
 pub const HIP_SUCCESS: HipError = 0;
@@ -499,11 +852,7 @@ pub fn get_device_properties(device_id: i32) -> Result<HipDeviceProp> {
 pub fn get_device_name(device_id: i32) -> Result<String> {
     let mut name_buf = [0i8; 256];
     unsafe {
-        check(hip_get_device_name(
-            device_id,
-            name_buf.as_mut_ptr(),
-            256,
-        ))?;
+        check(hip_get_device_name(device_id, name_buf.as_mut_ptr(), 256))?;
         let name = CStr::from_ptr(name_buf.as_ptr());
         Ok(name.to_string_lossy().into_owned())
     }
@@ -560,7 +909,11 @@ pub fn get_device_warp_size(device_id: i32) -> Result<i32> {
 pub fn get_device_compute_capability(device_id: i32) -> Result<(i32, i32)> {
     let mut major: c_int = 0;
     let mut minor: c_int = 0;
-    unsafe { check(hip_get_device_compute_capability(device_id, &mut major, &mut minor))? };
+    unsafe {
+        check(hip_get_device_compute_capability(
+            device_id, &mut major, &mut minor,
+        ))?
+    };
     Ok((major, minor))
 }
 

@@ -104,7 +104,8 @@ impl ContextBuilder {
         #[cfg(feature = "subgroup-ops")]
         let features = features | Features::SUBGROUP;
         #[cfg(feature = "wgpu-prof")]
-        let features = features | Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        let features =
+            features | Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         Self {
             adapter,
             features,

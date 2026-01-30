@@ -3,12 +3,10 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use super::ffi::{
-    HipErrorKind, Result, check,
-    hip_malloc, hip_free,
-    hip_memcpy_h2d, hip_memcpy_d2h,
-};
 use super::device::Stream;
+use super::ffi::{
+    check, hip_free, hip_malloc, hip_memcpy_d2h, hip_memcpy_h2d, HipErrorKind, Result,
+};
 
 /// A device buffer for GPU memory
 pub struct DeviceBuffer<T> {

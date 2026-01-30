@@ -125,7 +125,11 @@ impl<T: Copy> PinnedBuffer<T> {
     ///
     /// # Safety
     /// The source pointer must be valid for `self.len()` elements.
-    pub unsafe fn copy_from_device_async(&mut self, src: *const T, stream: HipStream) -> Result<()> {
+    pub unsafe fn copy_from_device_async(
+        &mut self,
+        src: *const T,
+        stream: HipStream,
+    ) -> Result<()> {
         if self.len == 0 {
             return Ok(());
         }
@@ -202,8 +206,8 @@ impl<T: Copy> Clone for PinnedBuffer<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hip::ffi::{hip_malloc, hip_free, check as ffi_check};
     use crate::hip::device::Stream;
+    use crate::hip::ffi::{check as ffi_check, hip_free, hip_malloc};
 
     #[test]
     fn test_pinned_buffer_empty() {
@@ -217,8 +221,10 @@ mod tests {
         // Test various sizes
         let sizes = [1, 16, 256, 1024, 4096];
         for &size in &sizes {
-            let buf: PinnedBuffer<f32> = PinnedBuffer::new(size)
-                .expect(&format!("Failed to allocate pinned buffer of size {}", size));
+            let buf: PinnedBuffer<f32> = PinnedBuffer::new(size).expect(&format!(
+                "Failed to allocate pinned buffer of size {}",
+                size
+            ));
             assert_eq!(buf.len(), size);
             assert!(!buf.is_empty());
             assert!(!buf.as_ptr().is_null());
@@ -292,10 +298,12 @@ mod tests {
 
         // Async copy: pinned → device → pinned
         unsafe {
-            src_buf.copy_to_device_async(device_ptr as *mut f32, stream.handle())
+            src_buf
+                .copy_to_device_async(device_ptr as *mut f32, stream.handle())
                 .expect("H→D async copy failed");
 
-            dst_buf.copy_from_device_async(device_ptr as *const f32, stream.handle())
+            dst_buf
+                .copy_from_device_async(device_ptr as *const f32, stream.handle())
                 .expect("D→H async copy failed");
         }
 
@@ -303,8 +311,11 @@ mod tests {
         stream.synchronize().expect("Stream sync failed");
 
         // Verify data
-        assert_eq!(dst_buf.as_slice(), src_data.as_slice(),
-            "Data mismatch after async round-trip");
+        assert_eq!(
+            dst_buf.as_slice(),
+            src_data.as_slice(),
+            "Data mismatch after async round-trip"
+        );
 
         // Clean up device memory
         unsafe {

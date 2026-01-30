@@ -3,16 +3,12 @@
 use std::ptr;
 
 use super::ffi::{
-    HipStream, HipEvent, HipErrorKind, Result, check,
-    get_device_count, get_device_name, get_gcn_arch_name, set_device,
-    get_device_total_memory, get_device_mp_count, get_device_warp_size,
-    get_device_compute_capability, is_device_integrated, device_supports_cooperative_launch,
-    hip_stream_create, hip_stream_destroy, hip_stream_synchronize,
-    hip_stream_wait_event,
-    hip_device_synchronize,
-    hip_event_create, hip_event_destroy, hip_event_record,
-    hip_event_synchronize, hip_event_query,
-    HIP_SUCCESS, HIP_ERROR_NOT_READY,
+    check, device_supports_cooperative_launch, get_device_compute_capability, get_device_count,
+    get_device_mp_count, get_device_name, get_device_total_memory, get_device_warp_size,
+    get_gcn_arch_name, hip_device_synchronize, hip_event_create, hip_event_destroy,
+    hip_event_query, hip_event_record, hip_event_synchronize, hip_stream_create,
+    hip_stream_destroy, hip_stream_synchronize, hip_stream_wait_event, is_device_integrated,
+    set_device, HipErrorKind, HipEvent, HipStream, Result, HIP_ERROR_NOT_READY, HIP_SUCCESS,
 };
 
 /// HIP context that manages device selection and provides a default stream.
@@ -303,7 +299,11 @@ mod tests {
 
         // Synchronize should succeed (event is already complete on null stream)
         let result = event.synchronize();
-        assert!(result.is_ok(), "Event::synchronize() failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Event::synchronize() failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -328,11 +328,18 @@ mod tests {
         // Null stream should work without explicit creation
         let stream = Stream::null();
         assert!(stream.is_null(), "Null stream should report is_null()");
-        assert!(stream.handle().is_null(), "Null stream handle should be null");
+        assert!(
+            stream.handle().is_null(),
+            "Null stream handle should be null"
+        );
 
         // Synchronize should work
         let result = stream.synchronize();
-        assert!(result.is_ok(), "Null stream sync failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Null stream sync failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -347,7 +354,11 @@ mod tests {
 
         // Make stream2 wait on the event
         let result = stream2.wait_event(&event);
-        assert!(result.is_ok(), "Stream::wait_event() failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Stream::wait_event() failed: {:?}",
+            result.err()
+        );
 
         // Both should sync without issue
         stream1.synchronize().expect("stream1 sync failed");
@@ -366,7 +377,9 @@ mod tests {
         event.record(&stream).expect("Third record failed");
 
         // Should sync fine
-        event.synchronize().expect("Sync after multiple records failed");
+        event
+            .synchronize()
+            .expect("Sync after multiple records failed");
     }
 
     #[test]
@@ -395,7 +408,11 @@ mod tests {
         assert!(mem.unwrap() > 0, "Total memory should be > 0");
 
         let mps = ctx.multiprocessor_count();
-        assert!(mps.is_ok(), "multiprocessor_count() failed: {:?}", mps.err());
+        assert!(
+            mps.is_ok(),
+            "multiprocessor_count() failed: {:?}",
+            mps.err()
+        );
         assert!(mps.unwrap() > 0, "MP count should be > 0");
 
         let warp = ctx.warp_size();
@@ -404,4 +421,3 @@ mod tests {
         assert!(warp.unwrap() > 0, "Warp size should be > 0");
     }
 }
-

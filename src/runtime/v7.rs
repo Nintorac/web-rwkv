@@ -529,7 +529,11 @@ impl<F: Float> Bundle<F> {
         };
         #[cfg(feature = "wgpu-prof")]
         let profiler = {
-            let prof = crate::tensor::prof::WgpuProf::new("v7", &model.context.device, &model.context.queue);
+            let prof = crate::tensor::prof::WgpuProf::new(
+                "v7",
+                &model.context.device,
+                &model.context.queue,
+            );
             std::sync::Arc::new(std::sync::Mutex::new(prof))
         };
         Self {
@@ -664,12 +668,15 @@ impl<F: Float> Dispatcher<RnnJob> for Bundle<F> {
 
             let embed_ops = TensorOp::List(vec![
                 hook_op(Hook::PostEmbedLoaded)?,
-                TensorOp::labeled("embed_ln", TensorOp::layer_norm(
-                    &tensor.embed.ln.w,
-                    &tensor.embed.ln.b,
-                    &buffer.input,
-                    Model::LN_EPS,
-                )?),
+                TensorOp::labeled(
+                    "embed_ln",
+                    TensorOp::layer_norm(
+                        &tensor.embed.ln.w,
+                        &tensor.embed.ln.b,
+                        &buffer.input,
+                        Model::LN_EPS,
+                    )?,
+                ),
                 TensorOp::blit(&buffer.input, &buffer.x)?,
                 hook_op(Hook::PostEmbedLayerNorm)?,
             ]);
@@ -1141,14 +1148,20 @@ fn dispatch_header<F: Float>(
     if num_header > 0 {
         ops.extend([
             hook_op(Hook::PreHead)?,
-            TensorOp::labeled("head_ln", TensorOp::layer_norm(&head.ln.w, &head.ln.b, &head_x, Model::LN_EPS)?),
+            TensorOp::labeled(
+                "head_ln",
+                TensorOp::layer_norm(&head.ln.w, &head.ln.b, &head_x, Model::LN_EPS)?,
+            ),
             hook_op(Hook::PostHeadLayerNorm)?,
-            TensorOp::labeled("head", head.w.matmul_op(
-                head_x.view(.., .., .., ..)?,
-                header.head_o.view(.., .., .., ..)?,
-                Activation::None,
-                turbo(num_header),
-            )?),
+            TensorOp::labeled(
+                "head",
+                head.w.matmul_op(
+                    head_x.view(.., .., .., ..)?,
+                    header.head_o.view(.., .., .., ..)?,
+                    Activation::None,
+                    turbo(num_header),
+                )?,
+            ),
             hook_op(Hook::PostHead)?,
         ]);
     }

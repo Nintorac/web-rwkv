@@ -14,9 +14,8 @@ mod hip {
         println!("cargo:rerun-if-env-changed=ROCM_PATH");
 
         let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-        let rocm_path = PathBuf::from(
-            env::var("ROCM_PATH").expect("ROCM_PATH must be set for hip feature"),
-        );
+        let rocm_path =
+            PathBuf::from(env::var("ROCM_PATH").expect("ROCM_PATH must be set for hip feature"));
 
         // Compile HIP kernels
         compile_hip_kernels(&rocm_path, &out_dir);
@@ -30,6 +29,7 @@ mod hip {
         );
         println!("cargo:rustc-link-lib=dylib=amdhip64");
         println!("cargo:rustc-link-lib=dylib=rocblas");
+        println!("cargo:rustc-link-lib=dylib=hipblaslt");
     }
 
     fn compile_hip_kernels(rocm_path: &PathBuf, out_dir: &PathBuf) {

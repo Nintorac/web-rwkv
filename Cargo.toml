@@ -107,3 +107,5 @@ hip = []
 hip-probes = ["hip"]
 ## Enable HIP profiling timers (guarded by feature flag).
 hip-prof = ["hip"]
+## Enable wgpu profiling via GPU timestamp queries.
+wgpu-prof = []

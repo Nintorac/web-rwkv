@@ -123,10 +123,9 @@ impl crate::context::Context {
                 TensorOp::Labeled { label, inner } => {
                     flatten(commands, passes, inner, Some(label));
                 }
-                TensorOp::List(ops) => {
-                    ops.iter()
-                        .for_each(|op| flatten(commands, passes, op, current_label))
-                }
+                TensorOp::List(ops) => ops
+                    .iter()
+                    .for_each(|op| flatten(commands, passes, op, current_label)),
                 TensorOp::Sep => {
                     let mut temp = vec![];
                     std::mem::swap(&mut temp, passes);
@@ -220,10 +219,9 @@ impl crate::context::Context {
                 TensorOp::Labeled { label, inner } => {
                     flatten(commands, passes, inner, Some(label));
                 }
-                TensorOp::List(ops) => {
-                    ops.iter()
-                        .for_each(|op| flatten(commands, passes, op, current_label))
-                }
+                TensorOp::List(ops) => ops
+                    .iter()
+                    .for_each(|op| flatten(commands, passes, op, current_label)),
                 TensorOp::Sep => {
                     let mut temp = vec![];
                     std::mem::swap(&mut temp, passes);
@@ -284,7 +282,11 @@ impl crate::context::Context {
                         for (index, bind) in atom.bindings.iter().enumerate() {
                             pass.set_bind_group(index as u32, &**bind, &[]);
                         }
-                        pass.dispatch_workgroups(atom.dispatch[0], atom.dispatch[1], atom.dispatch[2]);
+                        pass.dispatch_workgroups(
+                            atom.dispatch[0],
+                            atom.dispatch[1],
+                            atom.dispatch[2],
+                        );
                     }
 
                     drop(pass);

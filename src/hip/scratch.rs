@@ -12,11 +12,49 @@
 //! - LoRA buffers: `[lora_dim, max_seq_len, batch_size]`
 //! - Output buffer: `[n_vocab, max_seq_len, batch_size]`
 
-use half::f16;
 use super::ffi::Result;
 use super::model::Rwkv7ModelInfo;
 use super::pinned::PinnedBuffer;
 use super::tensor::{TensorHip, TensorShape};
+use half::f16;
+
+/// WKV kernel selection for HIP backend.
+///
+/// The default (`Auto`) keeps existing behavior but allows overriding via
+/// `WEB_RWKV_HIP_WKV_KERNEL`. Options:
+/// - `auto`      : legacy register kernel unless heuristic chooses otherwise
+/// - `register`  : original low-latency register-resident kernel
+/// - `wave`      : high-occupancy wave-cooperative kernel (shared memory)
+/// - `lds`       : LDS + atomics kernel for experimentation
+/// - `wave_t1`   : wave-cooperative kernel specialized for decode (T=1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WkvKernelKind {
+    Auto,
+    Register,
+    Tiled,
+    WaveReduceT1,
+    WaveReduce,
+    Lds,
+}
+
+impl WkvKernelKind {
+    /// Parse from environment variable `WEB_RWKV_HIP_WKV_KERNEL`.
+    /// Returns Auto when unset or unrecognized.
+    fn from_env() -> Self {
+        match std::env::var("WEB_RWKV_HIP_WKV_KERNEL") {
+            Ok(val) => match val.to_ascii_lowercase().as_str() {
+                "register" | "reg" | "orig" => Self::Register,
+                "tiled" | "global" => Self::Tiled,
+                "wave_t1" | "wave-t1" | "wave32_t1" => Self::WaveReduceT1,
+                "wave" | "wave32" | "wave-reduce" | "wave_reduce" => Self::WaveReduce,
+                "lds" | "shared" => Self::Lds,
+                "auto" | "" => Self::Auto,
+                _ => Self::Auto,
+            },
+            Err(_) => Self::Auto,
+        }
+    }
+}
 
 /// Runtime configuration for HIP inference.
 ///
@@ -35,6 +73,10 @@ pub struct HipRuntimeConfig {
     /// Keep recurrent state resident on device and avoid per-call H2D/D2H transfers.
     /// Default: false
     pub resident_state: bool,
+
+    /// Which WKV kernel implementation to use.
+    /// Default: Auto (legacy kernel; override via WEB_RWKV_HIP_WKV_KERNEL).
+    pub wkv_kernel: WkvKernelKind,
 }
 
 impl Default for HipRuntimeConfig {
@@ -43,6 +85,7 @@ impl Default for HipRuntimeConfig {
             max_prefill_chunk: 256,
             batch_size: 1,
             resident_state: false,
+            wkv_kernel: WkvKernelKind::from_env(),
         }
     }
 }
@@ -54,6 +97,7 @@ impl HipRuntimeConfig {
             max_prefill_chunk,
             batch_size,
             resident_state: false,
+            wkv_kernel: WkvKernelKind::from_env(),
         }
     }
 
@@ -63,6 +107,7 @@ impl HipRuntimeConfig {
             max_prefill_chunk: 1,
             batch_size: 1,
             resident_state: false,
+            wkv_kernel: WkvKernelKind::from_env(),
         }
     }
 
@@ -72,7 +117,14 @@ impl HipRuntimeConfig {
             max_prefill_chunk: max_chunk,
             batch_size: 1,
             resident_state: false,
+            wkv_kernel: WkvKernelKind::from_env(),
         }
+    }
+
+    /// Explicitly set the WKV kernel implementation.
+    pub fn with_wkv_kernel(mut self, kernel: WkvKernelKind) -> Self {
+        self.wkv_kernel = kernel;
+        self
     }
 }
 
@@ -132,7 +184,6 @@ pub struct HipScratch {
     pub wkv_state_gpu: Vec<TensorHip<f32>>,
 
     // ========== Standard buffers [n_embd, T, B] ==========
-
     /// Main hidden state (persists across layers within forward pass)
     pub x: TensorHip<f16>,
 
@@ -198,7 +249,6 @@ pub struct HipScratch {
     pub v_first: TensorHip<f16>,
 
     // ========== FFN hidden buffers [n_hidden, T, B] ==========
-
     /// FFN key projection output
     pub ffn_k: TensorHip<f16>,
 
@@ -206,7 +256,6 @@ pub struct HipScratch {
     pub ffn_k_sq: TensorHip<f16>,
 
     // ========== LoRA buffers [lora_dim, T, B] ==========
-
     /// Decay LoRA intermediate
     pub lora_w: TensorHip<f16>,
 
@@ -232,7 +281,6 @@ pub struct HipScratch {
     pub v_lora2: TensorHip<f16>,
 
     // ========== Temporary buffers ==========
-
     /// Temporary buffer for pointwise ops (std shape)
     pub temp1: TensorHip<f16>,
 
@@ -249,15 +297,16 @@ pub struct HipScratch {
     pub new_wkv_state: TensorHip<f32>,
 
     // ========== Output buffer [n_vocab, T, B] ==========
-
     /// Final logits output (f16)
     pub logits: TensorHip<f16>,
 
     /// Logits converted to f32 on GPU (for efficient download)
     pub logits_f32: TensorHip<f32>,
 
-    // ========== Token staging buffer [T, B] ==========
+    /// Pinned host buffer for async logits download (avoids pageable memory allocation)
+    pub logits_staging: PinnedBuffer<f32>,
 
+    // ========== Token staging buffer [T, B] ==========
     /// GPU staging buffer for tokens (zero-copy chunking)
     pub token_staging: TensorHip<u32>,
 
@@ -265,7 +314,6 @@ pub struct HipScratch {
     pub lens_gpu: TensorHip<i32>,
 
     // ========== Pinned host staging buffer [n_embd * T * B] ==========
-
     /// Pinned host buffer for async embedding upload (avoids sync on hipMemcpyAsync)
     pub emb_staging: PinnedBuffer<f16>,
 }
@@ -299,6 +347,7 @@ impl HipScratch {
 
         // Output shape [n_vocab, T, B]
         let out_shape = TensorShape::new(v, t, b, 1);
+        let out_size = v * t * b;
 
         // LoRA shapes
         let lora_w_shape = TensorShape::new(lora_dims.w_dim, t, b, 1);
@@ -380,6 +429,7 @@ impl HipScratch {
             // Output buffer
             logits: TensorHip::new(out_shape)?,
             logits_f32: TensorHip::new(out_shape)?,
+            logits_staging: PinnedBuffer::new(out_size)?,
 
             // Token staging buffer [T, B]
             token_staging: TensorHip::new(TensorShape::new(t, b, 1, 1))?,
@@ -421,7 +471,7 @@ impl HipScratch {
         let token_size = t * b; // Token staging buffer
 
         let std_count = 26; // Number of standard buffers
-        let ffn_count = 2;  // Number of FFN hidden buffers
+        let ffn_count = 2; // Number of FFN hidden buffers
 
         let lora_size = (ld.w_dim + ld.a_dim + ld.g_dim + ld.v_dim.unwrap_or(0)) * t * b;
 

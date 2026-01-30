@@ -7,14 +7,16 @@ use std::sync::Mutex;
 
 use futures::future::BoxFuture;
 
-use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
 use super::scratch::HipRuntimeConfig;
+use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
 use crate::runtime::{
     infer::{Rnn, RnnInput, RnnOutput, RnnOutputBatch, RnnRedirect, Token},
     JobInput, Runtime, RuntimeError,
 };
 use crate::tensor::shape::Shape;
-use crate::tensor::{TensorCpu, TensorError, TensorErrorKind, TensorInit, TensorShape as TensorShapeTrait};
+use crate::tensor::{
+    TensorCpu, TensorError, TensorErrorKind, TensorInit, TensorShape as TensorShapeTrait,
+};
 
 /// CPU-only softmax for HIP backend.
 ///
@@ -80,7 +82,10 @@ impl HipRuntime {
     /// let config = HipRuntimeConfig::new(256, 4);  // chunk_size=256, batch=4
     /// let runtime = HipRuntime::new(model, config)?;
     /// ```
-    pub fn with_config(model: Rwkv7Hip, mut config: HipRuntimeConfig) -> Result<Self, super::HipErrorKind> {
+    pub fn with_config(
+        model: Rwkv7Hip,
+        mut config: HipRuntimeConfig,
+    ) -> Result<Self, super::HipErrorKind> {
         config.resident_state = true;
         let num_batch = config.batch_size;
         let chunk_size = config.max_prefill_chunk;
@@ -136,13 +141,9 @@ impl HipRuntime {
     /// Get a snapshot of current state (for testing/debugging).
     pub fn get_state_snapshot(&self) -> HipState {
         let state_guard = self.state.lock().unwrap();
-        state_guard
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| {
-                HipState::new(&self.model.info, self.num_batch)
-                    .expect("Failed to allocate HIP state")
-            })
+        state_guard.as_ref().cloned().unwrap_or_else(|| {
+            HipState::new(&self.model.info, self.num_batch).expect("Failed to allocate HIP state")
+        })
     }
 
     /// Run inference on a batch of token sequences.
@@ -168,13 +169,17 @@ impl HipRuntime {
         // Take state from mutex, run forward, put new state back
         let old_state = {
             let mut state_guard = self.state.lock().unwrap();
-            state_guard
-                .take()
-                .unwrap_or_else(|| HipState::new(&self.model.info, self.num_batch).expect("Failed to allocate HIP state"))
+            state_guard.take().unwrap_or_else(|| {
+                HipState::new(&self.model.info, self.num_batch)
+                    .expect("Failed to allocate HIP state")
+            })
         };
 
         // Use async path with pre-allocated pinned buffers (avoids memory pinning overhead)
-        let (logits, new_state) = self.model.forward_async(sequences, Some(old_state))?.wait()?;
+        let (logits, new_state) = self
+            .model
+            .forward_async(sequences, Some(old_state))?
+            .wait()?;
 
         // Store the updated state
         let mut state_guard = self.state.lock().unwrap();
@@ -239,11 +244,7 @@ impl HipRuntime {
     ///
     /// # Returns
     /// Vec of logit slices, one per sequence (each of length vocab_size)
-    pub fn extract_last_logits(
-        &self,
-        logits: &TensorCpu<f32>,
-        lengths: &[usize],
-    ) -> Vec<Vec<f32>> {
+    pub fn extract_last_logits(&self, logits: &TensorCpu<f32>, lengths: &[usize]) -> Vec<Vec<f32>> {
         let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
 
@@ -273,11 +274,7 @@ impl HipRuntime {
     /// # Returns
     /// Vec of logit vectors, one per sequence. Each inner vec has length
     /// `seq_len * vocab_size` containing logits for all tokens in that sequence.
-    pub fn extract_all_logits(
-        &self,
-        logits: &TensorCpu<f32>,
-        lengths: &[usize],
-    ) -> Vec<Vec<f32>> {
+    pub fn extract_all_logits(&self, logits: &TensorCpu<f32>, lengths: &[usize]) -> Vec<Vec<f32>> {
         let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
 
@@ -314,9 +311,8 @@ impl HipRuntime {
 
             if num_out_tokens == 0 {
                 outputs.push(RnnOutputBatch(
-                    TensorInit::from_data(Shape::new(vocab_size, 0, 1, 1), vec![]).map_err(
-                        |e| RuntimeError::TensorError(e),
-                    )?,
+                    TensorInit::from_data(Shape::new(vocab_size, 0, 1, 1), vec![])
+                        .map_err(|e| RuntimeError::TensorError(e))?,
                 ));
             } else {
                 // Extract logits for this batch's output tokens
@@ -585,7 +581,10 @@ mod tests {
 
         println!("HipRuntime inference proof-of-life PASSED");
         println!("  - Ran inference on {} tokens", tokens.len());
-        println!("  - Output shape: [{}, {}, {}, {}]", shape[0], shape[1], shape[2], shape[3]);
+        println!(
+            "  - Output shape: [{}, {}, {}, {}]",
+            shape[0], shape[1], shape[2], shape[3]
+        );
     }
 
     /// Test stateful inference: multiple calls should accumulate state
@@ -616,11 +615,8 @@ mod tests {
         let top_k = |logits: &[f32], token_idx: usize, k: usize| -> Vec<usize> {
             let start = token_idx * vocab;
             let end = start + vocab;
-            let mut indexed: Vec<(usize, f32)> = logits[start..end]
-                .iter()
-                .copied()
-                .enumerate()
-                .collect();
+            let mut indexed: Vec<(usize, f32)> =
+                logits[start..end].iter().copied().enumerate().collect();
             indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             indexed.into_iter().take(k).map(|(i, _)| i).collect()
         };
@@ -631,8 +627,7 @@ mod tests {
             if overlap < 0.8 {
                 eprintln!(
                     "Warning: reset state top-5 overlap low at token {} (overlap={:.2})",
-                    token_idx,
-                    overlap
+                    token_idx, overlap
                 );
             }
         }
@@ -725,7 +720,11 @@ mod tests {
         println!("============================================================");
         println!("Tokens: {:?}", tokens);
         println!("Vocab size: {}, Num tokens: {}", vocab_size, num_tokens);
-        println!("HIP logits len: {}, WGPU logits len: {}", hip_logits_vec.len(), wgpu_logits_vec.len());
+        println!(
+            "HIP logits len: {}, WGPU logits len: {}",
+            hip_logits_vec.len(),
+            wgpu_logits_vec.len()
+        );
 
         // Debug: print some actual logit values
         println!("\nSample logits (first token, indices 0-5):");
@@ -737,9 +736,18 @@ mod tests {
 
         // Check logit ranges
         let hip_min = hip_logits_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let hip_max = hip_logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let wgpu_min = wgpu_logits_vec.iter().cloned().fold(f32::INFINITY, f32::min);
-        let wgpu_max = wgpu_logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let hip_max = hip_logits_vec
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let wgpu_min = wgpu_logits_vec
+            .iter()
+            .cloned()
+            .fold(f32::INFINITY, f32::min);
+        let wgpu_max = wgpu_logits_vec
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         println!("\nLogit ranges:");
         println!("  HIP:  [{:.4}, {:.4}]", hip_min, hip_max);
         println!("  WGPU: [{:.4}, {:.4}]", wgpu_min, wgpu_max);
@@ -983,7 +991,11 @@ mod tests {
         let mut offset = 0usize;
         for (b, &len) in lengths.iter().enumerate() {
             for t in 0..len {
-                let base_val = if b == 0 { (t + 1) as f32 } else { ((t + 1) * 10) as f32 };
+                let base_val = if b == 0 {
+                    (t + 1) as f32
+                } else {
+                    ((t + 1) * 10) as f32
+                };
                 for v in 0..vocab_size {
                     data[(offset + t) * vocab_size + v] = base_val;
                 }
@@ -992,8 +1004,7 @@ mod tests {
         }
 
         let logits: TensorCpu<f32> =
-            TensorInit::from_data(Shape::new(vocab_size, total_tokens, 1, 1), data)
-                .unwrap();
+            TensorInit::from_data(Shape::new(vocab_size, total_tokens, 1, 1), data).unwrap();
 
         let extracted = runtime.extract_last_logits(&logits, &lengths);
 
@@ -1026,7 +1037,11 @@ mod tests {
         let mut offset = 0usize;
         for (b, &len) in lengths.iter().enumerate() {
             for t in 0..len {
-                let base_val = if b == 0 { (t + 1) as f32 } else { ((t + 1) * 10) as f32 };
+                let base_val = if b == 0 {
+                    (t + 1) as f32
+                } else {
+                    ((t + 1) * 10) as f32
+                };
                 for v in 0..vocab_size {
                     data[(offset + t) * vocab_size + v] = base_val;
                 }
@@ -1035,8 +1050,7 @@ mod tests {
         }
 
         let logits: TensorCpu<f32> =
-            TensorInit::from_data(Shape::new(vocab_size, total_tokens, 1, 1), data)
-                .unwrap();
+            TensorInit::from_data(Shape::new(vocab_size, total_tokens, 1, 1), data).unwrap();
 
         let extracted = runtime.extract_all_logits(&logits, &lengths);
 
@@ -1072,7 +1086,9 @@ mod tests {
 
         // Process [1, 2, 3] without padding
         let seq: Vec<u32> = vec![1, 2, 3];
-        let _logits_unpadded = runtime_unpadded.infer_one(&seq).expect("Unpadded inference failed");
+        let _logits_unpadded = runtime_unpadded
+            .infer_one(&seq)
+            .expect("Unpadded inference failed");
         let state_unpadded = runtime_unpadded.get_state_snapshot();
 
         // Process [1, 2, 3] with padding via variable-length batch
@@ -1080,7 +1096,7 @@ mod tests {
         // But we only care about the first batch's state
         let seq1: Vec<u32> = vec![1, 2, 3];
         let seq2: Vec<u32> = vec![4, 5]; // Different sequence, will be padded
-        // infer() now handles variable-length sequences automatically
+                                         // infer() now handles variable-length sequences automatically
         let _logits_padded = runtime_padded
             .infer(&[&seq1, &seq2])
             .expect("Padded inference failed");
@@ -1162,7 +1178,10 @@ mod tests {
         assert_eq!(output.0.len(), 1, "Should have 1 batch output");
         let out_shape = output.0[0].0.shape();
         assert_eq!(out_shape[0], vocab_size, "First dim should be vocab_size");
-        assert_eq!(out_shape[1], 1, "Second dim should be 1 for RnnOption::Last");
+        assert_eq!(
+            out_shape[1], 1,
+            "Second dim should be 1 for RnnOption::Last"
+        );
 
         // Verify input was consumed
         assert_eq!(remaining.num_token(), 0, "Input should be consumed");
@@ -1205,7 +1224,10 @@ mod tests {
         // Batch 1: Full option → [vocab, 2, 1, 1]
         let shape1 = output.0[1].0.shape();
         assert_eq!(shape1[0], vocab_size);
-        assert_eq!(shape1[1], 2, "Batch 1 with Full should have 2 output tokens");
+        assert_eq!(
+            shape1[1], 2,
+            "Batch 1 with Full should have 2 output tokens"
+        );
 
         // Verify input was consumed
         assert_eq!(remaining.num_token(), 0, "Input should be consumed");
@@ -1341,28 +1363,27 @@ mod tests {
         let top_k = |logits: &[f32], token_idx: usize, k: usize| -> Vec<usize> {
             let start = token_idx * vocab;
             let end = start + vocab;
-            let mut indexed: Vec<(usize, f32)> = logits[start..end]
-                .iter()
-                .copied()
-                .enumerate()
-                .collect();
+            let mut indexed: Vec<(usize, f32)> =
+                logits[start..end].iter().copied().enumerate().collect();
             indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             indexed.into_iter().take(k).map(|(i, _)| i).collect()
         };
         for token_idx in 0..tokens.len() {
             let chunked_top5 = top_k(&chunked_logits, token_idx, 5);
             let direct_top5 = top_k(direct_data, token_idx, 5);
-            let overlap = chunked_top5.iter().filter(|i| direct_top5.contains(i)).count() as f32 / 5.0;
+            let overlap = chunked_top5
+                .iter()
+                .filter(|i| direct_top5.contains(i))
+                .count() as f32
+                / 5.0;
             if overlap < 0.8 {
                 eprintln!(
                     "Warning: chunked vs direct top-5 overlap low at token {} (overlap={:.2})",
-                    token_idx,
-                    overlap
+                    token_idx, overlap
                 );
             }
         }
 
         println!("test_hip_runtime_chunked_matches_direct PASSED");
     }
-
 }

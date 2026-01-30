@@ -11,15 +11,14 @@
 
 use std::ffi::c_int;
 
-use half::f16;
-use super::ffi::{
-    HipErrorKind, Result, RocblasHandle, ROCBLAS_STATUS_SUCCESS,
-    rocblas_handle_create, rocblas_handle_destroy, rocblas_set_stream_wrapper,
-    rocblas_to_hip_error,
-    launch_hgemm, launch_hgemm_f32_out, launch_sgemm, launch_sgemm_ta,
-};
 use super::device::Stream;
-use super::tensor::{TensorShape, TensorHip};
+use super::ffi::{
+    launch_hgemm, launch_hgemm_f32_out, launch_sgemm, launch_sgemm_ta, rocblas_handle_create,
+    rocblas_handle_destroy, rocblas_set_stream_wrapper, rocblas_to_hip_error, HipErrorKind, Result,
+    RocblasHandle, ROCBLAS_STATUS_SUCCESS,
+};
+use super::tensor::{TensorHip, TensorShape};
+use half::f16;
 
 // ============================================================================
 // HipBlasContext - Reusable BLAS context for efficient batched operations
@@ -239,9 +238,9 @@ pub fn hgemm_f16(
     // weight: [N, K, 1, 1] where N is out_features, K is in_features
     // input: [K, T, B, 1] where K is in_features, T*B is total columns
     // For batched inputs, we flatten all non-first dimensions into columns
-    let m = weight_shape[0] as c_int;  // N (output features) - rows of weight
-    let k = weight_shape[1] as c_int;  // K (input features) - cols of weight, rows of input
-    // Compute n as product of all dimensions except the first (handles batching)
+    let m = weight_shape[0] as c_int; // N (output features) - rows of weight
+    let k = weight_shape[1] as c_int; // K (input features) - cols of weight, rows of input
+                                      // Compute n as product of all dimensions except the first (handles batching)
     let n = (input_shape[1] * input_shape[2] * input_shape[3]) as c_int;
 
     // Verify dimensions
@@ -258,7 +257,9 @@ pub fn hgemm_f16(
     let status = unsafe {
         launch_hgemm(
             handle,
-            m, n, k,
+            m,
+            n,
+            k,
             weight.as_ptr() as *const u16,
             input.as_ptr() as *const u16,
             output.as_mut_ptr() as *mut u16,
@@ -300,9 +301,9 @@ pub fn hgemm_f16_to_f32(
 
     // weight: [M, K, 1, 1] where M is out_features (vocab_size), K is in_features (n_embd)
     // input: [K, T, B, 1] where K is in_features, T*B is total columns
-    let m = weight_shape[0] as c_int;  // M (output features / vocab_size)
-    let k = weight_shape[1] as c_int;  // K (input features / n_embd)
-    // Compute n as product of all dimensions except the first (handles batching)
+    let m = weight_shape[0] as c_int; // M (output features / vocab_size)
+    let k = weight_shape[1] as c_int; // K (input features / n_embd)
+                                      // Compute n as product of all dimensions except the first (handles batching)
     let n = (input_shape[1] * input_shape[2] * input_shape[3]) as c_int;
 
     // Verify dimensions
@@ -319,7 +320,9 @@ pub fn hgemm_f16_to_f32(
     let status = unsafe {
         launch_hgemm_f32_out(
             handle,
-            m, n, k,
+            m,
+            n,
+            k,
             weight.as_ptr() as *const u16,
             input.as_ptr() as *const u16,
             output.as_mut_ptr(),
@@ -366,9 +369,9 @@ pub fn sgemm_f32(
     // weight: [N, K, 1, 1] where N is out_features, K is in_features
     // input: [K, T, B, 1] where K is in_features, T*B is total columns
     // For batched inputs, we flatten all non-first dimensions into columns
-    let m = weight_shape[0] as c_int;  // N (output features) - rows of weight
-    let k = weight_shape[1] as c_int;  // K (input features) - cols of weight, rows of input
-    // Compute n as product of all dimensions except the first (handles batching)
+    let m = weight_shape[0] as c_int; // N (output features) - rows of weight
+    let k = weight_shape[1] as c_int; // K (input features) - cols of weight, rows of input
+                                      // Compute n as product of all dimensions except the first (handles batching)
     let n = (input_shape[1] * input_shape[2] * input_shape[3]) as c_int;
 
     // Verify dimensions
@@ -385,11 +388,13 @@ pub fn sgemm_f32(
     let status = unsafe {
         launch_sgemm(
             handle,
-            m, n, k,
-            1.0,  // alpha
+            m,
+            n,
+            k,
+            1.0, // alpha
             weight.as_ptr(),
             input.as_ptr(),
-            0.0,  // beta
+            0.0, // beta
             output.as_mut_ptr(),
         )
     };
@@ -424,16 +429,19 @@ pub fn sgemm_f32(
 pub fn hip_sgemm(
     weight: &[f32],
     input: &[f32],
-    m: usize,   // output features (N)
-    k: usize,   // input features (K)
-    n: usize,   // tokens (A)
+    m: usize, // output features (N)
+    k: usize, // input features (K)
+    n: usize, // tokens (A)
 ) -> Result<Vec<f32>> {
     if weight.len() != m * k {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Weight size mismatch: expected {}×{}={}, got {}",
-                m, k, m * k, weight.len()
+                m,
+                k,
+                m * k,
+                weight.len()
             ),
         });
     }
@@ -442,7 +450,10 @@ pub fn hip_sgemm(
             code: -1,
             message: format!(
                 "Input size mismatch: expected {}×{}={}, got {}",
-                k, n, k * n, input.len()
+                k,
+                n,
+                k * n,
+                input.len()
             ),
         });
     }
@@ -497,16 +508,19 @@ pub fn hip_sgemm(
 pub fn hip_sgemm_ta(
     weight: &[f32],
     input: &[f32],
-    m: usize,   // output features
-    k: usize,   // input features
-    n: usize,   // tokens
+    m: usize, // output features
+    k: usize, // input features
+    n: usize, // tokens
 ) -> Result<Vec<f32>> {
     if weight.len() != m * k {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Weight size mismatch: expected {}×{}={}, got {}",
-                m, k, m * k, weight.len()
+                m,
+                k,
+                m * k,
+                weight.len()
             ),
         });
     }
@@ -515,7 +529,10 @@ pub fn hip_sgemm_ta(
             code: -1,
             message: format!(
                 "Input size mismatch: expected {}×{}={}, got {}",
-                k, n, k * n, input.len()
+                k,
+                n,
+                k * n,
+                input.len()
             ),
         });
     }
@@ -525,7 +542,7 @@ pub fn hip_sgemm_ta(
     // For transposed A:
     // weight is stored as row-major [M, K] = column-major [K, M]
     // We tell rocBLAS to use shape [K, M] and transpose to get [M, K]
-    let weight_shape = TensorShape::new(k, m, 1, 1);  // stored shape
+    let weight_shape = TensorShape::new(k, m, 1, 1); // stored shape
     let input_shape = TensorShape::new(k, n, 1, 1);
     let output_shape = TensorShape::new(m, n, 1, 1);
 
@@ -539,11 +556,13 @@ pub fn hip_sgemm_ta(
     let status = unsafe {
         launch_sgemm_ta(
             handle,
-            m as c_int, n as c_int, k as c_int,
-            1.0,  // alpha
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            1.0, // alpha
             d_weight.as_ptr(),
             d_input.as_ptr(),
-            0.0,  // beta
+            0.0, // beta
             d_output.as_mut_ptr(),
         )
     };
@@ -573,16 +592,19 @@ pub fn hip_sgemm_ta(
 pub fn hip_hgemm(
     weight: &[f16],
     input: &[f16],
-    m: usize,   // output features (N)
-    k: usize,   // input features (K)
-    n: usize,   // tokens (A)
+    m: usize, // output features (N)
+    k: usize, // input features (K)
+    n: usize, // tokens (A)
 ) -> Result<Vec<f16>> {
     if weight.len() != m * k {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Weight size mismatch: expected {}×{}={}, got {}",
-                m, k, m * k, weight.len()
+                m,
+                k,
+                m * k,
+                weight.len()
             ),
         });
     }
@@ -591,7 +613,10 @@ pub fn hip_hgemm(
             code: -1,
             message: format!(
                 "Input size mismatch: expected {}×{}={}, got {}",
-                k, n, k * n, input.len()
+                k,
+                n,
+                k * n,
+                input.len()
             ),
         });
     }

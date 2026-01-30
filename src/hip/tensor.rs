@@ -3,14 +3,12 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use super::ffi::{
-    HipErrorKind, Result, check,
-    hip_malloc, hip_malloc_managed, hip_free, hip_memset,
-    hip_memcpy_h2d, hip_memcpy_d2h,
-};
-use super::device::Stream;
 use super::buffer::MemoryType;
-
+use super::device::Stream;
+use super::ffi::{
+    check, hip_free, hip_malloc, hip_malloc_managed, hip_memcpy_d2h, hip_memcpy_h2d, hip_memset,
+    HipErrorKind, Result,
+};
 
 /// A 4D tensor shape following web-rwkv conventions.
 ///
@@ -131,7 +129,11 @@ impl TensorView {
 
     /// Convert shaped indices to linear index within this view.
     pub fn linear_index(&self, x: usize, y: usize, z: usize, w: usize) -> usize {
-        self.offset + x * self.strides[0] + y * self.strides[1] + z * self.strides[2] + w * self.strides[3]
+        self.offset
+            + x * self.strides[0]
+            + y * self.strides[1]
+            + z * self.strides[2]
+            + w * self.strides[3]
     }
 
     /// Create a sub-view (slice) of this view.
@@ -146,8 +148,10 @@ impl TensorView {
         w_range: (usize, usize),
     ) -> Result<Self> {
         // Validate ranges
-        if x_range.1 > self.shape[0] || y_range.1 > self.shape[1]
-            || z_range.1 > self.shape[2] || w_range.1 > self.shape[3]
+        if x_range.1 > self.shape[0]
+            || y_range.1 > self.shape[1]
+            || z_range.1 > self.shape[2]
+            || w_range.1 > self.shape[3]
         {
             return Err(HipErrorKind {
                 code: -1,
@@ -467,7 +471,11 @@ impl<T: Copy> TensorHip<T> {
         if data.len() != self.len() {
             return Err(HipErrorKind {
                 code: -1,
-                message: format!("Size mismatch: host {} vs tensor {}", data.len(), self.len()),
+                message: format!(
+                    "Size mismatch: host {} vs tensor {}",
+                    data.len(),
+                    self.len()
+                ),
             });
         }
 
@@ -508,7 +516,9 @@ impl<T: Copy> TensorHip<T> {
                 code: -1,
                 message: format!(
                     "Copy would exceed buffer: offset {} + len {} > allocated {}",
-                    offset, data.len(), self.allocated_len
+                    offset,
+                    data.len(),
+                    self.allocated_len
                 ),
             });
         }
@@ -539,9 +549,7 @@ impl<T: Copy> TensorHip<T> {
         }
 
         let size = self.allocated_len * std::mem::size_of::<T>();
-        unsafe {
-            check(hip_memset(self.ptr as *mut c_void, 0, size))
-        }
+        unsafe { check(hip_memset(self.ptr as *mut c_void, 0, size)) }
     }
 
     /// Create a view (slice) of this tensor.
@@ -653,7 +661,10 @@ impl<T: Copy> TensorHip<T> {
                 code: -1,
                 message: format!(
                     "Cannot reshape: old shape {} (len={}) != new shape {} (len={})",
-                    self.shape(), old_len, new_shape, new_len
+                    self.shape(),
+                    old_len,
+                    new_shape,
+                    new_len
                 ),
             });
         }
@@ -685,7 +696,10 @@ impl<T: Copy> TensorHip<T> {
                 code: -1,
                 message: format!(
                     "Cannot reshape: old shape {} (len={}) != new shape {} (len={})",
-                    self.shape(), old_len, new_shape, new_len
+                    self.shape(),
+                    old_len,
+                    new_shape,
+                    new_len
                 ),
             });
         }
@@ -717,20 +731,20 @@ unsafe impl<T: Sync> Sync for TensorHip<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hip::device::{Stream, Event};
+    use crate::hip::device::{Event, Stream};
 
     #[test]
     fn test_tensor_new_empty() {
-        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::new(0, 1, 1, 1))
-            .expect("Failed to create empty tensor");
+        let tensor: TensorHip<f32> =
+            TensorHip::new(TensorShape::new(0, 1, 1, 1)).expect("Failed to create empty tensor");
         assert_eq!(tensor.len(), 0);
         assert!(tensor.is_empty());
     }
 
     #[test]
     fn test_tensor_new_1d() {
-        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::from_slice(&[100]))
-            .expect("Failed to create 1D tensor");
+        let tensor: TensorHip<f32> =
+            TensorHip::new(TensorShape::from_slice(&[100])).expect("Failed to create 1D tensor");
         assert_eq!(tensor.shape().dim(0), 100);
         assert_eq!(tensor.len(), 100);
         assert!(!tensor.is_empty());
@@ -771,8 +785,13 @@ mod tests {
 
         assert_eq!(result.len(), data.len());
         for (i, (&expected, &actual)) in data.iter().zip(result.iter()).enumerate() {
-            assert!((expected - actual).abs() < 1e-6,
-                "Mismatch at index {}: expected {}, got {}", i, expected, actual);
+            assert!(
+                (expected - actual).abs() < 1e-6,
+                "Mismatch at index {}: expected {}, got {}",
+                i,
+                expected,
+                actual
+            );
         }
     }
 
@@ -789,7 +808,8 @@ mod tests {
         let mut dst = vec![0.0f32; 256];
 
         // Async copy
-        tensor.copy_to_slice_async(&mut dst, &stream)
+        tensor
+            .copy_to_slice_async(&mut dst, &stream)
             .expect("copy_to_slice_async failed");
 
         // Record event and sync
@@ -799,8 +819,13 @@ mod tests {
 
         // Verify data
         for (i, (&expected, &actual)) in data.iter().zip(dst.iter()).enumerate() {
-            assert!((expected - actual).abs() < 1e-6,
-                "Mismatch at index {}: expected {}, got {}", i, expected, actual);
+            assert!(
+                (expected - actual).abs() < 1e-6,
+                "Mismatch at index {}: expected {}, got {}",
+                i,
+                expected,
+                actual
+            );
         }
     }
 
@@ -822,13 +847,14 @@ mod tests {
     #[test]
     fn test_tensor_copy_to_slice_async_empty() {
         let stream = Stream::null();
-        let tensor: TensorHip<f32> = TensorHip::new(TensorShape::new(0, 1, 1, 1))
-            .expect("Failed to create empty tensor");
+        let tensor: TensorHip<f32> =
+            TensorHip::new(TensorShape::new(0, 1, 1, 1)).expect("Failed to create empty tensor");
 
         let mut dst: Vec<f32> = vec![];
 
         // Should succeed (no-op for empty)
-        tensor.copy_to_slice_async(&mut dst, &stream)
+        tensor
+            .copy_to_slice_async(&mut dst, &stream)
             .expect("Empty copy should succeed");
     }
 
@@ -844,8 +870,8 @@ mod tests {
     #[test]
     fn test_tensor_fill_zero() {
         let stream = Stream::null();
-        let mut tensor: TensorHip<f32> = TensorHip::new(TensorShape::from_slice(&[100]))
-            .expect("Failed to create tensor");
+        let mut tensor: TensorHip<f32> =
+            TensorHip::new(TensorShape::from_slice(&[100])).expect("Failed to create tensor");
 
         // Fill with zeros
         tensor.fill_zero().expect("Failed to fill tensor");

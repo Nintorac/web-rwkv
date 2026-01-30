@@ -1,34 +1,72 @@
 //! HIP kernel wrapper functions.
 
-use std::ffi::c_int;
 use half::f16;
+use std::ffi::c_int;
 
-use super::ffi::{
-    HipErrorKind, Result, check,
-    launch_copy_f32, launch_decay_exp_f32, launch_lerp_f32,
-    launch_sigmoid_f32, launch_squared_relu_f32, launch_softplus_decay_f32,
-    launch_layer_norm_f32, launch_group_norm_f32, launch_l2_norm_f32,
-    launch_tanh_f32, launch_token_shift_f32, launch_channel_mix_state_f32,
-    launch_channel_mix_state_f32_masked,
-    launch_wkv_bonus_f32, launch_control_k_f32, launch_wkv7_f32, launch_wkv7_f32_masked,
-    launch_copy_f16, launch_copy_f16_to_f32, launch_decay_exp_f16, launch_lerp_f16,
-    launch_sigmoid_f16, launch_squared_relu_f16, launch_softplus_decay_f16,
-    launch_layer_norm_f16, launch_group_norm_f16, launch_l2_norm_f16,
-    launch_tanh_f16, launch_channel_mix_state_f16, launch_channel_mix_state_f16_masked,
-    launch_wkv_bonus_f16, launch_control_k_f16, launch_wkv7_f16_masked,
-    // Elementwise operations
-    launch_add_f32, launch_mul_f32, launch_negate_f32, launch_exp_f32,
-    launch_broadcast_add_f32, launch_broadcast_mul_f32,
-    launch_add_f16, launch_mul_f16, launch_negate_f16, launch_exp_f16,
-    launch_broadcast_add_f16, launch_broadcast_mul_f16,
-};
-use super::device::Stream;
 use super::buffer::DeviceBuffer;
-use super::tensor::{TensorShape, TensorHip};
+use super::device::Stream;
+use super::ffi::{
+    check,
+    launch_add_f16,
+    // Elementwise operations
+    launch_add_f32,
+    launch_broadcast_add_f16,
+    launch_broadcast_add_f32,
+    launch_broadcast_mul_f16,
+    launch_broadcast_mul_f32,
+    launch_channel_mix_state_f16,
+    launch_channel_mix_state_f16_masked,
+    launch_channel_mix_state_f32,
+    launch_channel_mix_state_f32_masked,
+    launch_control_k_f16,
+    launch_control_k_f32,
+    launch_copy_f16,
+    launch_copy_f16_to_f32,
+    launch_copy_f32,
+    launch_decay_exp_f16,
+    launch_decay_exp_f32,
+    launch_exp_f16,
+    launch_exp_f32,
+    launch_group_norm_f16,
+    launch_group_norm_f32,
+    launch_l2_norm_f16,
+    launch_l2_norm_f32,
+    launch_layer_norm_f16,
+    launch_layer_norm_f32,
+    launch_lerp_f16,
+    launch_lerp_f32,
+    launch_mul_f16,
+    launch_mul_f32,
+    launch_negate_f16,
+    launch_negate_f32,
+    launch_sigmoid_f16,
+    launch_sigmoid_f32,
+    launch_softplus_decay_f16,
+    launch_softplus_decay_f32,
+    launch_squared_relu_f16,
+    launch_squared_relu_f32,
+    launch_tanh_f16,
+    launch_tanh_f32,
+    launch_token_shift_f32,
+    launch_wkv7_f16_masked,
+    launch_wkv7_f32,
+    launch_wkv7_f32_coalesced,
+    launch_wkv7_f32_masked,
+    // WKV7 GEMV operations
+    launch_wkv7_gemv,
+    launch_wkv7_state_update_flat,
+    launch_wkv7_tiled,
+    launch_wkv7_wave_reduce_t1,
+    launch_wkv_bonus_f16,
+    launch_wkv_bonus_f32,
+    HipErrorKind,
+    Result,
+    RocblasHandle,
+};
+use super::tensor::{TensorHip, TensorShape};
 
 #[cfg(feature = "hip-probes")]
 use crate::hip_probe;
-
 
 /// Launch the copy kernel to copy f32 data from input to output
 pub fn copy_f32(
@@ -274,7 +312,10 @@ pub fn lerp_f32(
             code: -1,
             message: format!(
                 "Size mismatch: a={}, b={}, t={}, output={}",
-                n, b.len(), t.len(), output.len()
+                n,
+                b.len(),
+                t.len(),
+                output.len()
             ),
         });
     }
@@ -309,7 +350,10 @@ pub fn lerp_f16(
             code: -1,
             message: format!(
                 "Size mismatch: a={}, b={}, t={}, output={}",
-                n, b.len(), t.len(), output.len()
+                n,
+                b.len(),
+                t.len(),
+                output.len()
             ),
         });
     }
@@ -615,8 +659,8 @@ pub fn layer_norm_f32(
     stream: &Stream,
 ) -> Result<()> {
     // Input shape: [C, T, B, 1] - treat T*B as total vectors
-    let c = input.shape()[0];  // Channel dimension (normalize over this)
-    // Compute n as product of all dimensions except the first (handles batching)
+    let c = input.shape()[0]; // Channel dimension (normalize over this)
+                              // Compute n as product of all dimensions except the first (handles batching)
     let n = input.shape()[1] * input.shape()[2] * input.shape()[3];
 
     // Validate shapes - output should have same total size
@@ -626,7 +670,10 @@ pub fn layer_norm_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
-                c, n, output.shape(), out_n
+                c,
+                n,
+                output.shape(),
+                out_n
             ),
         });
     }
@@ -635,7 +682,9 @@ pub fn layer_norm_f32(
             code: -1,
             message: format!(
                 "Weight/bias shape mismatch: expected [{}, 1, 1, 1], got weight={}, bias={}",
-                c, weight.shape(), bias.shape()
+                c,
+                weight.shape(),
+                bias.shape()
             ),
         });
     }
@@ -677,7 +726,11 @@ pub fn layer_norm_f16(
             message: "layer_norm_f16 shape mismatch".to_string(),
         });
     }
-    if !input.is_contiguous() || !output.is_contiguous() || !weight.is_contiguous() || !bias.is_contiguous() {
+    if !input.is_contiguous()
+        || !output.is_contiguous()
+        || !weight.is_contiguous()
+        || !bias.is_contiguous()
+    {
         return Err(HipErrorKind {
             code: -1,
             message: "layer_norm_f16 requires contiguous tensors".to_string(),
@@ -721,7 +774,10 @@ pub fn hip_layer_norm(
             code: -1,
             message: format!(
                 "Input size mismatch: expected {} ({}*{}), got {}",
-                c * n, c, n, input.len()
+                c * n,
+                c,
+                n,
+                input.len()
             ),
         });
     }
@@ -730,7 +786,9 @@ pub fn hip_layer_norm(
             code: -1,
             message: format!(
                 "Weight/bias size mismatch: expected {}, got weight={}, bias={}",
-                c, weight.len(), bias.len()
+                c,
+                weight.len(),
+                bias.len()
             ),
         });
     }
@@ -793,7 +851,10 @@ pub fn group_norm_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
-                c, n, output.shape(), out_n
+                c,
+                n,
+                output.shape(),
+                out_n
             ),
         });
     }
@@ -846,7 +907,10 @@ pub fn group_norm_f16(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
-                c, n, output.shape(), out_n
+                c,
+                n,
+                output.shape(),
+                out_n
             ),
         });
     }
@@ -885,7 +949,11 @@ pub fn hip_group_norm(
     if input.len() != c * n {
         return Err(HipErrorKind {
             code: -1,
-            message: format!("Input size mismatch: expected {}, got {}", c * n, input.len()),
+            message: format!(
+                "Input size mismatch: expected {}, got {}",
+                c * n,
+                input.len()
+            ),
         });
     }
     if weight.len() != c || bias.len() != c {
@@ -904,7 +972,15 @@ pub fn hip_group_norm(
     let d_bias = TensorHip::from_slice(bias, param_shape, &stream)?;
     let mut d_output = TensorHip::<f32>::new(input_shape)?;
 
-    group_norm_f32(&d_input, &d_weight, &d_bias, &mut d_output, num_groups, eps, &stream)?;
+    group_norm_f32(
+        &d_input,
+        &d_weight,
+        &d_bias,
+        &mut d_output,
+        num_groups,
+        eps,
+        &stream,
+    )?;
 
     d_output.to_vec(&stream)
 }
@@ -947,7 +1023,10 @@ pub fn l2_norm_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
-                c, n, output.shape(), out_n
+                c,
+                n,
+                output.shape(),
+                out_n
             ),
         });
     }
@@ -996,7 +1075,10 @@ pub fn l2_norm_f16(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected C={} with {} vectors, got {} with {} vectors",
-                c, n, output.shape(), out_n
+                c,
+                n,
+                output.shape(),
+                out_n
             ),
         });
     }
@@ -1031,7 +1113,11 @@ pub fn hip_l2_norm(
     if input.len() != c * n {
         return Err(HipErrorKind {
             code: -1,
-            message: format!("Input size mismatch: expected {}, got {}", c * n, input.len()),
+            message: format!(
+                "Input size mismatch: expected {}, got {}",
+                c * n,
+                input.len()
+            ),
         });
     }
 
@@ -1152,17 +1238,16 @@ pub fn token_shift_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, t, output.shape()
+                c,
+                t,
+                output.shape()
             ),
         });
     }
     if state_in.shape()[0] != c || state_out.shape()[0] != c {
         return Err(HipErrorKind {
             code: -1,
-            message: format!(
-                "State shape mismatch: expected [{}, 1, 1, 1]",
-                c
-            ),
+            message: format!("State shape mismatch: expected [{}, 1, 1, 1]", c),
         });
     }
     if mix.shape()[0] != c {
@@ -1170,7 +1255,8 @@ pub fn token_shift_f32(
             code: -1,
             message: format!(
                 "Mix shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c, mix.shape()
+                c,
+                mix.shape()
             ),
         });
     }
@@ -1221,7 +1307,14 @@ pub fn hip_token_shift(
     let mut d_output = TensorHip::<f32>::new(x_shape)?;
     let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
 
-    token_shift_f32(&d_x, &d_state_in, &d_mix, &mut d_output, &mut d_state_out, &stream)?;
+    token_shift_f32(
+        &d_x,
+        &d_state_in,
+        &d_mix,
+        &mut d_output,
+        &mut d_state_out,
+        &stream,
+    )?;
 
     let output = d_output.to_vec(&stream)?;
     let state_out = d_state_out.to_vec(&stream)?;
@@ -1258,7 +1351,8 @@ pub fn channel_mix_state_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                x.shape(), output.shape()
+                x.shape(),
+                output.shape()
             ),
         });
     }
@@ -1267,7 +1361,9 @@ pub fn channel_mix_state_f32(
             code: -1,
             message: format!(
                 "State shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, b, state_in.shape()
+                c,
+                b,
+                state_in.shape()
             ),
         });
     }
@@ -1276,7 +1372,8 @@ pub fn channel_mix_state_f32(
             code: -1,
             message: format!(
                 "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c, x_k.shape()
+                c,
+                x_k.shape()
             ),
         });
     }
@@ -1328,7 +1425,8 @@ pub fn channel_mix_state_f32_masked(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                x.shape(), output.shape()
+                x.shape(),
+                output.shape()
             ),
         });
     }
@@ -1337,7 +1435,9 @@ pub fn channel_mix_state_f32_masked(
             code: -1,
             message: format!(
                 "State shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, b, state_in.shape()
+                c,
+                b,
+                state_in.shape()
             ),
         });
     }
@@ -1346,7 +1446,8 @@ pub fn channel_mix_state_f32_masked(
             code: -1,
             message: format!(
                 "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c, x_k.shape()
+                c,
+                x_k.shape()
             ),
         });
     }
@@ -1355,7 +1456,8 @@ pub fn channel_mix_state_f32_masked(
             code: -1,
             message: format!(
                 "Lengths shape mismatch: expected [{}, 1, 1, 1], got {}",
-                b, lengths.shape()
+                b,
+                lengths.shape()
             ),
         });
     }
@@ -1393,7 +1495,8 @@ pub fn channel_mix_state_f16(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                x.shape(), output.shape()
+                x.shape(),
+                output.shape()
             ),
         });
     }
@@ -1402,7 +1505,9 @@ pub fn channel_mix_state_f16(
             code: -1,
             message: format!(
                 "State shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, b, state_in.shape()
+                c,
+                b,
+                state_in.shape()
             ),
         });
     }
@@ -1411,7 +1516,8 @@ pub fn channel_mix_state_f16(
             code: -1,
             message: format!(
                 "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c, x_k.shape()
+                c,
+                x_k.shape()
             ),
         });
     }
@@ -1449,7 +1555,8 @@ pub fn channel_mix_state_f16_masked(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                x.shape(), output.shape()
+                x.shape(),
+                output.shape()
             ),
         });
     }
@@ -1458,7 +1565,9 @@ pub fn channel_mix_state_f16_masked(
             code: -1,
             message: format!(
                 "State shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c, b, state_in.shape()
+                c,
+                b,
+                state_in.shape()
             ),
         });
     }
@@ -1467,7 +1576,8 @@ pub fn channel_mix_state_f16_masked(
             code: -1,
             message: format!(
                 "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c, x_k.shape()
+                c,
+                x_k.shape()
             ),
         });
     }
@@ -1476,7 +1586,8 @@ pub fn channel_mix_state_f16_masked(
             code: -1,
             message: format!(
                 "Lengths shape mismatch: expected [{}, 1, 1, 1], got {}",
-                b, lengths.shape()
+                b,
+                lengths.shape()
             ),
         });
     }
@@ -1515,7 +1626,11 @@ pub fn hip_channel_mix_state(
     if state_in.len() != c * b {
         return Err(HipErrorKind {
             code: -1,
-            message: format!("state_in size mismatch: expected {}, got {}", c * b, state_in.len()),
+            message: format!(
+                "state_in size mismatch: expected {}, got {}",
+                c * b,
+                state_in.len()
+            ),
         });
     }
     if x_k.len() != c {
@@ -1537,7 +1652,14 @@ pub fn hip_channel_mix_state(
     let mut d_output = TensorHip::<f32>::new(x_shape)?;
     let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
 
-    channel_mix_state_f32(&d_x, &d_state_in, &d_x_k, &mut d_output, &mut d_state_out, &stream)?;
+    channel_mix_state_f32(
+        &d_x,
+        &d_state_in,
+        &d_x_k,
+        &mut d_output,
+        &mut d_state_out,
+        &stream,
+    )?;
 
     let output = d_output.to_vec(&stream)?;
     let state_out = d_state_out.to_vec(&stream)?;
@@ -1566,10 +1688,10 @@ pub fn wkv_bonus_f32(
     stream: &Stream,
 ) -> Result<()> {
     // Shape: [N, H, T, B] where N=head_size
-    let n = r.shape()[0];  // head_size
-    let h = r.shape()[1];  // n_heads
-    let t = r.shape()[2];  // tokens
-    let b = r.shape()[3];  // batch
+    let n = r.shape()[0]; // head_size
+    let h = r.shape()[1]; // n_heads
+    let t = r.shape()[2]; // tokens
+    let b = r.shape()[3]; // batch
 
     // Validate shapes
     if k.shape() != r.shape() || v.shape() != r.shape() {
@@ -1577,7 +1699,9 @@ pub fn wkv_bonus_f32(
             code: -1,
             message: format!(
                 "Shape mismatch: r={}, k={}, v={}",
-                r.shape(), k.shape(), v.shape()
+                r.shape(),
+                k.shape(),
+                v.shape()
             ),
         });
     }
@@ -1586,7 +1710,8 @@ pub fn wkv_bonus_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                r.shape(), output.shape()
+                r.shape(),
+                output.shape()
             ),
         });
     }
@@ -1595,12 +1720,18 @@ pub fn wkv_bonus_f32(
             code: -1,
             message: format!(
                 "r_k shape mismatch: expected [{}, {}, 1, 1], got {}",
-                n, h, r_k.shape()
+                n,
+                h,
+                r_k.shape()
             ),
         });
     }
-    if !r.is_contiguous() || !k.is_contiguous() || !v.is_contiguous()
-        || !r_k.is_contiguous() || !output.is_contiguous() {
+    if !r.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !r_k.is_contiguous()
+        || !output.is_contiguous()
+    {
         return Err(HipErrorKind {
             code: -1,
             message: "wkv_bonus_f32 requires contiguous tensors".to_string(),
@@ -1681,10 +1812,10 @@ pub fn hip_wkv_bonus(
     k: &[f32],
     v: &[f32],
     r_k: &[f32],
-    n: usize,  // head_size
-    h: usize,  // n_heads
-    t: usize,  // tokens
-    b: usize,  // batch
+    n: usize, // head_size
+    h: usize, // n_heads
+    t: usize, // tokens
+    b: usize, // batch
 ) -> Result<Vec<f32>> {
     let expected_len = n * h * t * b;
     let rk_len = n * h;
@@ -1694,7 +1825,10 @@ pub fn hip_wkv_bonus(
             code: -1,
             message: format!(
                 "Input size mismatch: expected {}, got r={}, k={}, v={}",
-                expected_len, r.len(), k.len(), v.len()
+                expected_len,
+                r.len(),
+                k.len(),
+                v.len()
             ),
         });
     }
@@ -1748,7 +1882,8 @@ pub fn control_k_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                k.shape(), output.shape()
+                k.shape(),
+                output.shape()
             ),
         });
     }
@@ -1757,7 +1892,8 @@ pub fn control_k_f32(
             code: -1,
             message: format!(
                 "a shape mismatch: expected {}, got {}",
-                k.shape(), a.shape()
+                k.shape(),
+                a.shape()
             ),
         });
     }
@@ -1766,7 +1902,8 @@ pub fn control_k_f32(
             code: -1,
             message: format!(
                 "k_a shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c, k_a.shape()
+                c,
+                k_a.shape()
             ),
         });
     }
@@ -1860,7 +1997,9 @@ pub fn hip_control_k(
             code: -1,
             message: format!(
                 "Input size mismatch: expected {}, got k={}, a={}",
-                expected_len, k.len(), a.len()
+                expected_len,
+                k.len(),
+                a.len()
             ),
         });
     }
@@ -1917,21 +2056,29 @@ pub fn wkv7_f32(
     stream: &Stream,
 ) -> Result<()> {
     // Input shape: [N, H, T, B]
-    let n = w_decay.shape()[0];  // head_size
-    let h = w_decay.shape()[1];  // n_heads
-    let t = w_decay.shape()[2];  // tokens
-    let b_size = w_decay.shape()[3];  // batch
+    let n = w_decay.shape()[0]; // head_size
+    let h = w_decay.shape()[1]; // n_heads
+    let t = w_decay.shape()[2]; // tokens
+    let b_size = w_decay.shape()[3]; // batch
 
     // Validate input shapes
     let input_shape = w_decay.shape();
-    if q.shape() != input_shape || k.shape() != input_shape || v.shape() != input_shape
-        || a.shape() != input_shape || b.shape() != input_shape
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
     {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
-                w_decay.shape(), q.shape(), k.shape(), v.shape(), a.shape(), b.shape()
+                w_decay.shape(),
+                q.shape(),
+                k.shape(),
+                v.shape(),
+                a.shape(),
+                b.shape()
             ),
         });
     }
@@ -1942,7 +2089,8 @@ pub fn wkv7_f32(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                input_shape, output.shape()
+                input_shape,
+                output.shape()
             ),
         });
     }
@@ -1954,7 +2102,8 @@ pub fn wkv7_f32(
             code: -1,
             message: format!(
                 "state_in shape mismatch: expected {}, got {}",
-                state_shape, state_in.shape()
+                state_shape,
+                state_in.shape()
             ),
         });
     }
@@ -1963,15 +2112,22 @@ pub fn wkv7_f32(
             code: -1,
             message: format!(
                 "state_out shape mismatch: expected {}, got {}",
-                state_shape, state_out.shape()
+                state_shape,
+                state_out.shape()
             ),
         });
     }
 
     // Check contiguity
-    if !w_decay.is_contiguous() || !q.is_contiguous() || !k.is_contiguous()
-        || !v.is_contiguous() || !a.is_contiguous() || !b.is_contiguous()
-        || !state_in.is_contiguous() || !output.is_contiguous() || !state_out.is_contiguous()
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state_in.is_contiguous()
+        || !output.is_contiguous()
+        || !state_out.is_contiguous()
     {
         return Err(HipErrorKind {
             code: -1,
@@ -1997,6 +2153,292 @@ pub fn wkv7_f32(
             stream.handle(),
         ))
     }
+}
+
+/// WKV7 kernel with coalesced state memory access.
+/// Uses shared memory to stage state loads/stores for better memory bandwidth.
+pub fn wkv7_f32_coalesced(
+    w_decay: &TensorHip<f32>,
+    q: &TensorHip<f32>,
+    k: &TensorHip<f32>,
+    v: &TensorHip<f32>,
+    a: &TensorHip<f32>,
+    b: &TensorHip<f32>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    state_out: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    let n = w_decay.shape()[0];
+    let h = w_decay.shape()[1];
+    let t = w_decay.shape()[2];
+    let b_size = w_decay.shape()[3];
+
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
+                w_decay.shape(),
+                q.shape(),
+                k.shape(),
+                v.shape(),
+                a.shape(),
+                b.shape()
+            ),
+        });
+    }
+
+    if output.shape() != input_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                input_shape,
+                output.shape()
+            ),
+        });
+    }
+
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape || state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected {}, got in={}, out={}",
+                state_shape,
+                state_in.shape(),
+                state_out.shape()
+            ),
+        });
+    }
+
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state_in.is_contiguous()
+        || !output.is_contiguous()
+        || !state_out.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_f32_coalesced requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_f32_coalesced(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// High-occupancy WKV7 variant with global state (matches WGPU-style layout).
+pub fn wkv7_tiled(
+    w_decay: &TensorHip<f16>,
+    q: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    v: &TensorHip<f16>,
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    state: &mut TensorHip<f32>,
+    output: &mut TensorHip<f16>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    // Shapes
+    let n = w_decay.shape()[0];
+    let h = w_decay.shape()[1];
+    let t = w_decay.shape()[2];
+    let b_size = w_decay.shape()[3];
+
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "Input shape mismatch".to_string(),
+        });
+    }
+
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected {}, got {}",
+                state_shape,
+                state.shape()
+            ),
+        });
+    }
+
+    let output_shape = TensorShape::new(n, h, t, b_size);
+    if output.shape() != output_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                output_shape,
+                output.shape()
+            ),
+        });
+    }
+
+    if lengths.shape().len() != b_size {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "lengths size mismatch: expected {}, got {}",
+                b_size,
+                lengths.shape().len()
+            ),
+        });
+    }
+
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state.is_contiguous()
+        || !output.is_contiguous()
+        || !lengths.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_tiled requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_tiled(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state.as_mut_ptr(),
+            output.as_mut_ptr(),
+            lengths.as_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute WKV7 with coalesced state access on host data.
+pub fn hip_wkv7_coalesced(
+    w_decay: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    a: &[f32],
+    b: &[f32],
+    state_in: &[f32],
+    n: usize,
+    h: usize,
+    t: usize,
+    batch: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let input_len = n * h * t * batch;
+    let state_len = n * n * h * batch;
+
+    if w_decay.len() != input_len
+        || q.len() != input_len
+        || k.len() != input_len
+        || v.len() != input_len
+        || a.len() != input_len
+        || b.len() != input_len
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}, got w={}, q={}, k={}, v={}, a={}, b={}",
+                input_len,
+                w_decay.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                a.len(),
+                b.len()
+            ),
+        });
+    }
+    if state_in.len() != state_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_in size mismatch: expected {}, got {}",
+                state_len,
+                state_in.len()
+            ),
+        });
+    }
+
+    let stream = Stream::null();
+
+    let input_shape = TensorShape::new(n, h, t, batch);
+    let state_shape = TensorShape::new(n, n, h, batch);
+
+    let d_w_decay = TensorHip::from_slice(w_decay, input_shape, &stream)?;
+    let d_q = TensorHip::from_slice(q, input_shape, &stream)?;
+    let d_k = TensorHip::from_slice(k, input_shape, &stream)?;
+    let d_v = TensorHip::from_slice(v, input_shape, &stream)?;
+    let d_a = TensorHip::from_slice(a, input_shape, &stream)?;
+    let d_b = TensorHip::from_slice(b, input_shape, &stream)?;
+    let d_state_in = TensorHip::from_slice(state_in, state_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(input_shape)?;
+    let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
+
+    wkv7_f32_coalesced(
+        &d_w_decay,
+        &d_q,
+        &d_k,
+        &d_v,
+        &d_a,
+        &d_b,
+        &d_state_in,
+        &mut d_output,
+        &mut d_state_out,
+        &stream,
+    )?;
+
+    let output = d_output.to_vec(&stream)?;
+    let state_out = d_state_out.to_vec(&stream)?;
+
+    Ok((output, state_out))
 }
 
 /// Compute WKV7 on host data, returning (output, state_out).
@@ -2026,21 +2468,35 @@ pub fn hip_wkv7(
     let input_len = n * h * t * batch;
     let state_len = n * n * h * batch;
 
-    if w_decay.len() != input_len || q.len() != input_len || k.len() != input_len
-        || v.len() != input_len || a.len() != input_len || b.len() != input_len
+    if w_decay.len() != input_len
+        || q.len() != input_len
+        || k.len() != input_len
+        || v.len() != input_len
+        || a.len() != input_len
+        || b.len() != input_len
     {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Input size mismatch: expected {}, got w={}, q={}, k={}, v={}, a={}, b={}",
-                input_len, w_decay.len(), q.len(), k.len(), v.len(), a.len(), b.len()
+                input_len,
+                w_decay.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                a.len(),
+                b.len()
             ),
         });
     }
     if state_in.len() != state_len {
         return Err(HipErrorKind {
             code: -1,
-            message: format!("state_in size mismatch: expected {}, got {}", state_len, state_in.len()),
+            message: format!(
+                "state_in size mismatch: expected {}, got {}",
+                state_len,
+                state_in.len()
+            ),
         });
     }
 
@@ -2060,8 +2516,16 @@ pub fn hip_wkv7(
     let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
 
     wkv7_f32(
-        &d_w_decay, &d_q, &d_k, &d_v, &d_a, &d_b,
-        &d_state_in, &mut d_output, &mut d_state_out, &stream
+        &d_w_decay,
+        &d_q,
+        &d_k,
+        &d_v,
+        &d_a,
+        &d_b,
+        &d_state_in,
+        &mut d_output,
+        &mut d_state_out,
+        &stream,
     )?;
 
     let output = d_output.to_vec(&stream)?;
@@ -2095,21 +2559,29 @@ pub fn wkv7_f32_masked(
     stream: &Stream,
 ) -> Result<()> {
     // Input shape: [N, H, T, B]
-    let n = w_decay.shape()[0];  // head_size
-    let h = w_decay.shape()[1];  // n_heads
-    let t = w_decay.shape()[2];  // tokens (padded)
-    let b_size = w_decay.shape()[3];  // batch
+    let n = w_decay.shape()[0]; // head_size
+    let h = w_decay.shape()[1]; // n_heads
+    let t = w_decay.shape()[2]; // tokens (padded)
+    let b_size = w_decay.shape()[3]; // batch
 
     // Validate input shapes
     let input_shape = w_decay.shape();
-    if q.shape() != input_shape || k.shape() != input_shape || v.shape() != input_shape
-        || a.shape() != input_shape || b.shape() != input_shape
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
     {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
-                w_decay.shape(), q.shape(), k.shape(), v.shape(), a.shape(), b.shape()
+                w_decay.shape(),
+                q.shape(),
+                k.shape(),
+                v.shape(),
+                a.shape(),
+                b.shape()
             ),
         });
     }
@@ -2120,7 +2592,8 @@ pub fn wkv7_f32_masked(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                input_shape, output.shape()
+                input_shape,
+                output.shape()
             ),
         });
     }
@@ -2132,7 +2605,8 @@ pub fn wkv7_f32_masked(
             code: -1,
             message: format!(
                 "state_in shape mismatch: expected {}, got {}",
-                state_shape, state_in.shape()
+                state_shape,
+                state_in.shape()
             ),
         });
     }
@@ -2141,7 +2615,8 @@ pub fn wkv7_f32_masked(
             code: -1,
             message: format!(
                 "state_out shape mismatch: expected {}, got {}",
-                state_shape, state_out.shape()
+                state_shape,
+                state_out.shape()
             ),
         });
     }
@@ -2159,9 +2634,15 @@ pub fn wkv7_f32_masked(
     }
 
     // Check contiguity
-    if !w_decay.is_contiguous() || !q.is_contiguous() || !k.is_contiguous()
-        || !v.is_contiguous() || !a.is_contiguous() || !b.is_contiguous()
-        || !state_in.is_contiguous() || !output.is_contiguous() || !state_out.is_contiguous()
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state_in.is_contiguous()
+        || !output.is_contiguous()
+        || !state_out.is_contiguous()
         || !lengths.is_contiguous()
     {
         return Err(HipErrorKind {
@@ -2210,14 +2691,22 @@ pub fn wkv7_f16_masked(
     let b_size = w_decay.shape()[3];
 
     let input_shape = w_decay.shape();
-    if q.shape() != input_shape || k.shape() != input_shape || v.shape() != input_shape
-        || a.shape() != input_shape || b.shape() != input_shape
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
     {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
-                w_decay.shape(), q.shape(), k.shape(), v.shape(), a.shape(), b.shape()
+                w_decay.shape(),
+                q.shape(),
+                k.shape(),
+                v.shape(),
+                a.shape(),
+                b.shape()
             ),
         });
     }
@@ -2227,7 +2716,8 @@ pub fn wkv7_f16_masked(
             code: -1,
             message: format!(
                 "Output shape mismatch: expected {}, got {}",
-                input_shape, output.shape()
+                input_shape,
+                output.shape()
             ),
         });
     }
@@ -2238,7 +2728,8 @@ pub fn wkv7_f16_masked(
             code: -1,
             message: format!(
                 "state_in shape mismatch: expected {}, got {}",
-                state_shape, state_in.shape()
+                state_shape,
+                state_in.shape()
             ),
         });
     }
@@ -2247,7 +2738,8 @@ pub fn wkv7_f16_masked(
             code: -1,
             message: format!(
                 "state_out shape mismatch: expected {}, got {}",
-                state_shape, state_out.shape()
+                state_shape,
+                state_out.shape()
             ),
         });
     }
@@ -2263,9 +2755,15 @@ pub fn wkv7_f16_masked(
         });
     }
 
-    if !w_decay.is_contiguous() || !q.is_contiguous() || !k.is_contiguous()
-        || !v.is_contiguous() || !a.is_contiguous() || !b.is_contiguous()
-        || !state_in.is_contiguous() || !output.is_contiguous() || !state_out.is_contiguous()
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state_in.is_contiguous()
+        || !output.is_contiguous()
+        || !state_out.is_contiguous()
         || !lengths.is_contiguous()
     {
         return Err(HipErrorKind {
@@ -2289,6 +2787,287 @@ pub fn wkv7_f16_masked(
             n as c_int,
             h as c_int,
             t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// High-occupancy WKV7 variant using wave-cooperative reductions.
+///
+/// This kernel stores state in LDS (shared memory) and uses explicit
+/// shuffle-based reductions instead of atomics. It should have better
+/// occupancy than the original register-based kernel.
+///
+/// # Arguments
+/// Same as `wkv7_f16_masked`, but state is copied from state_in to state_out.
+pub fn wkv7_wave_reduce(
+    w_decay: &TensorHip<f16>,
+    q: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    v: &TensorHip<f16>,
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f16>,
+    state_out: &mut TensorHip<f32>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    use crate::hip::ffi::launch_wkv7_wave_reduce;
+
+    let n = w_decay.shape()[0];
+    let h = w_decay.shape()[1];
+    let t = w_decay.shape()[2];
+    let b_size = w_decay.shape()[3];
+
+    // Validate shapes (same as wkv7_f16_masked)
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Shape mismatch: w_decay={:?}, q={:?}, k={:?}, v={:?}, a={:?}, b={:?}",
+                w_decay.shape(),
+                q.shape(),
+                k.shape(),
+                v.shape(),
+                a.shape(),
+                b.shape()
+            ),
+        });
+    }
+
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape || state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected {}, got state_in={}, state_out={}",
+                state_shape,
+                state_in.shape(),
+                state_out.shape()
+            ),
+        });
+    }
+
+    let output_shape = TensorShape::new(n, h, t, b_size);
+    if output.shape() != output_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                output_shape,
+                output.shape()
+            ),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_wave_reduce(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            lengths.as_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// LDS-based WKV7 variant with state in shared memory.
+///
+/// This kernel stores state in LDS (shared memory) and uses atomic
+/// reductions. It may be faster than the original for small state sizes.
+pub fn wkv7_lds(
+    w_decay: &TensorHip<f16>,
+    q: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    v: &TensorHip<f16>,
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f16>,
+    state_out: &mut TensorHip<f32>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    use crate::hip::ffi::launch_wkv7_lds;
+
+    let n = w_decay.shape()[0];
+    let h = w_decay.shape()[1];
+    let t = w_decay.shape()[2];
+    let b_size = w_decay.shape()[3];
+
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "Input shape mismatch".to_string(),
+        });
+    }
+
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape || state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected {}, got state_in={}, state_out={}",
+                state_shape,
+                state_in.shape(),
+                state_out.shape()
+            ),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_lds(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            lengths.as_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Wave-cooperative WKV7 specialized for T=1 (decode).
+pub fn wkv7_wave_reduce_t1(
+    w_decay: &TensorHip<f16>,
+    q: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    v: &TensorHip<f16>,
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f16>,
+    state_out: &mut TensorHip<f32>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    use crate::hip::ffi::launch_wkv7_wave_reduce_t1;
+
+    let n = w_decay.shape()[0];
+    let h = w_decay.shape()[1];
+    let t = w_decay.shape()[2];
+    let b_size = w_decay.shape()[3];
+
+    if t != 1 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_wave_reduce_t1 requires T=1".to_string(),
+        });
+    }
+
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "Input shape mismatch".to_string(),
+        });
+    }
+
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape || state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected {}, got state_in={}, state_out={}",
+                state_shape,
+                state_in.shape(),
+                state_out.shape()
+            ),
+        });
+    }
+
+    let output_shape = TensorShape::new(n, h, t, b_size);
+    if output.shape() != output_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                output_shape,
+                output.shape()
+            ),
+        });
+    }
+
+    if lengths.shape().len() != b_size {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "lengths size mismatch: expected {}, got {}",
+                b_size,
+                lengths.shape().len()
+            ),
+        });
+    }
+
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state_in.is_contiguous()
+        || !output.is_contiguous()
+        || !state_out.is_contiguous()
+        || !lengths.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_wave_reduce_t1 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_wave_reduce_t1(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            lengths.as_ptr(),
+            n as c_int,
+            h as c_int,
             b_size as c_int,
             stream.handle(),
         ))
@@ -2363,27 +3142,45 @@ pub fn hip_wkv7_masked(
     let input_len = n * h * t * batch;
     let state_len = n * n * h * batch;
 
-    if w_decay.len() != input_len || q.len() != input_len || k.len() != input_len
-        || v.len() != input_len || a.len() != input_len || b.len() != input_len
+    if w_decay.len() != input_len
+        || q.len() != input_len
+        || k.len() != input_len
+        || v.len() != input_len
+        || a.len() != input_len
+        || b.len() != input_len
     {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Input size mismatch: expected {}, got w={}, q={}, k={}, v={}, a={}, b={}",
-                input_len, w_decay.len(), q.len(), k.len(), v.len(), a.len(), b.len()
+                input_len,
+                w_decay.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                a.len(),
+                b.len()
             ),
         });
     }
     if state_in.len() != state_len {
         return Err(HipErrorKind {
             code: -1,
-            message: format!("state_in size mismatch: expected {}, got {}", state_len, state_in.len()),
+            message: format!(
+                "state_in size mismatch: expected {}, got {}",
+                state_len,
+                state_in.len()
+            ),
         });
     }
     if lengths.len() != batch {
         return Err(HipErrorKind {
             code: -1,
-            message: format!("lengths size mismatch: expected {}, got {}", batch, lengths.len()),
+            message: format!(
+                "lengths size mismatch: expected {}, got {}",
+                batch,
+                lengths.len()
+            ),
         });
     }
 
@@ -2405,9 +3202,17 @@ pub fn hip_wkv7_masked(
     let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
 
     wkv7_f32_masked(
-        &d_w_decay, &d_q, &d_k, &d_v, &d_a, &d_b,
-        &d_state_in, &mut d_output, &mut d_state_out,
-        &d_lengths, &stream
+        &d_w_decay,
+        &d_q,
+        &d_k,
+        &d_v,
+        &d_a,
+        &d_b,
+        &d_state_in,
+        &mut d_output,
+        &mut d_state_out,
+        &d_lengths,
+        &stream,
     )?;
 
     let output = d_output.to_vec(&stream)?;
@@ -2434,7 +3239,9 @@ pub fn add_f32(
             code: -1,
             message: format!(
                 "Size mismatch: a={}, b={}, output={}",
-                a.len(), b.len(), output.len()
+                a.len(),
+                b.len(),
+                output.len()
             ),
         });
     }
@@ -2469,7 +3276,9 @@ pub fn mul_f32(
             code: -1,
             message: format!(
                 "Size mismatch: a={}, b={}, output={}",
-                a.len(), b.len(), output.len()
+                a.len(),
+                b.len(),
+                output.len()
             ),
         });
     }
@@ -2501,7 +3310,8 @@ pub fn negate_f32(
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2522,17 +3332,14 @@ pub fn negate_f32(
 }
 
 /// Exponential: output = exp(input)
-pub fn exp_f32(
-    input: &TensorHip<f32>,
-    output: &mut TensorHip<f32>,
-    stream: &Stream,
-) -> Result<()> {
+pub fn exp_f32(input: &TensorHip<f32>, output: &mut TensorHip<f32>, stream: &Stream) -> Result<()> {
     if input.len() != output.len() {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2567,7 +3374,8 @@ pub fn broadcast_add_f32(
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2576,7 +3384,8 @@ pub fn broadcast_add_f32(
             code: -1,
             message: format!(
                 "Broadcast incompatible: input len {} not divisible by bias len {}",
-                input.len(), bias.len()
+                input.len(),
+                bias.len()
             ),
         });
     }
@@ -2613,7 +3422,8 @@ pub fn broadcast_mul_f32(
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2622,7 +3432,8 @@ pub fn broadcast_mul_f32(
             code: -1,
             message: format!(
                 "Broadcast incompatible: input len {} not divisible by scale len {}",
-                input.len(), scale.len()
+                input.len(),
+                scale.len()
             ),
         });
     }
@@ -2655,7 +3466,9 @@ pub fn add_f16(
             code: -1,
             message: format!(
                 "Size mismatch: a={}, b={}, output={}",
-                a.len(), b.len(), output.len()
+                a.len(),
+                b.len(),
+                output.len()
             ),
         });
     }
@@ -2687,7 +3500,9 @@ pub fn mul_f16(
             code: -1,
             message: format!(
                 "Size mismatch: a={}, b={}, output={}",
-                a.len(), b.len(), output.len()
+                a.len(),
+                b.len(),
+                output.len()
             ),
         });
     }
@@ -2718,7 +3533,8 @@ pub fn negate_f16(
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2738,17 +3554,14 @@ pub fn negate_f16(
     }
 }
 
-pub fn exp_f16(
-    input: &TensorHip<f16>,
-    output: &mut TensorHip<f16>,
-    stream: &Stream,
-) -> Result<()> {
+pub fn exp_f16(input: &TensorHip<f16>, output: &mut TensorHip<f16>, stream: &Stream) -> Result<()> {
     if input.len() != output.len() {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2779,7 +3592,8 @@ pub fn broadcast_add_f16(
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2788,7 +3602,8 @@ pub fn broadcast_add_f16(
             code: -1,
             message: format!(
                 "Broadcast incompatible: input len {} not divisible by bias len {}",
-                input.len(), bias.len()
+                input.len(),
+                bias.len()
             ),
         });
     }
@@ -2821,7 +3636,8 @@ pub fn broadcast_mul_f16(
             code: -1,
             message: format!(
                 "Size mismatch: input={}, output={}",
-                input.len(), output.len()
+                input.len(),
+                output.len()
             ),
         });
     }
@@ -2830,7 +3646,8 @@ pub fn broadcast_mul_f16(
             code: -1,
             message: format!(
                 "Broadcast incompatible: input len {} not divisible by scale len {}",
-                input.len(), scale.len()
+                input.len(),
+                scale.len()
             ),
         });
     }
@@ -2852,6 +3669,269 @@ pub fn broadcast_mul_f16(
     }
 }
 
+// ============================================================================
+// WKV7 rocBLAS GEMV Implementation
+// ============================================================================
+
+/// Compute WKV7 using rocBLAS batched GEMV operations.
+///
+/// This is an alternative implementation of WKV7 that uses rocBLAS
+/// `sgemv_strided_batched` for the matrix-vector operations instead of
+/// a custom fused kernel. The algorithm:
+///
+/// ```text
+/// For each timestep t:
+///   1. sa = state @ a  (batched GEMV)
+///   2. state = state * w + outer(sa, b) + outer(v, k)  (element-wise)
+///   3. y = state @ q  (batched GEMV)
+/// ```
+///
+/// # Arguments
+/// * `handle` - rocBLAS handle (must be set to the correct stream)
+/// * `w_decay` - Pre-computed decay tensor [N, H, T, B]
+/// * `q`, `k`, `v`, `a`, `b` - Input tensors [N, H, T, B]
+/// * `state_in` - Input state tensor [N, N, H, B]
+/// * `output` - Output tensor [N, H, T, B]
+/// * `state_out` - Output state tensor [N, N, H, B]
+/// * `sa_tmp` - Scratch buffer for intermediate sa computation [N, H, B]
+/// * `stream` - HIP stream
+pub fn wkv7_gemv_f32(
+    handle: RocblasHandle,
+    w_decay: &TensorHip<f32>,
+    q: &TensorHip<f32>,
+    k: &TensorHip<f32>,
+    v: &TensorHip<f32>,
+    a: &TensorHip<f32>,
+    b: &TensorHip<f32>,
+    state_in: &TensorHip<f32>,
+    output: &mut TensorHip<f32>,
+    state_out: &mut TensorHip<f32>,
+    sa_tmp: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    // Input shape: [N, H, T, B]
+    let n = w_decay.shape()[0]; // head_size
+    let h = w_decay.shape()[1]; // n_heads
+    let t = w_decay.shape()[2]; // tokens
+    let b_size = w_decay.shape()[3]; // batch
+
+    // Validate input shapes
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input shape mismatch: w_decay={}, q={}, k={}, v={}, a={}, b={}",
+                w_decay.shape(),
+                q.shape(),
+                k.shape(),
+                v.shape(),
+                a.shape(),
+                b.shape()
+            ),
+        });
+    }
+
+    // Validate output shape
+    if output.shape() != input_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                input_shape,
+                output.shape()
+            ),
+        });
+    }
+
+    // Validate state shapes: [N, N, H, B]
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state_in.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_in shape mismatch: expected {}, got {}",
+                state_shape,
+                state_in.shape()
+            ),
+        });
+    }
+    if state_out.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_out shape mismatch: expected {}, got {}",
+                state_shape,
+                state_out.shape()
+            ),
+        });
+    }
+
+    // Validate scratch buffer shape: [N, H, B]
+    let sa_shape = TensorShape::new(n, h, b_size, 1);
+    if sa_tmp.shape() != sa_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "sa_tmp shape mismatch: expected {}, got {}",
+                sa_shape,
+                sa_tmp.shape()
+            ),
+        });
+    }
+
+    // Check contiguity
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state_in.is_contiguous()
+        || !output.is_contiguous()
+        || !state_out.is_contiguous()
+        || !sa_tmp.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_gemv_f32 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_gemv(
+            handle,
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state_in.as_ptr(),
+            output.as_mut_ptr(),
+            state_out.as_mut_ptr(),
+            sa_tmp.as_mut_ptr(),
+            n as c_int,
+            h as c_int,
+            t as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Compute WKV7 using rocBLAS GEMV on host data, returning (output, state_out).
+/// This is a convenience function for testing.
+///
+/// # Arguments
+/// * `w_decay` - Pre-computed decay data [N, H, T, B] flattened
+/// * `q`, `k`, `v`, `a`, `b` - Input data [N, H, T, B] flattened
+/// * `state_in` - Input state [N, N, H, B] flattened
+/// * `n` - head_size
+/// * `h` - n_heads
+/// * `t` - tokens
+/// * `batch` - batch size
+pub fn hip_wkv7_gemv(
+    w_decay: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    a: &[f32],
+    b: &[f32],
+    state_in: &[f32],
+    n: usize,
+    h: usize,
+    t: usize,
+    batch: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    use super::blas::{rocblas_create, rocblas_destroy, rocblas_set_stream};
+
+    let input_len = n * h * t * batch;
+    let state_len = n * n * h * batch;
+    let sa_len = n * h * batch;
+
+    if w_decay.len() != input_len
+        || q.len() != input_len
+        || k.len() != input_len
+        || v.len() != input_len
+        || a.len() != input_len
+        || b.len() != input_len
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Input size mismatch: expected {}, got w={}, q={}, k={}, v={}, a={}, b={}",
+                input_len,
+                w_decay.len(),
+                q.len(),
+                k.len(),
+                v.len(),
+                a.len(),
+                b.len()
+            ),
+        });
+    }
+    if state_in.len() != state_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_in size mismatch: expected {}, got {}",
+                state_len,
+                state_in.len()
+            ),
+        });
+    }
+
+    let stream = Stream::null();
+
+    // Create rocBLAS handle
+    let handle = rocblas_create()?;
+    rocblas_set_stream(handle, &stream)?;
+
+    let input_shape = TensorShape::new(n, h, t, batch);
+    let state_shape = TensorShape::new(n, n, h, batch);
+    let sa_shape = TensorShape::new(n, h, batch, 1);
+
+    let d_w_decay = TensorHip::from_slice(w_decay, input_shape, &stream)?;
+    let d_q = TensorHip::from_slice(q, input_shape, &stream)?;
+    let d_k = TensorHip::from_slice(k, input_shape, &stream)?;
+    let d_v = TensorHip::from_slice(v, input_shape, &stream)?;
+    let d_a = TensorHip::from_slice(a, input_shape, &stream)?;
+    let d_b = TensorHip::from_slice(b, input_shape, &stream)?;
+    let d_state_in = TensorHip::from_slice(state_in, state_shape, &stream)?;
+    let mut d_output = TensorHip::<f32>::new(input_shape)?;
+    let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
+    let mut d_sa_tmp = TensorHip::<f32>::new(sa_shape)?;
+
+    wkv7_gemv_f32(
+        handle,
+        &d_w_decay,
+        &d_q,
+        &d_k,
+        &d_v,
+        &d_a,
+        &d_b,
+        &d_state_in,
+        &mut d_output,
+        &mut d_state_out,
+        &mut d_sa_tmp,
+        &stream,
+    )?;
+
+    // Clean up rocBLAS handle
+    rocblas_destroy(handle)?;
+
+    let output = d_output.to_vec(&stream)?;
+    let state_out = d_state_out.to_vec(&stream)?;
+
+    Ok((output, state_out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2864,26 +3944,26 @@ mod tests {
 
         // Create test data with various values including edge cases
         let data_f16: Vec<f16> = [
-            0.0f32, 1.0, -1.0, 0.5, -0.5,
-            100.0, -100.0, 0.001, -0.001,
-            65504.0,  // max f16
-            6.1e-5,   // smallest positive normal f16
-        ].iter().map(|&x| f16::from_f32(x)).collect();
+            0.0f32, 1.0, -1.0, 0.5, -0.5, 100.0, -100.0, 0.001, -0.001, 65504.0, // max f16
+            6.1e-5,  // smallest positive normal f16
+        ]
+        .iter()
+        .map(|&x| f16::from_f32(x))
+        .collect();
 
         let n = data_f16.len();
         let shape = TensorShape::new(n, 1, 1, 1);
 
         // Upload f16 data to GPU
-        let input = TensorHip::from_slice(&data_f16, shape, &stream)
-            .expect("Failed to create f16 tensor");
+        let input =
+            TensorHip::from_slice(&data_f16, shape, &stream).expect("Failed to create f16 tensor");
 
         // Create output f32 tensor
-        let mut output: TensorHip<f32> = TensorHip::new(shape)
-            .expect("Failed to create f32 tensor");
+        let mut output: TensorHip<f32> =
+            TensorHip::new(shape).expect("Failed to create f32 tensor");
 
         // Run conversion kernel
-        copy_f16_to_f32(&input, &mut output, &stream)
-            .expect("copy_f16_to_f32 failed");
+        copy_f16_to_f32(&input, &mut output, &stream).expect("copy_f16_to_f32 failed");
 
         // Download result
         let result = output.to_vec(&stream).expect("Failed to download result");
@@ -2896,7 +3976,10 @@ mod tests {
             assert!(
                 diff < 1e-6 || diff / expected.abs().max(1e-10) < 1e-6,
                 "Mismatch at index {}: f16={} -> expected={}, got={}",
-                i, f16_val, expected, f32_val
+                i,
+                f16_val,
+                expected,
+                f32_val
             );
         }
     }
@@ -2914,14 +3997,13 @@ mod tests {
 
         let shape = TensorShape::new(n, 1, 1, 1);
 
-        let input = TensorHip::from_slice(&data_f16, shape, &stream)
-            .expect("Failed to create f16 tensor");
+        let input =
+            TensorHip::from_slice(&data_f16, shape, &stream).expect("Failed to create f16 tensor");
 
-        let mut output: TensorHip<f32> = TensorHip::new(shape)
-            .expect("Failed to create f32 tensor");
+        let mut output: TensorHip<f32> =
+            TensorHip::new(shape).expect("Failed to create f32 tensor");
 
-        copy_f16_to_f32(&input, &mut output, &stream)
-            .expect("copy_f16_to_f32 failed");
+        copy_f16_to_f32(&input, &mut output, &stream).expect("copy_f16_to_f32 failed");
 
         let result = output.to_vec(&stream).expect("Failed to download result");
 
@@ -2932,7 +4014,10 @@ mod tests {
             assert!(
                 diff < 1e-4,
                 "Mismatch at index {}: f16={} -> expected={}, got={}",
-                i, f16_val, expected, f32_val
+                i,
+                f16_val,
+                expected,
+                f32_val
             );
         }
     }

@@ -8,7 +8,10 @@ mod enabled {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use wgpu::{Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, QuerySet, QuerySetDescriptor, QueryType, Queue};
+    use wgpu::{
+        Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, QuerySet,
+        QuerySetDescriptor, QueryType, Queue,
+    };
 
     /// Maximum number of timestamp pairs (start + end) per profiling session.
     /// Note: QuerySet max is 4096, so MAX_TIMESTAMPS * 2 must not exceed that.
@@ -113,7 +116,12 @@ mod enabled {
             if !self.enabled || self.query_index == 0 {
                 return;
             }
-            encoder.resolve_query_set(&self.query_set, 0..self.query_index, &self.resolve_buffer, 0);
+            encoder.resolve_query_set(
+                &self.query_set,
+                0..self.query_index,
+                &self.resolve_buffer,
+                0,
+            );
             encoder.copy_buffer_to_buffer(
                 &self.resolve_buffer,
                 0,
