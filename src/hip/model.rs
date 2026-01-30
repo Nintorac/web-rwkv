@@ -35,6 +35,7 @@ use super::kernels::{
     wkv7_tiled,
     wkv7_wave_reduce,
     wkv7_wave_reduce_t1,
+    wkv7_colmajor_t1,
     wkv_bonus_f16,
 };
 use super::pinned::PinnedBuffer;
@@ -1717,13 +1718,31 @@ impl Rwkv7Hip {
                             &lens_gpu,
                             stream,
                         )?,
-                        WkvKernelKind::ColmajorT1 => todo!("ColmajorT1 integration in bd-2eg.3"),
+                        WkvKernelKind::ColmajorT1 => {
+                            // Row-owned kernel updates state in-place
+                            wkv7_colmajor_t1(
+                                &w_decay_wkv,
+                                &r_wkv,
+                                &k_ctrl_wkv,
+                                &v_wkv,
+                                &wkv_a_wkv,
+                                &wkv_b_wkv,
+                                &mut wkv_state_gpu[layer_idx],
+                                &mut wkv_out_wkv,
+                                &lens_gpu,
+                                stream,
+                            )?;
+                        }
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
+                // In-place kernels (Tiled, ColmajorT1) already updated wkv_state_gpu;
+                // only swap for kernels that write to new_wkv_state.
+                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1) {
+                    std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
+                }
 
                 // Group norm on WKV output
                 prof.time("wkv_norm", || {
@@ -2313,13 +2332,28 @@ impl Rwkv7Hip {
                             &lens_gpu,
                             stream,
                         )?,
-                        WkvKernelKind::ColmajorT1 => todo!("ColmajorT1 integration in bd-2eg.3"),
+                        WkvKernelKind::ColmajorT1 => {
+                            wkv7_colmajor_t1(
+                                &w_decay_wkv,
+                                &r_wkv,
+                                &k_ctrl_wkv,
+                                &v_wkv,
+                                &wkv_a_wkv,
+                                &wkv_b_wkv,
+                                &mut wkv_state_gpu[layer_idx],
+                                &mut wkv_out_wkv,
+                                &lens_gpu,
+                                stream,
+                            )?;
+                        }
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
+                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1) {
+                    std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
+                }
 
                 // Group norm on WKV output
                 prof.time("wkv_norm", || {
