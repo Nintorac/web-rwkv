@@ -34,13 +34,15 @@ fn test_hip_against_ground_truth() {
     }
     if !ground_truth_fixtures_exist() {
         eprintln!("Skipping test: ground truth fixtures not found at tests/fixtures/ground_truth/");
-        eprintln!("Generate with: python scripts/extract_rwkv7_fixtures.py --model /path/to/model.pth");
+        eprintln!(
+            "Generate with: python scripts/extract_rwkv7_fixtures.py --model /path/to/model.pth"
+        );
         return;
     }
 
     // Load config to get token sequence
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
@@ -50,10 +52,13 @@ fn test_hip_against_ground_truth() {
 
     // Load model
     use web_rwkv::hip::HipRuntimeConfig;
-    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
-        .expect("Failed to load model");
+    let model =
+        web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+            .expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
 
     // State for streaming inference (starts as None, then chains through)
     let mut state: Option<web_rwkv::hip::HipState> = None;
@@ -67,11 +72,12 @@ fn test_hip_against_ground_truth() {
     for step in 0..n_steps {
         let token = tokens_i64[step] as u32;
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
-        let fixture = TestFixture::load(&fixture_path)
-            .expect(&format!("Failed to load {}", fixture_path));
+        let fixture =
+            TestFixture::load(&fixture_path).expect(&format!("Failed to load {}", fixture_path));
 
         // Run single token through HIP model
-        let (logits, new_state) = model.forward(&[&[token]], state)
+        let (logits, new_state) = model
+            .forward(&[&[token]], state)
             .expect(&format!("Forward pass failed at step {}", step));
         state = Some(new_state);
 
@@ -81,24 +87,34 @@ fn test_hip_against_ground_truth() {
         // Compare logits - use MATMUL tolerances for BF16 vs FP32
         // Require 99% of elements within tolerance (allows for BF16 precision outliers)
         let tol = Tolerances::MATMUL;
-        let (pass_count, total, max_diff) = count_within_tolerance(&logits, expected_logits, tol.rtol, tol.atol);
+        let (pass_count, total, max_diff) =
+            count_within_tolerance(&logits, expected_logits, tol.rtol, tol.atol);
         let pass_pct = 100.0 * pass_count as f64 / total as f64;
 
         // Find top prediction
-        let (max_idx, max_val) = logits.iter().enumerate()
+        let (max_idx, max_val) = logits
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
         if pass_pct >= WARN_PASS_PCT {
-            println!("  Step {}: token {} -> top prediction {} (logit {:.4}) {:.2}% within tol OK",
-                     step, token, max_idx, max_val, pass_pct);
+            println!(
+                "  Step {}: token {} -> top prediction {} (logit {:.4}) {:.2}% within tol OK",
+                step, token, max_idx, max_val, pass_pct
+            );
         } else if pass_pct >= MIN_PASS_PCT {
             eprintln!("  Step {}: token {} -> top prediction {} (logit {:.4}) {:.2}% within tol WARNING (below {}%)",
                      step, token, max_idx, max_val, pass_pct, WARN_PASS_PCT);
         } else {
-            eprintln!("  Step {}: token {} FAILED: only {:.2}% within tolerance (need {}%)",
-                     step, token, pass_pct, MIN_PASS_PCT);
-            eprintln!("    Max diff: {:.6}, pass: {}/{}", max_diff, pass_count, total);
+            eprintln!(
+                "  Step {}: token {} FAILED: only {:.2}% within tolerance (need {}%)",
+                step, token, pass_pct, MIN_PASS_PCT
+            );
+            eprintln!(
+                "    Max diff: {:.6}, pass: {}/{}",
+                max_diff, pass_count, total
+            );
 
             // Debug: show top-5 predictions from both
             let mut indexed: Vec<_> = logits.iter().enumerate().collect();
@@ -113,12 +129,21 @@ fn test_hip_against_ground_truth() {
         }
     }
 
-    assert!(all_passed, "Some steps failed ground truth comparison (need {}% within tolerance)", MIN_PASS_PCT);
+    assert!(
+        all_passed,
+        "Some steps failed ground truth comparison (need {}% within tolerance)",
+        MIN_PASS_PCT
+    );
     println!("\nAll {} steps passed ground truth validation!", n_steps);
 }
 
 /// Count elements within tolerance and return (pass_count, total, max_diff).
-fn count_within_tolerance(actual: &[f32], expected: &[f32], rtol: f32, atol: f32) -> (usize, usize, f32) {
+fn count_within_tolerance(
+    actual: &[f32],
+    expected: &[f32],
+    rtol: f32,
+    atol: f32,
+) -> (usize, usize, f32) {
     let mut pass_count = 0;
     let mut max_diff = 0.0f32;
     for (&a, &e) in actual.iter().zip(expected.iter()) {
@@ -222,16 +247,19 @@ fn test_top1_match_all_steps() {
         return;
     }
 
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
     use web_rwkv::hip::HipRuntimeConfig;
-    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
-        .expect("Failed to load model");
+    let model =
+        web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+            .expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Top-1 (Argmax) Match Test ===\n");
@@ -244,7 +272,8 @@ fn test_top1_match_all_steps() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state)
+        let (logits, new_state) = model
+            .forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
@@ -254,25 +283,41 @@ fn test_top1_match_all_steps() {
 
         if actual_top1 == expected_top1 {
             matches += 1;
-            println!("  Step {:2}: token {:5} -> top1={:5} ✓", step, token, actual_top1);
+            println!(
+                "  Step {:2}: token {:5} -> top1={:5} ✓",
+                step, token, actual_top1
+            );
         } else {
             mismatches.push((step, token, actual_top1, expected_top1));
-            println!("  Step {:2}: token {:5} -> HIP={:5}, expected={:5} ✗",
-                     step, token, actual_top1, expected_top1);
+            println!(
+                "  Step {:2}: token {:5} -> HIP={:5}, expected={:5} ✗",
+                step, token, actual_top1, expected_top1
+            );
         }
     }
 
     println!("\n=== Summary ===");
-    println!("Top-1 matches: {}/{} ({:.1}%)", matches, n_steps, 100.0 * matches as f64 / n_steps as f64);
+    println!(
+        "Top-1 matches: {}/{} ({:.1}%)",
+        matches,
+        n_steps,
+        100.0 * matches as f64 / n_steps as f64
+    );
 
     if !mismatches.is_empty() {
         println!("\nMismatches:");
         for (step, token, actual, expected) in &mismatches {
-            println!("  Step {}: token {} -> HIP predicts {}, expected {}", step, token, actual, expected);
+            println!(
+                "  Step {}: token {} -> HIP predicts {}, expected {}",
+                step, token, actual, expected
+            );
         }
     }
 
-    assert_eq!(matches, n_steps, "All steps should have matching top-1 predictions");
+    assert_eq!(
+        matches, n_steps,
+        "All steps should have matching top-1 predictions"
+    );
     println!("\n✓ All {} steps have matching top-1 predictions!", n_steps);
 }
 
@@ -288,16 +333,19 @@ fn test_top5_overlap_all_steps() {
         return;
     }
 
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
     use web_rwkv::hip::HipRuntimeConfig;
-    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
-        .expect("Failed to load model");
+    let model =
+        web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+            .expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Top-5 Overlap Test ===\n");
@@ -311,7 +359,8 @@ fn test_top5_overlap_all_steps() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state)
+        let (logits, new_state) = model
+            .forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
@@ -321,9 +370,18 @@ fn test_top5_overlap_all_steps() {
         let overlap = top_k_overlap(&actual_top5, &expected_top5);
         total_overlap += overlap;
 
-        let status = if overlap >= MIN_OVERLAP_THRESHOLD { "✓" } else { "✗" };
-        println!("  Step {:2}: overlap={:.0}% ({}/5) {}",
-                 step, overlap * 100.0, (overlap * 5.0) as usize, status);
+        let status = if overlap >= MIN_OVERLAP_THRESHOLD {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "  Step {:2}: overlap={:.0}% ({}/5) {}",
+            step,
+            overlap * 100.0,
+            (overlap * 5.0) as usize,
+            status
+        );
 
         if overlap < MIN_OVERLAP_THRESHOLD {
             steps_below_threshold.push((step, overlap, actual_top5.clone(), expected_top5.clone()));
@@ -333,7 +391,11 @@ fn test_top5_overlap_all_steps() {
     let avg_overlap = total_overlap / n_steps as f64;
     println!("\n=== Summary ===");
     println!("Average top-5 overlap: {:.1}%", avg_overlap * 100.0);
-    println!("Steps below {:.0}% threshold: {}", MIN_OVERLAP_THRESHOLD * 100.0, steps_below_threshold.len());
+    println!(
+        "Steps below {:.0}% threshold: {}",
+        MIN_OVERLAP_THRESHOLD * 100.0,
+        steps_below_threshold.len()
+    );
 
     if !steps_below_threshold.is_empty() {
         println!("\nSteps with low overlap:");
@@ -344,11 +406,17 @@ fn test_top5_overlap_all_steps() {
         }
     }
 
-    assert!(avg_overlap >= MIN_OVERLAP_THRESHOLD,
-            "Average top-5 overlap {:.1}% below threshold {:.0}%",
-            avg_overlap * 100.0, MIN_OVERLAP_THRESHOLD * 100.0);
+    assert!(
+        avg_overlap >= MIN_OVERLAP_THRESHOLD,
+        "Average top-5 overlap {:.1}% below threshold {:.0}%",
+        avg_overlap * 100.0,
+        MIN_OVERLAP_THRESHOLD * 100.0
+    );
 
-    println!("\n✓ Top-5 overlap test passed! Average: {:.1}%", avg_overlap * 100.0);
+    println!(
+        "\n✓ Top-5 overlap test passed! Average: {:.1}%",
+        avg_overlap * 100.0
+    );
 }
 
 /// Test top-10 overlap with detailed reporting.
@@ -362,16 +430,19 @@ fn test_top10_overlap_all_steps() {
         return;
     }
 
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
     use web_rwkv::hip::HipRuntimeConfig;
-    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
-        .expect("Failed to load model");
+    let model =
+        web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+            .expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Top-10 Overlap Test ===\n");
@@ -384,7 +455,8 @@ fn test_top10_overlap_all_steps() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state)
+        let (logits, new_state) = model
+            .forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
@@ -394,18 +466,29 @@ fn test_top10_overlap_all_steps() {
         let overlap = top_k_overlap(&actual_top10, &expected_top10);
         total_overlap += overlap;
 
-        println!("  Step {:2}: overlap={:.0}% ({}/10)", step, overlap * 100.0, (overlap * 10.0) as usize);
+        println!(
+            "  Step {:2}: overlap={:.0}% ({}/10)",
+            step,
+            overlap * 100.0,
+            (overlap * 10.0) as usize
+        );
     }
 
     let avg_overlap = total_overlap / n_steps as f64;
     println!("\n=== Summary ===");
     println!("Average top-10 overlap: {:.1}%", avg_overlap * 100.0);
 
-    assert!(avg_overlap >= MIN_OVERLAP_THRESHOLD,
-            "Average top-10 overlap {:.1}% below threshold {:.0}%",
-            avg_overlap * 100.0, MIN_OVERLAP_THRESHOLD * 100.0);
+    assert!(
+        avg_overlap >= MIN_OVERLAP_THRESHOLD,
+        "Average top-10 overlap {:.1}% below threshold {:.0}%",
+        avg_overlap * 100.0,
+        MIN_OVERLAP_THRESHOLD * 100.0
+    );
 
-    println!("\n✓ Top-10 overlap test passed! Average: {:.1}%", avg_overlap * 100.0);
+    println!(
+        "\n✓ Top-10 overlap test passed! Average: {:.1}%",
+        avg_overlap * 100.0
+    );
 }
 
 /// Test Spearman rank correlation of full logit distributions.
@@ -424,16 +507,19 @@ fn test_spearman_rank_correlation() {
         return;
     }
 
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
     use web_rwkv::hip::HipRuntimeConfig;
-    let model = web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
-        .expect("Failed to load model");
+    let model =
+        web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+            .expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
     let mut state: Option<web_rwkv::hip::HipState> = None;
 
     println!("\n=== Spearman Rank Correlation Test ===\n");
@@ -448,7 +534,8 @@ fn test_spearman_rank_correlation() {
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
-        let (logits, new_state) = model.forward(&[&[token]], state)
+        let (logits, new_state) = model
+            .forward(&[&[token]], state)
             .expect("Forward pass failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
@@ -470,11 +557,17 @@ fn test_spearman_rank_correlation() {
     println!("Average Spearman ρ: {:.6}", avg_rho);
     println!("Minimum Spearman ρ: {:.6} (step {})", min_rho, min_rho_step);
 
-    assert!(avg_rho >= MIN_CORRELATION,
-            "Average Spearman correlation {:.6} below threshold {:.3}",
-            avg_rho, MIN_CORRELATION);
+    assert!(
+        avg_rho >= MIN_CORRELATION,
+        "Average Spearman correlation {:.6} below threshold {:.3}",
+        avg_rho,
+        MIN_CORRELATION
+    );
 
-    println!("\n✓ Spearman rank correlation test passed! Average ρ = {:.6}", avg_rho);
+    println!(
+        "\n✓ Spearman rank correlation test passed! Average ρ = {:.6}",
+        avg_rho
+    );
 }
 
 /// Test that final logits produce expected next token prediction.
@@ -490,20 +583,28 @@ fn test_ground_truth_final_prediction() {
     }
 
     // Load final step fixture
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let n_steps = config.i64("n_steps")[0] as usize;
 
-    let final_fixture = TestFixture::load(&format!("tests/fixtures/ground_truth/step_{}.npz", n_steps - 1))
-        .expect("Failed to load final step fixture");
+    let final_fixture = TestFixture::load(&format!(
+        "tests/fixtures/ground_truth/step_{}.npz",
+        n_steps - 1
+    ))
+    .expect("Failed to load final step fixture");
     let expected_logits = final_fixture.f32("logits");
 
     // Find argmax of expected logits
-    let (expected_argmax, _) = expected_logits.iter().enumerate()
+    let (expected_argmax, _) = expected_logits
+        .iter()
+        .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap();
 
-    println!("Final step (after 'Assistant:') expects token {}", expected_argmax);
+    println!(
+        "Final step (after 'Assistant:') expects token {}",
+        expected_argmax
+    );
 
     // The expected next token after "Assistant:" should be reasonable
     // (e.g., a space, newline, or start of response)

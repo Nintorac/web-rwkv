@@ -359,9 +359,7 @@ fn get_uname() -> Option<String> {
 /// # Arguments
 ///
 /// * `adapter_info` - Optional pre-collected adapter info (adapter_name, backend_api, driver_version)
-pub fn collect_gpu_info(
-    adapter_info: Option<(&str, &str, Option<&str>)>,
-) -> Option<GpuInfo> {
+pub fn collect_gpu_info(adapter_info: Option<(&str, &str, Option<&str>)>) -> Option<GpuInfo> {
     if let Some((adapter_name, backend_api, driver_version)) = adapter_info {
         return Some(GpuInfo {
             adapter_name: Some(adapter_name.to_string()),
@@ -529,9 +527,7 @@ fn try_rocm_smi() -> Option<GpuInfo> {
 /// // With GPU info from wgpu adapter
 /// let metadata = collect_run_metadata(Some(("NVIDIA GeForce RTX 3080", "Vulkan", Some("535.104.05"))));
 /// ```
-pub fn collect_run_metadata(
-    gpu_adapter_info: Option<(&str, &str, Option<&str>)>,
-) -> RunMetadata {
+pub fn collect_run_metadata(gpu_adapter_info: Option<(&str, &str, Option<&str>)>) -> RunMetadata {
     RunMetadata {
         git: collect_git_info(),
         build: collect_build_info(),
@@ -601,11 +597,7 @@ mod tests {
 
     #[test]
     fn test_collect_gpu_info_with_adapter() {
-        let info = collect_gpu_info(Some((
-            "Test GPU",
-            "Vulkan",
-            Some("1.2.3"),
-        )));
+        let info = collect_gpu_info(Some(("Test GPU", "Vulkan", Some("1.2.3"))));
 
         assert!(info.is_some());
         let gpu = info.unwrap();

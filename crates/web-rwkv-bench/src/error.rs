@@ -192,30 +192,35 @@ pub fn classify_error(error: &BenchError) -> (ErrorKind, String) {
         BenchError::OutOfMemory { message } => {
             (ErrorKind::OutOfMemory, format!("OOM: {}", message))
         }
-        BenchError::DeviceLost { backend, message } => {
-            (ErrorKind::DeviceLost, format!("Device lost ({}): {}", backend, message))
-        }
-        BenchError::UnsupportedBackend { backend, reason } => {
-            (ErrorKind::UnsupportedBackend, format!("Backend '{}' not supported: {}", backend, reason))
-        }
-        BenchError::ModelLoad { path, message } => {
-            (ErrorKind::ModelLoadFailed, format!("Model load failed '{}': {}", path, message))
-        }
-        BenchError::Inference { operation, message } => {
-            (ErrorKind::InferenceError, format!("Inference error in {}: {}", operation, message))
-        }
-        BenchError::Timeout { operation, timeout } => {
-            (ErrorKind::Timeout, format!("{} timed out after {:?}", operation, timeout))
-        }
-        BenchError::Io { operation, message } => {
-            (ErrorKind::Other, format!("IO error in {}: {}", operation, message))
-        }
-        BenchError::Config { what, message } => {
-            (ErrorKind::Other, format!("Config error in {}: {}", what, message))
-        }
-        BenchError::Other { message } => {
-            (ErrorKind::Other, message.clone())
-        }
+        BenchError::DeviceLost { backend, message } => (
+            ErrorKind::DeviceLost,
+            format!("Device lost ({}): {}", backend, message),
+        ),
+        BenchError::UnsupportedBackend { backend, reason } => (
+            ErrorKind::UnsupportedBackend,
+            format!("Backend '{}' not supported: {}", backend, reason),
+        ),
+        BenchError::ModelLoad { path, message } => (
+            ErrorKind::ModelLoadFailed,
+            format!("Model load failed '{}': {}", path, message),
+        ),
+        BenchError::Inference { operation, message } => (
+            ErrorKind::InferenceError,
+            format!("Inference error in {}: {}", operation, message),
+        ),
+        BenchError::Timeout { operation, timeout } => (
+            ErrorKind::Timeout,
+            format!("{} timed out after {:?}", operation, timeout),
+        ),
+        BenchError::Io { operation, message } => (
+            ErrorKind::Other,
+            format!("IO error in {}: {}", operation, message),
+        ),
+        BenchError::Config { what, message } => (
+            ErrorKind::Other,
+            format!("Config error in {}: {}", what, message),
+        ),
+        BenchError::Other { message } => (ErrorKind::Other, message.clone()),
     }
 }
 
@@ -291,7 +296,10 @@ pub fn classify_error_message(message: &str) -> (ErrorKind, String) {
     }
 
     // Check for timeout patterns
-    if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline exceeded") {
+    if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("deadline exceeded")
+    {
         return (ErrorKind::Timeout, message.to_string());
     }
 
@@ -508,7 +516,10 @@ mod tests {
             path: "model.st".to_string(),
             message: "not found".to_string(),
         };
-        assert_eq!(error.to_string(), "failed to load model 'model.st': not found");
+        assert_eq!(
+            error.to_string(),
+            "failed to load model 'model.st': not found"
+        );
     }
 
     #[test]

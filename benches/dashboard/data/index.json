@@ -1,11 +1,501 @@
 {
   "files": [
     {
-      "name": "example_benchmark.jsonl",
-      "size": 3100,
-      "modified": "2026-01-28T10:00:00Z",
-      "description": "Example benchmark results"
+      "name": "bench_decode_batch_sweep_20260213T163024Z.jsonl",
+      "size": 8214,
+      "modified": "2026-01-29T16:31:17.900453Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T162751Z.jsonl",
+      "size": 10755,
+      "modified": "2026-01-29T16:30:16.292018Z"
+    },
+    {
+      "name": "bench_smoke_20260213T162741Z.jsonl",
+      "size": 12767,
+      "modified": "2026-01-29T16:27:43.807419Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T154003Z.jsonl",
+      "size": 10765,
+      "modified": "2026-01-29T15:42:27.373418Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T152516Z.jsonl",
+      "size": 10757,
+      "modified": "2026-01-29T15:27:40.782581Z"
+    },
+    {
+      "name": "bench_ablation_quick_20260213T112949Z.jsonl",
+      "size": 3080,
+      "modified": "2026-01-29T11:30:44.254911Z"
+    },
+    {
+      "name": "bench_ablation_quick_20260213T112813Z.jsonl",
+      "size": 3089,
+      "modified": "2026-01-29T11:29:16.179659Z"
+    },
+    {
+      "name": "bench_ablation_all_sizes_20260213T105724Z.jsonl",
+      "size": 19254,
+      "modified": "2026-01-29T11:26:54.176865Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T102958Z.jsonl",
+      "size": 10771,
+      "modified": "2026-01-29T10:32:21.753510Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T101834Z.jsonl",
+      "size": 10765,
+      "modified": "2026-01-29T10:20:59.120200Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T093025Z.jsonl",
+      "size": 10783,
+      "modified": "2026-01-29T09:32:49.253830Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T092753Z.jsonl",
+      "size": 10755,
+      "modified": "2026-01-29T09:30:17.029234Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T090419Z.jsonl",
+      "size": 10770,
+      "modified": "2026-01-29T09:06:49.875034Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_large_20260213T060839Z.jsonl",
+      "size": 4420,
+      "modified": "2026-01-29T06:14:06.401503Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_large_20260213T055928Z.jsonl",
+      "size": 4400,
+      "modified": "2026-01-29T06:04:58.342890Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_large_20260213T054832Z.jsonl",
+      "size": 4404,
+      "modified": "2026-01-29T05:54:15.787024Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T052856Z.jsonl",
+      "size": 10772,
+      "modified": "2026-01-29T05:31:23.485277Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260213T052123Z.jsonl",
+      "size": 8209,
+      "modified": "2026-01-29T05:25:44.013623Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260213T052008Z.jsonl",
+      "size": 9504,
+      "modified": "2026-01-29T05:21:06.309543Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T024535Z.jsonl",
+      "size": 3106,
+      "modified": "2026-01-29T02:45:42.265024Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T024514Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:45:14.689272Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T024328Z.jsonl",
+      "size": 3090,
+      "modified": "2026-01-29T02:43:34.718183Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T024214Z.jsonl",
+      "size": 3088,
+      "modified": "2026-01-29T02:42:20.991855Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T023844Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:38:44.477829Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T023826Z.jsonl",
+      "size": 3093,
+      "modified": "2026-01-29T02:38:33.464929Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T023702Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:37:02.358760Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T023641Z.jsonl",
+      "size": 3087,
+      "modified": "2026-01-29T02:36:47.153898Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T023159Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:31:59.565520Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T023100Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:31:00.414059Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T022929Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:29:29.562887Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T022816Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:28:16.909550Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T022758Z.jsonl",
+      "size": 3083,
+      "modified": "2026-01-29T02:28:05.898650Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T022741Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:27:41.832866Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T022440Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T02:24:40.241495Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T012538Z.jsonl",
+      "size": 3086,
+      "modified": "2026-01-29T01:25:45.352820Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T011149Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T01:11:50.139342Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010849Z.jsonl",
+      "size": 3080,
+      "modified": "2026-01-29T01:08:56.773987Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010740Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T01:07:40.918742Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010722Z.jsonl",
+      "size": 3094,
+      "modified": "2026-01-29T01:07:29.298858Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010701Z.jsonl",
+      "size": 3095,
+      "modified": "2026-01-29T01:07:08.315067Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010647Z.jsonl",
+      "size": 3079,
+      "modified": "2026-01-29T01:06:53.785212Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010541Z.jsonl",
+      "size": 3094,
+      "modified": "2026-01-29T01:05:48.447862Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010524Z.jsonl",
+      "size": 3095,
+      "modified": "2026-01-29T01:05:31.146034Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010510Z.jsonl",
+      "size": 3076,
+      "modified": "2026-01-29T01:05:16.794178Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010353Z.jsonl",
+      "size": 3094,
+      "modified": "2026-01-29T01:03:59.709945Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010118Z.jsonl",
+      "size": 3078,
+      "modified": "2026-01-29T01:01:26.192446Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010104Z.jsonl",
+      "size": 3084,
+      "modified": "2026-01-29T01:01:11.183580Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010049Z.jsonl",
+      "size": 3079,
+      "modified": "2026-01-29T01:00:57.397703Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010028Z.jsonl",
+      "size": 3095,
+      "modified": "2026-01-29T01:00:35.242901Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T010014Z.jsonl",
+      "size": 3078,
+      "modified": "2026-01-29T01:00:20.778030Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T005613Z.jsonl",
+      "size": 3088,
+      "modified": "2026-01-29T00:56:20.115178Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T005346Z.jsonl",
+      "size": 3094,
+      "modified": "2026-01-29T00:53:52.832494Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T004740Z.jsonl",
+      "size": 3104,
+      "modified": "2026-01-29T00:47:46.725636Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T004141Z.jsonl",
+      "size": 3093,
+      "modified": "2026-01-29T00:41:48.362777Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T004019Z.jsonl",
+      "size": 3079,
+      "modified": "2026-01-29T00:40:26.433515Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003955Z.jsonl",
+      "size": 3079,
+      "modified": "2026-01-29T00:40:02.731729Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003936Z.jsonl",
+      "size": 3096,
+      "modified": "2026-01-29T00:39:43.527903Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003906Z.jsonl",
+      "size": 3088,
+      "modified": "2026-01-29T00:39:13.220178Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003847Z.jsonl",
+      "size": 3077,
+      "modified": "2026-01-29T00:38:53.952352Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003745Z.jsonl",
+      "size": 3078,
+      "modified": "2026-01-29T00:37:52.067913Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003637Z.jsonl",
+      "size": 3094,
+      "modified": "2026-01-29T00:36:44.207385Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003618Z.jsonl",
+      "size": 3086,
+      "modified": "2026-01-29T00:36:25.343514Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003556Z.jsonl",
+      "size": 3095,
+      "modified": "2026-01-29T00:36:03.017667Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003457Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T00:34:57.633114Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T003335Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T00:33:36.140672Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T002132Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T00:21:32.172488Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T001934Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T00:19:35.014556Z"
+    },
+    {
+      "name": "bench_decode_dev_20260213T001800Z.jsonl",
+      "size": 554,
+      "modified": "2026-01-29T00:18:00.391415Z"
+    },
+    {
+      "name": "bench_decode_dev_20260212T235555Z.jsonl",
+      "size": 3078,
+      "modified": "2026-01-28T23:56:02.079154Z"
+    },
+    {
+      "name": "bench_decode_dev_20260212T232212Z.jsonl",
+      "size": 3095,
+      "modified": "2026-01-28T23:22:19.139128Z"
+    },
+    {
+      "name": "bench_decode_dev_20260212T231418Z.jsonl",
+      "size": 3087,
+      "modified": "2026-01-28T23:14:24.516760Z"
+    },
+    {
+      "name": "bench_decode_dev_20260212T225124Z.jsonl",
+      "size": 3079,
+      "modified": "2026-01-28T22:51:31.863276Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T224320Z.jsonl",
+      "size": 8214,
+      "modified": "2026-01-28T22:51:16.889421Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T223417Z.jsonl",
+      "size": 8198,
+      "modified": "2026-01-28T22:42:10.366790Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T222422Z.jsonl",
+      "size": 8210,
+      "modified": "2026-01-28T22:32:35.681137Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T145334Z.jsonl",
+      "size": 8199,
+      "modified": "2026-01-28T15:01:56.880548Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T144431Z.jsonl",
+      "size": 8203,
+      "modified": "2026-01-28T14:52:52.970894Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260212T141620Z.jsonl",
+      "size": 10177,
+      "modified": "2026-01-28T14:17:34.973743Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260212T141304Z.jsonl",
+      "size": 10191,
+      "modified": "2026-01-28T14:14:20.128541Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260212T140901Z.jsonl",
+      "size": 10170,
+      "modified": "2026-01-28T14:10:14.453487Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260212T140745Z.jsonl",
+      "size": 9512,
+      "modified": "2026-01-28T14:08:47.210183Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T134919Z.jsonl",
+      "size": 8218,
+      "modified": "2026-01-28T14:00:52.492374Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T134114Z.jsonl",
+      "size": 10733,
+      "modified": "2026-01-28T13:48:00.142659Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_hip_20260212T134501Z.jsonl",
+      "size": 5016,
+      "modified": "2026-01-28T13:47:57.856677Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260212T133727Z.jsonl",
+      "size": 3753,
+      "modified": "2026-01-28T13:37:31.046244Z"
+    },
+    {
+      "name": "bench_decode_batch_sweep_20260212T133423Z.jsonl",
+      "size": 3094,
+      "modified": "2026-01-28T13:34:27.625492Z"
+    },
+    {
+      "name": "bench_dev_20260212T132307Z.jsonl",
+      "size": 20412,
+      "modified": "2026-01-28T13:26:59.295556Z"
+    },
+    {
+      "name": "bench_dev_20260212T124333Z.jsonl",
+      "size": 20670,
+      "modified": "2026-01-28T12:47:42.956303Z"
+    },
+    {
+      "name": "bench_dev_20260212T122812Z.jsonl",
+      "size": 10393,
+      "modified": "2026-01-28T12:29:01.927373Z"
+    },
+    {
+      "name": "bench_dev_20260212T122741Z.jsonl",
+      "size": 5733,
+      "modified": "2026-01-28T12:27:54.439781Z"
+    },
+    {
+      "name": "bench_dev_20260212T115818Z.jsonl",
+      "size": 51123,
+      "modified": "2026-01-28T12:25:47.035550Z"
+    },
+    {
+      "name": "bench_dev_20260212T115646Z.jsonl",
+      "size": 31645,
+      "modified": "2026-01-28T11:58:07.214780Z"
+    },
+    {
+      "name": "bench_dev_20260212T115451Z.jsonl",
+      "size": 33620,
+      "modified": "2026-01-28T11:56:19.489939Z"
+    },
+    {
+      "name": "bench_full_20260212T115049Z.jsonl",
+      "size": 61978,
+      "modified": "2026-01-28T11:54:44.727959Z"
+    },
+    {
+      "name": "bench_full_20260212T114835Z.jsonl",
+      "size": 36156,
+      "modified": "2026-01-28T11:50:31.488685Z"
+    },
+    {
+      "name": "bench_smoke_20260212T112926Z.jsonl",
+      "size": 12827,
+      "modified": "2026-01-28T11:29:27.818400Z"
+    },
+    {
+      "name": "bench_smoke_20260212T112808Z.jsonl",
+      "size": 12733,
+      "modified": "2026-01-28T11:28:09.910109Z"
+    },
+    {
+      "name": "bench_smoke_20260212T104048Z.jsonl",
+      "size": 3144,
+      "modified": "2026-01-28T10:40:49.920450Z"
+    },
+    {
+      "name": "bench_smoke_20260212T103940Z.jsonl",
+      "size": 3136,
+      "modified": "2026-01-28T10:39:41.552051Z"
     }
   ],
-  "_comment": "This is a sample manifest. Generate with scripts/gen_manifest.py or manually update."
+  "generated": "2026-01-29T16:32:23.913802Z",
+  "count": 99
 }

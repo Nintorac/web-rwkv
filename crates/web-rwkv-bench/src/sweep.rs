@@ -97,10 +97,7 @@ impl CaseParams {
     /// and adapter-specific info so it can be used to group repeats and
     /// compare results across runs.
     pub fn case_id(&self) -> String {
-        let mut parts = vec![
-            self.model_name.clone(),
-            self.backend_id.clone(),
-        ];
+        let mut parts = vec![self.model_name.clone(), self.backend_id.clone()];
 
         if let Some(ref wgpu_backend) = self.wgpu_backend {
             parts.push(wgpu_backend.clone());
@@ -453,17 +450,16 @@ impl SweepEngine {
             for backend in &self.config.backends {
                 // For wgpu backend, expand over wgpu_backends
                 // For hip backend, use None for wgpu_backend
-                let wgpu_variants: Vec<Option<String>> = if backend.backend_id == "wgpu"
-                    && !backend.wgpu_backends.is_empty()
-                {
-                    backend
-                        .wgpu_backends
-                        .iter()
-                        .map(|v| Some(v.clone()))
-                        .collect()
-                } else {
-                    vec![None]
-                };
+                let wgpu_variants: Vec<Option<String>> =
+                    if backend.backend_id == "wgpu" && !backend.wgpu_backends.is_empty() {
+                        backend
+                            .wgpu_backends
+                            .iter()
+                            .map(|v| Some(v.clone()))
+                            .collect()
+                    } else {
+                        vec![None]
+                    };
 
                 for wgpu_backend in &wgpu_variants {
                     for &batch_size in &self.config.batch_sizes {
@@ -485,7 +481,9 @@ impl SweepEngine {
 
                                     // Check max_cases limit (count non-skipped cases)
                                     // Note: We expand all cases but stop early if limit reached
-                                    if self.limits_tracker.limits_reached_for_expansion(cases.len())
+                                    if self
+                                        .limits_tracker
+                                        .limits_reached_for_expansion(cases.len())
                                     {
                                         break 'expansion;
                                     }
@@ -700,10 +698,7 @@ impl SweepEngine {
     ///
     /// This is the main entry point for executing a sweep with
     /// per-case setup/teardown and limits checking.
-    pub fn execute_with_hooks<'a>(
-        &'a mut self,
-        hooks: &'a Hooks,
-    ) -> SweepExecutor<'a> {
+    pub fn execute_with_hooks<'a>(&'a mut self, hooks: &'a Hooks) -> SweepExecutor<'a> {
         let cases = self.expand_cases();
         let total = cases.len();
         let skipped = cases.iter().filter(|c| c.skip_reason.is_some()).count();

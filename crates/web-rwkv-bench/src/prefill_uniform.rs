@@ -77,14 +77,14 @@ pub fn canonical_length_list(token_chunk_size: u32) -> Vec<u32> {
     // Generate canonical list: [1, C/4, C/2, C-1, C, C+1, 2C, 4C, 8C]
     let mut lengths = vec![
         1,
-        (c / 4).max(1),       // C/4, minimum 1
-        (c / 2).max(1),       // C/2, minimum 1
+        (c / 4).max(1),             // C/4, minimum 1
+        (c / 2).max(1),             // C/2, minimum 1
         c.saturating_sub(1).max(1), // C-1, minimum 1
-        c,                     // C
-        c + 1,                 // C+1
-        c * 2,                 // 2C
-        c * 4,                 // 4C
-        c * 8,                 // 8C
+        c,                          // C
+        c + 1,                      // C+1
+        c * 2,                      // 2C
+        c * 4,                      // 4C
+        c * 8,                      // 8C
     ];
 
     // Sort and deduplicate
@@ -117,11 +117,11 @@ pub fn canonical_length_list(token_chunk_size: u32) -> Vec<u32> {
 pub fn total_token_targets(token_chunk_size: u32) -> Vec<u32> {
     let c = token_chunk_size;
     vec![
-        (c / 2).max(1),  // C/2, minimum 1
-        c,               // C
-        c * 2,           // 2C
-        c * 4,           // 4C
-        c * 8,           // 8C
+        (c / 2).max(1), // C/2, minimum 1
+        c,              // C
+        c * 2,          // 2C
+        c * 4,          // 4C
+        c * 8,          // 8C
     ]
 }
 
@@ -278,7 +278,11 @@ impl TokenGenerator {
 
     /// Advances the internal state and returns the next raw value.
     fn next_raw(&mut self) -> u64 {
-        self.state = (self.state.wrapping_mul(Self::MULTIPLIER).wrapping_add(Self::INCREMENT)) & Self::MASK;
+        self.state = (self
+            .state
+            .wrapping_mul(Self::MULTIPLIER)
+            .wrapping_add(Self::INCREMENT))
+            & Self::MASK;
         self.state
     }
 
@@ -342,7 +346,11 @@ impl PrefillResult {
     /// * `ttft_ms_local` - Per-batch TTFT values in milliseconds
     /// * `total_prompt_tokens` - Total tokens processed
     /// * `num_infer_calls` - Number of inference calls made
-    pub fn from_ttft(ttft_ms_local: Vec<f64>, total_prompt_tokens: u32, num_infer_calls: u32) -> Self {
+    pub fn from_ttft(
+        ttft_ms_local: Vec<f64>,
+        total_prompt_tokens: u32,
+        num_infer_calls: u32,
+    ) -> Self {
         let prefill_total_ms = ttft_ms_local
             .iter()
             .cloned()
@@ -679,13 +687,13 @@ mod tests {
         let lengths = canonical_length_list(128);
         // Should contain: 1, 32, 64, 127, 128, 129, 256, 512, 1024
         assert!(lengths.contains(&1));
-        assert!(lengths.contains(&32));   // C/4
-        assert!(lengths.contains(&64));   // C/2
-        assert!(lengths.contains(&127));  // C-1
-        assert!(lengths.contains(&128));  // C
-        assert!(lengths.contains(&129));  // C+1
-        assert!(lengths.contains(&256));  // 2C
-        assert!(lengths.contains(&512));  // 4C
+        assert!(lengths.contains(&32)); // C/4
+        assert!(lengths.contains(&64)); // C/2
+        assert!(lengths.contains(&127)); // C-1
+        assert!(lengths.contains(&128)); // C
+        assert!(lengths.contains(&129)); // C+1
+        assert!(lengths.contains(&256)); // 2C
+        assert!(lengths.contains(&512)); // 4C
         assert!(lengths.contains(&1024)); // 8C
 
         // Should be sorted
@@ -705,14 +713,14 @@ mod tests {
         let lengths = canonical_length_list(256);
         // Should contain: 1, 64, 128, 255, 256, 257, 512, 1024, 2048
         assert!(lengths.contains(&1));
-        assert!(lengths.contains(&64));    // C/4
-        assert!(lengths.contains(&128));   // C/2
-        assert!(lengths.contains(&255));   // C-1
-        assert!(lengths.contains(&256));   // C
-        assert!(lengths.contains(&257));   // C+1
-        assert!(lengths.contains(&512));   // 2C
-        assert!(lengths.contains(&1024));  // 4C
-        assert!(lengths.contains(&2048));  // 8C
+        assert!(lengths.contains(&64)); // C/4
+        assert!(lengths.contains(&128)); // C/2
+        assert!(lengths.contains(&255)); // C-1
+        assert!(lengths.contains(&256)); // C
+        assert!(lengths.contains(&257)); // C+1
+        assert!(lengths.contains(&512)); // 2C
+        assert!(lengths.contains(&1024)); // 4C
+        assert!(lengths.contains(&2048)); // 8C
     }
 
     #[test]
@@ -786,7 +794,10 @@ mod tests {
 
         // Should be sorted and deduplicated
         for i in 1..lengths.len() {
-            assert!(lengths[i] > lengths[i - 1], "Should be sorted with no duplicates");
+            assert!(
+                lengths[i] > lengths[i - 1],
+                "Should be sorted with no duplicates"
+            );
         }
     }
 
@@ -809,7 +820,10 @@ mod tests {
         let mut gen2 = TokenGenerator::new(54321, 50257);
         let tokens2 = gen2.generate(100);
 
-        assert_ne!(tokens1, tokens2, "Different seeds should produce different sequences");
+        assert_ne!(
+            tokens1, tokens2,
+            "Different seeds should produce different sequences"
+        );
     }
 
     #[test]

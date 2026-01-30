@@ -48,22 +48,37 @@ impl Tolerances {
     /// BF16-appropriate tolerance for normalized activations (after layernorm, groupnorm, L2norm).
     /// Normalization can amplify input differences for low-variance groups, so we use
     /// the standard BF16 tolerance rather than trying to be tighter.
-    pub const NORMALIZED: Self = Self { rtol: 1e-2, atol: 1e-2 };
+    pub const NORMALIZED: Self = Self {
+        rtol: 1e-2,
+        atol: 1e-2,
+    };
 
     /// Tolerance for linear projections and matrix multiplications.
     /// Standard BF16 comparison tolerance.
-    pub const MATMUL: Self = Self { rtol: 1e-2, atol: 1e-2 };
+    pub const MATMUL: Self = Self {
+        rtol: 1e-2,
+        atol: 1e-2,
+    };
 
     /// Tolerance for activations with potential numerical instability.
-    pub const ACTIVATION: Self = Self { rtol: 1e-2, atol: 1e-2 };
+    pub const ACTIVATION: Self = Self {
+        rtol: 1e-2,
+        atol: 1e-2,
+    };
 
     /// Tolerance for WKV state (FP32 accumulation on both sides).
     /// Can be tighter since both implementations use FP32 for state.
-    pub const STATE: Self = Self { rtol: 1e-3, atol: 1e-4 };
+    pub const STATE: Self = Self {
+        rtol: 1e-3,
+        atol: 1e-4,
+    };
 
     /// Tolerance for values with accumulated error across layers.
     /// After 12 layers, expect ~1e-2 aggregate relative error.
-    pub const ACCUMULATED: Self = Self { rtol: 2e-2, atol: 2e-2 };
+    pub const ACCUMULATED: Self = Self {
+        rtol: 2e-2,
+        atol: 2e-2,
+    };
 }
 
 /// Supported array types in fixtures.
@@ -170,7 +185,11 @@ impl TestFixture {
     pub fn f32(&self, name: &str) -> &[f32] {
         match self.data.get(name) {
             Some(FixtureArray::F32(v)) => v,
-            _ => panic!("Expected f32 array for '{}', available keys: {:?}", name, self.tensor_keys()),
+            _ => panic!(
+                "Expected f32 array for '{}', available keys: {:?}",
+                name,
+                self.tensor_keys()
+            ),
         }
     }
 
@@ -179,7 +198,11 @@ impl TestFixture {
     pub fn i32(&self, name: &str) -> &[i32] {
         match self.data.get(name) {
             Some(FixtureArray::I32(v)) => v,
-            _ => panic!("Expected i32 array for '{}', available keys: {:?}", name, self.tensor_keys()),
+            _ => panic!(
+                "Expected i32 array for '{}', available keys: {:?}",
+                name,
+                self.tensor_keys()
+            ),
         }
     }
 
@@ -188,7 +211,11 @@ impl TestFixture {
     pub fn i64(&self, name: &str) -> &[i64] {
         match self.data.get(name) {
             Some(FixtureArray::I64(v)) => v,
-            _ => panic!("Expected i64 array for '{}', available keys: {:?}", name, self.tensor_keys()),
+            _ => panic!(
+                "Expected i64 array for '{}', available keys: {:?}",
+                name,
+                self.tensor_keys()
+            ),
         }
     }
 
@@ -197,7 +224,11 @@ impl TestFixture {
     pub fn u32(&self, name: &str) -> &[u32] {
         match self.data.get(name) {
             Some(FixtureArray::U32(v)) => v,
-            _ => panic!("Expected u32 array for '{}', available keys: {:?}", name, self.tensor_keys()),
+            _ => panic!(
+                "Expected u32 array for '{}', available keys: {:?}",
+                name,
+                self.tensor_keys()
+            ),
         }
     }
 
@@ -315,7 +346,10 @@ impl TensorMismatch {
             self.max_diff_actual, self.max_diff_expected, self.max_diff
         ));
 
-        msg.push_str(&format!("  Mean absolute error: {:.6}\n", self.mean_abs_error));
+        msg.push_str(&format!(
+            "  Mean absolute error: {:.6}\n",
+            self.mean_abs_error
+        ));
 
         if let Some(shape) = &self.shape {
             msg.push_str(&format!("  Shape: {:?}\n", shape));
@@ -520,8 +554,16 @@ mod tests {
         let result = assert_tensors_close(&a, &b, 1e-3, 1e-4);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("mismatch"), "Error should mention mismatch: {}", err);
-        assert!(err.contains("index 0"), "Error should identify index 0: {}", err);
+        assert!(
+            err.contains("mismatch"),
+            "Error should mention mismatch: {}",
+            err
+        );
+        assert!(
+            err.contains("index 0"),
+            "Error should identify index 0: {}",
+            err
+        );
     }
 
     #[test]
@@ -532,7 +574,11 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Length mismatch"), "Error: {}", err);
-        assert!(err.contains("3") && err.contains("2"), "Should mention both lengths: {}", err);
+        assert!(
+            err.contains("3") && err.contains("2"),
+            "Should mention both lengths: {}",
+            err
+        );
     }
 
     #[test]
@@ -602,7 +648,11 @@ mod tests {
         // Should report total count
         assert!(err.contains("3/5"), "Should report 3/5 mismatches: {}", err);
         // Should show first mismatch at index 0
-        assert!(err.contains("index 0"), "Should report first at index 0: {}", err);
+        assert!(
+            err.contains("index 0"),
+            "Should report first at index 0: {}",
+            err
+        );
     }
 
     #[test]
@@ -616,7 +666,11 @@ mod tests {
 
         // Should report max diff location
         assert!(err.contains("Max diff"), "Should report max diff: {}", err);
-        assert!(err.contains("index 2"), "Max diff should be at index 2: {}", err);
+        assert!(
+            err.contains("index 2"),
+            "Max diff should be at index 2: {}",
+            err
+        );
     }
 
     #[test]
@@ -631,8 +685,16 @@ mod tests {
 
         // Should show coordinates
         assert!(err.contains("coords"), "Should show coordinates: {}", err);
-        assert!(err.contains("[1, 0, 1, 0]"), "Coords should be [1, 0, 1, 0]: {}", err);
-        assert!(err.contains("Shape: [2, 2, 2, 1]"), "Should show shape: {}", err);
+        assert!(
+            err.contains("[1, 0, 1, 0]"),
+            "Coords should be [1, 0, 1, 0]: {}",
+            err
+        );
+        assert!(
+            err.contains("Shape: [2, 2, 2, 1]"),
+            "Should show shape: {}",
+            err
+        );
     }
 
     #[test]
@@ -645,7 +707,11 @@ mod tests {
 
         // Should show both values
         assert!(err.contains("2.5"), "Should show actual value 2.5: {}", err);
-        assert!(err.contains("2.0"), "Should show expected value 2.0: {}", err);
+        assert!(
+            err.contains("2.0"),
+            "Should show expected value 2.0: {}",
+            err
+        );
         assert!(err.contains("diff"), "Should show difference: {}", err);
     }
 
@@ -657,7 +723,11 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
 
-        assert!(err.contains("Mean absolute error"), "Should show MAE: {}", err);
+        assert!(
+            err.contains("Mean absolute error"),
+            "Should show MAE: {}",
+            err
+        );
     }
 
     // =========================================================================

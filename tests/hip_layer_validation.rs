@@ -31,8 +31,8 @@ fn tolerances_for_hook(hook: HipHook) -> Tolerances {
     use HipHook::*;
     match hook {
         // Normalized values
-        PostEmbedLayerNorm | PostAttLayerNorm | PostFfnLayerNorm |
-        PostHeadLayerNorm | PostAttGroupNorm | PostAttL2Norm => Tolerances::NORMALIZED,
+        PostEmbedLayerNorm | PostAttLayerNorm | PostFfnLayerNorm | PostHeadLayerNorm
+        | PostAttGroupNorm | PostAttL2Norm => Tolerances::NORMALIZED,
 
         // Linear projections
         PostAttLinear | PostFfnLinear | PostAttOut | PostFfnOut | PostHead => Tolerances::MATMUL,
@@ -279,7 +279,12 @@ fn validate_hook(
             // Flatten expected if it has batch/seq dimensions (fixture is [B, T, C])
             let expected_flat: Vec<f32> = expected.to_vec();
 
-            let result = assert_tensors_close(actual_slice, &expected_flat, tolerances.rtol, tolerances.atol);
+            let result = assert_tensors_close(
+                actual_slice,
+                &expected_flat,
+                tolerances.rtol,
+                tolerances.atol,
+            );
 
             results.push(ValidationResult {
                 hook,
@@ -306,7 +311,8 @@ fn validate_hook(
         let expected = fixture.f32(key);
         let expected_flat: Vec<f32> = expected.to_vec();
 
-        let result = assert_tensors_close(captured, &expected_flat, tolerances.rtol, tolerances.atol);
+        let result =
+            assert_tensors_close(captured, &expected_flat, tolerances.rtol, tolerances.atol);
 
         results.push(ValidationResult {
             hook,
@@ -332,7 +338,9 @@ fn test_hip_layer_by_layer_step0() {
     let fixture_path = "tests/fixtures/ground_truth/step_0.npz";
     if !Path::new(fixture_path).exists() {
         eprintln!("Skipping: fixture not found at {}", fixture_path);
-        eprintln!("Generate with: python scripts/extract_rwkv7_fixtures.py --model /path/to/model.pth");
+        eprintln!(
+            "Generate with: python scripts/extract_rwkv7_fixtures.py --model /path/to/model.pth"
+        );
         return;
     }
 
@@ -340,11 +348,14 @@ fn test_hip_layer_by_layer_step0() {
     let fixture = TestFixture::load(fixture_path).expect("Failed to load fixture");
 
     // Load config to get token
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let token = config.i64("tokens")[0] as u32;
 
-    println!("\n=== Layer-by-layer validation for step 0 (token {}) ===\n", token);
+    println!(
+        "\n=== Layer-by-layer validation for step 0 (token {}) ===\n",
+        token
+    );
 
     // Build probes
     let (probes, captured) = build_capture_probes();
@@ -355,12 +366,15 @@ fn test_hip_layer_by_layer_step0() {
         .expect("Failed to load model")
         .with_probes(probes);
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
 
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let (_logits, _state) = model.forward(&[&[token]], None)
+    let (_logits, _state) = model
+        .forward(&[&[token]], None)
         .expect("Forward pass failed");
 
     // Validate all captured values
@@ -409,10 +423,16 @@ fn test_hip_layer_by_layer_step0() {
                 if r.passed {
                     passed_checks += 1;
                     if r.error.is_none() || !r.error.as_ref().unwrap().contains("not in fixture") {
-                        println!("[PASS] {:?} layer={:?} key={}", r.hook, r.layer, r.fixture_key);
+                        println!(
+                            "[PASS] {:?} layer={:?} key={}",
+                            r.hook, r.layer, r.fixture_key
+                        );
                     }
                 } else {
-                    println!("[FAIL] {:?} layer={:?} key={}", r.hook, r.layer, r.fixture_key);
+                    println!(
+                        "[FAIL] {:?} layer={:?} key={}",
+                        r.hook, r.layer, r.fixture_key
+                    );
                     if let Some(ref e) = r.error {
                         println!("       {}", e);
                     }
@@ -490,22 +510,35 @@ fn test_hip_layer_by_layer_step0() {
 
     println!("\n=== Summary ===");
     let pass_rate = passed_checks as f64 / total_checks as f64;
-    println!("Passed: {}/{} ({:.1}%)", passed_checks, total_checks, pass_rate * 100.0);
+    println!(
+        "Passed: {}/{} ({:.1}%)",
+        passed_checks,
+        total_checks,
+        pass_rate * 100.0
+    );
 
     // 95% pass threshold - accounts for expected BF16 vs FP32 precision differences
     const PASS_THRESHOLD: f64 = 0.95;
 
     if pass_rate < PASS_THRESHOLD {
         if let Some(failure) = first_failure {
-            println!("\nFirst failure: {:?} at layer {:?}, key '{}'",
-                     failure.hook, failure.layer, failure.fixture_key);
+            println!(
+                "\nFirst failure: {:?} at layer {:?}, key '{}'",
+                failure.hook, failure.layer, failure.fixture_key
+            );
         }
-        panic!("Layer validation below {:.0}% threshold: {:.1}%",
-               PASS_THRESHOLD * 100.0, pass_rate * 100.0);
+        panic!(
+            "Layer validation below {:.0}% threshold: {:.1}%",
+            PASS_THRESHOLD * 100.0,
+            pass_rate * 100.0
+        );
     }
 
-    println!("\nLayer validation passed ({:.1}% >= {:.0}% threshold)",
-             pass_rate * 100.0, PASS_THRESHOLD * 100.0);
+    println!(
+        "\nLayer validation passed ({:.1}% >= {:.0}% threshold)",
+        pass_rate * 100.0,
+        PASS_THRESHOLD * 100.0
+    );
 }
 
 /// Test all hooks are captured (diagnostic test).
@@ -524,13 +557,14 @@ fn test_probe_coverage() {
         .expect("Failed to load model")
         .with_probes(probes);
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
 
     let n_layer = model.info.n_layer;
 
     // Run forward pass
-    let (_logits, _state) = model.forward(&[&[0]], None)
-        .expect("Forward pass failed");
+    let (_logits, _state) = model.forward(&[&[0]], None).expect("Forward pass failed");
 
     let captured = captured.lock().unwrap();
 
@@ -539,7 +573,11 @@ fn test_probe_coverage() {
     // Check embedding probes
     let embed_hooks = vec![HipHook::PostEmbed, HipHook::PostEmbedLayerNorm];
     for hook in embed_hooks {
-        let layer = if hook == HipHook::PostEmbedLayerNorm { Some(0) } else { None };
+        let layer = if hook == HipHook::PostEmbedLayerNorm {
+            Some(0)
+        } else {
+            None
+        };
         let exists = captured.contains_key(&(hook, layer));
         let status = if exists { "CAPTURED" } else { "MISSING" };
         let len = captured.get(&(hook, layer)).map(|d| d.len()).unwrap_or(0);
@@ -578,7 +616,10 @@ fn test_probe_coverage() {
     for hook in &per_layer_hooks {
         let exists = captured.contains_key(&(*hook, Some(0)));
         let status = if exists { "CAPTURED" } else { "MISSING" };
-        let len = captured.get(&(*hook, Some(0))).map(|d| d.len()).unwrap_or(0);
+        let len = captured
+            .get(&(*hook, Some(0)))
+            .map(|d| d.len())
+            .unwrap_or(0);
         println!("[{}] {:?} len={}", status, hook, len);
     }
 
@@ -595,7 +636,11 @@ fn test_probe_coverage() {
     // Count total
     let expected_per_layer = per_layer_hooks.len();
     let expected_total = 2 + expected_per_layer * n_layer + 2; // embed + layers + head
-    println!("\nTotal captured: {} (expected ~{})", captured.len(), expected_total);
+    println!(
+        "\nTotal captured: {} (expected ~{})",
+        captured.len(),
+        expected_total
+    );
 }
 
 /// Validate multiple steps to track divergence accumulation.
@@ -612,18 +657,23 @@ fn test_hip_divergence_progression() {
         return;
     }
 
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = (config.i64("n_steps")[0] as usize).min(5); // Test first 5 steps
 
-    println!("\n=== Divergence Progression (first {} steps) ===\n", n_steps);
+    println!(
+        "\n=== Divergence Progression (first {} steps) ===\n",
+        n_steps
+    );
 
     // Load model (without probes for speed)
     use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model.with_config(config).expect("Failed to configure model");
+    let model = model
+        .with_config(config)
+        .expect("Failed to configure model");
     let mut state: Option<HipState> = None;
 
     for step in 0..n_steps {
@@ -635,11 +685,10 @@ fn test_hip_divergence_progression() {
             continue;
         }
 
-        let fixture = TestFixture::load(&fixture_path)
-            .expect(&format!("Failed to load {}", fixture_path));
+        let fixture =
+            TestFixture::load(&fixture_path).expect(&format!("Failed to load {}", fixture_path));
 
-        let (logits, new_state) = model.forward(&[&[token]], state)
-            .expect("Forward failed");
+        let (logits, new_state) = model.forward(&[&[token]], state).expect("Forward failed");
         state = Some(new_state);
 
         let expected = fixture.f32("logits");
@@ -667,16 +716,26 @@ fn test_hip_divergence_progression() {
         let mismatch_pct = 100.0 * mismatch_count as f32 / logits.len() as f32;
 
         // Find top prediction
-        let (top_hip, _) = logits.iter().enumerate()
+        let (top_hip, _) = logits
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
-        let (top_expected, _) = expected.iter().enumerate()
+        let (top_expected, _) = expected
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .unwrap();
 
-        let top_match = if top_hip == top_expected { "OK" } else { "MISMATCH" };
+        let top_match = if top_hip == top_expected {
+            "OK"
+        } else {
+            "MISMATCH"
+        };
 
-        println!("Step {} (token {}): max_diff={:.6}, mean_diff={:.6}, mismatches={:.2}%, top={}",
-                 step, token, max_diff, mean_diff, mismatch_pct, top_match);
+        println!(
+            "Step {} (token {}): max_diff={:.6}, mean_diff={:.6}, mismatches={:.2}%, top={}",
+            step, token, max_diff, mean_diff, mismatch_pct, top_match
+        );
     }
 }

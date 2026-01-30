@@ -44,11 +44,21 @@ use web_rwkv::hip::{HipRuntime, Rwkv7Hip};
 #[command(author, version, about = "Compare text generation across backends")]
 struct Cli {
     /// Path to model file (.st safetensors format)
-    #[arg(short, long, value_name = "FILE", default_value = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        default_value = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st"
+    )]
     model: PathBuf,
 
     /// Path to tokenizer JSON file
-    #[arg(short, long, value_name = "FILE", default_value = "assets/vocab/rwkv_vocab_v20230424.json")]
+    #[arg(
+        short,
+        long,
+        value_name = "FILE",
+        default_value = "assets/vocab/rwkv_vocab_v20230424.json"
+    )]
     tokenizer: PathBuf,
 
     /// Only run Vulkan/WGPU backend
@@ -169,7 +179,11 @@ impl UnifiedRuntime {
         })
     }
 
-    async fn new_wgpu(model_path: &std::path::Path, info: &ModelInfo, chunk_size: usize) -> Result<Self> {
+    async fn new_wgpu(
+        model_path: &std::path::Path,
+        info: &ModelInfo,
+        chunk_size: usize,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter = instance
             .adapter(wgpu::PowerPreference::HighPerformance)
@@ -258,7 +272,9 @@ impl UnifiedRuntime {
                 let probs = match &self.runtime {
                     #[cfg(feature = "hip")]
                     BackendRuntime::Hip(_) => {
-                        web_rwkv::hip::softmax_one_cpu(output.0[0].0.clone())?.data().to_vec()
+                        web_rwkv::hip::softmax_one_cpu(output.0[0].0.clone())?
+                            .data()
+                            .to_vec()
                     }
                     BackendRuntime::Wgpu(_) => {
                         let ctx = self.context.as_ref().unwrap();
@@ -274,7 +290,12 @@ impl UnifiedRuntime {
         };
 
         // Sample first token
-        let mut generated_tokens = vec![sample_top_k_nucleus(&probs, config.top_k, config.top_p, config.temperature)];
+        let mut generated_tokens = vec![sample_top_k_nucleus(
+            &probs,
+            config.top_k,
+            config.top_p,
+            config.temperature,
+        )];
 
         // Decode loop
         for _ in 1..config.max_tokens {
@@ -296,16 +317,17 @@ impl UnifiedRuntime {
 
             let probs = match &self.runtime {
                 #[cfg(feature = "hip")]
-                BackendRuntime::Hip(_) => {
-                    web_rwkv::hip::softmax_one_cpu(output.0[0].0.clone())?.data().to_vec()
-                }
+                BackendRuntime::Hip(_) => web_rwkv::hip::softmax_one_cpu(output.0[0].0.clone())?
+                    .data()
+                    .to_vec(),
                 BackendRuntime::Wgpu(_) => {
                     let ctx = self.context.as_ref().unwrap();
                     softmax_one(ctx, output.0[0].0.clone()).await?.to_vec()
                 }
             };
 
-            let next_token = sample_top_k_nucleus(&probs, config.top_k, config.top_p, config.temperature);
+            let next_token =
+                sample_top_k_nucleus(&probs, config.top_k, config.top_p, config.temperature);
             generated_tokens.push(next_token);
         }
 
@@ -359,7 +381,10 @@ async fn run_tests(runtime: &UnifiedRuntime, tokenizer: &Tokenizer) -> Result<()
     // Example 2: Long-form continuation (with sampling)
     // =========================================================================
     println!("\n{}", "=".repeat(70));
-    println!("[{}] Example 2: Long-form continuation (with sampling)", backend);
+    println!(
+        "[{}] Example 2: Long-form continuation (with sampling)",
+        backend
+    );
     println!("{}", "=".repeat(70));
 
     let story_prompt = "Once upon a time, in a land far away, there lived a";
@@ -374,7 +399,9 @@ async fn run_tests(runtime: &UnifiedRuntime, tokenizer: &Tokenizer) -> Result<()
 
     println!("\nPrompt: {}", story_prompt);
     println!("\nGenerated continuation:");
-    let output = runtime.generate(tokenizer, story_prompt, &story_config).await?;
+    let output = runtime
+        .generate(tokenizer, story_prompt, &story_config)
+        .await?;
     println!("{}", output);
 
     // =========================================================================
@@ -400,14 +427,19 @@ Assistant:"#;
     println!("\nConversation:");
     println!("{}", chat_prompt);
     print!(" ");
-    let output = runtime.generate(tokenizer, chat_prompt, &chat_config).await?;
+    let output = runtime
+        .generate(tokenizer, chat_prompt, &chat_config)
+        .await?;
     println!("{}", output);
 
     // =========================================================================
     // Example 4: Chunked processing for long prompts
     // =========================================================================
     println!("\n{}", "=".repeat(70));
-    println!("[{}] Example 4: Chunked processing for long prompts", backend);
+    println!(
+        "[{}] Example 4: Chunked processing for long prompts",
+        backend
+    );
     println!("{}", "=".repeat(70));
 
     let long_prompt = "The quick brown fox jumps over the lazy dog. ".repeat(20);
@@ -423,7 +455,9 @@ Assistant:"#;
         stop_tokens: vec![0],
     };
 
-    let output = runtime.generate(tokenizer, &long_prompt, &chunk_config).await?;
+    let output = runtime
+        .generate(tokenizer, &long_prompt, &chunk_config)
+        .await?;
     println!("\nGenerated continuation: {}", output.trim());
 
     Ok(())
@@ -464,7 +498,10 @@ async fn main() -> Result<()> {
 
     println!("Model: {:?}", cli.model);
     println!("  Version: {:?}", info.version);
-    println!("  Layers: {}, Embed: {}, Vocab: {}", info.num_layer, info.num_emb, info.num_vocab);
+    println!(
+        "  Layers: {}, Embed: {}, Vocab: {}",
+        info.num_layer, info.num_emb, info.num_vocab
+    );
 
     // Run Vulkan/WGPU backend
     #[cfg(not(feature = "hip"))]

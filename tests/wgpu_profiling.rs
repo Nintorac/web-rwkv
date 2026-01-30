@@ -13,6 +13,8 @@ use anyhow::Result;
 use half::f16;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
+#[cfg(feature = "wgpu-prof")]
+use web_rwkv::context::Context;
 use web_rwkv::{
     context::ContextBuilder,
     runtime::{
@@ -22,8 +24,6 @@ use web_rwkv::{
         v7, TokioRuntime,
     },
 };
-#[cfg(feature = "wgpu-prof")]
-use web_rwkv::context::Context;
 
 const MODEL_PATH: &str = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
 
@@ -56,7 +56,10 @@ async fn profile_decode_batch_1() -> Result<()> {
 }
 
 async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
-    eprintln!("\n=== WGPU Decode Profiling: batch_size={}, decode_steps={} ===\n", batch_size, decode_steps);
+    eprintln!(
+        "\n=== WGPU Decode Profiling: batch_size={}, decode_steps={} ===\n",
+        batch_size, decode_steps
+    );
 
     // Load model
     let file = File::open(MODEL_PATH)?;
@@ -65,7 +68,10 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
     let info = Loader::info(&model)?;
 
     eprintln!("Model: {} v{:?}", MODEL_PATH, info.version);
-    eprintln!("  Vocab: {}, Layers: {}, Embed: {}", info.num_vocab, info.num_layer, info.num_emb);
+    eprintln!(
+        "  Vocab: {}, Layers: {}, Embed: {}",
+        info.num_vocab, info.num_layer, info.num_emb
+    );
 
     // Create WGPU context
     let instance = wgpu::Instance::default();
@@ -79,12 +85,18 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
         .expect("failed to find adapter");
 
     let adapter_info = adapter.get_info();
-    eprintln!("Adapter: {} ({:?})", adapter_info.name, adapter_info.backend);
+    eprintln!(
+        "Adapter: {} ({:?})",
+        adapter_info.name, adapter_info.backend
+    );
 
     #[cfg(feature = "wgpu-prof")]
     {
         let features = adapter.features();
-        eprintln!("Timestamp support: {}", features.contains(wgpu::Features::TIMESTAMP_QUERY));
+        eprintln!(
+            "Timestamp support: {}",
+            features.contains(wgpu::Features::TIMESTAMP_QUERY)
+        );
     }
 
     let context = ContextBuilder::new(adapter)
@@ -106,7 +118,7 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
         let batches: Vec<_> = (0..batch_size)
             .map(|_| RnnInputBatch::new(vec![1u32], RnnOption::Last))
             .collect();
-        let input = RnnInput::new(batches, 1);  // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
+        let input = RnnInput::new(batches, 1); // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
         let _ = runtime.infer(input).await?;
     }
 
@@ -124,7 +136,7 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
                 RnnInputBatch::new(vec![token], RnnOption::Last)
             })
             .collect();
-        let input = RnnInput::new(batches, 1);  // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
+        let input = RnnInput::new(batches, 1); // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
 
         let step_start = std::time::Instant::now();
         let _ = runtime.infer(input).await?;
@@ -137,10 +149,16 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
     let total_tokens = batch_size * decode_steps;
     let tokens_per_sec = total_tokens as f64 / total_time.as_secs_f64();
 
-    let step_times_ms: Vec<f64> = step_times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+    let step_times_ms: Vec<f64> = step_times
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
     let mean_step_ms = step_times_ms.iter().sum::<f64>() / step_times_ms.len() as f64;
     let min_step_ms = step_times_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_step_ms = step_times_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_step_ms = step_times_ms
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let mut sorted = step_times_ms.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -152,7 +170,10 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
     eprintln!("Batch size:      {}", batch_size);
     eprintln!("Decode steps:    {}", decode_steps);
     eprintln!("Total tokens:    {}", total_tokens);
-    eprintln!("Total time:      {:.3} ms", total_time.as_secs_f64() * 1000.0);
+    eprintln!(
+        "Total time:      {:.3} ms",
+        total_time.as_secs_f64() * 1000.0
+    );
     eprintln!("Throughput:      {:.1} tokens/sec", tokens_per_sec);
     eprintln!("");
     eprintln!("Step latency:");
@@ -176,7 +197,10 @@ async fn profile_decode_detailed() -> Result<()> {
     let batch_size = 256usize;
     let decode_steps = 32usize;
 
-    eprintln!("\n=== WGPU Detailed Profiling: batch_size={}, decode_steps={} ===\n", batch_size, decode_steps);
+    eprintln!(
+        "\n=== WGPU Detailed Profiling: batch_size={}, decode_steps={} ===\n",
+        batch_size, decode_steps
+    );
 
     // Load model
     let file = File::open(MODEL_PATH)?;
@@ -185,7 +209,10 @@ async fn profile_decode_detailed() -> Result<()> {
     let info = Loader::info(&model)?;
 
     eprintln!("Model: {} v{:?}", MODEL_PATH, info.version);
-    eprintln!("  Vocab: {}, Layers: {}, Embed: {}", info.num_vocab, info.num_layer, info.num_emb);
+    eprintln!(
+        "  Vocab: {}, Layers: {}, Embed: {}",
+        info.num_vocab, info.num_layer, info.num_emb
+    );
 
     // Create WGPU context
     let instance = wgpu::Instance::default();
@@ -199,12 +226,18 @@ async fn profile_decode_detailed() -> Result<()> {
         .expect("failed to find adapter");
 
     let adapter_info = adapter.get_info();
-    eprintln!("Adapter: {} ({:?})", adapter_info.name, adapter_info.backend);
+    eprintln!(
+        "Adapter: {} ({:?})",
+        adapter_info.name, adapter_info.backend
+    );
 
     #[cfg(feature = "wgpu-prof")]
     {
         let features = adapter.features();
-        eprintln!("Timestamp support: {}", features.contains(wgpu::Features::TIMESTAMP_QUERY));
+        eprintln!(
+            "Timestamp support: {}",
+            features.contains(wgpu::Features::TIMESTAMP_QUERY)
+        );
     }
 
     let context = ContextBuilder::new(adapter)
@@ -253,7 +286,10 @@ async fn profile_decode_detailed() -> Result<()> {
     }
 
     // Timed decode steps with detailed breakdown
-    eprintln!("Running {} decode steps with detailed timing...\n", decode_steps);
+    eprintln!(
+        "Running {} decode steps with detailed timing...\n",
+        decode_steps
+    );
 
     let mut dispatch_times = Vec::with_capacity(decode_steps);
     let mut load_times = Vec::with_capacity(decode_steps);
@@ -340,14 +376,32 @@ async fn profile_decode_detailed() -> Result<()> {
     eprintln!("Decode steps:    {}", decode_steps);
     eprintln!("Throughput:      {:.1} tokens/sec", tokens_per_sec);
     eprintln!("");
-    eprintln!("Output size:     {:.2} MB (f32)", output_size_bytes as f64 / 1e6);
+    eprintln!(
+        "Output size:     {:.2} MB (f32)",
+        output_size_bytes as f64 / 1e6
+    );
     eprintln!("");
     eprintln!("Timing breakdown (mean/min/max ms):");
-    eprintln!("  dispatch:      {:.3} / {:.3} / {:.3}", dispatch_mean, dispatch_min, dispatch_max);
-    eprintln!("  load:          {:.3} / {:.3} / {:.3}", load_mean, load_min, load_max);
-    eprintln!("  submit:        {:.3} / {:.3} / {:.3}", submit_mean, submit_min, submit_max);
-    eprintln!("  back:          {:.3} / {:.3} / {:.3}", back_mean, back_min, back_max);
-    eprintln!("  total:         {:.3} / {:.3} / {:.3}", total_mean, total_min, total_max);
+    eprintln!(
+        "  dispatch:      {:.3} / {:.3} / {:.3}",
+        dispatch_mean, dispatch_min, dispatch_max
+    );
+    eprintln!(
+        "  load:          {:.3} / {:.3} / {:.3}",
+        load_mean, load_min, load_max
+    );
+    eprintln!(
+        "  submit:        {:.3} / {:.3} / {:.3}",
+        submit_mean, submit_min, submit_max
+    );
+    eprintln!(
+        "  back:          {:.3} / {:.3} / {:.3}",
+        back_mean, back_min, back_max
+    );
+    eprintln!(
+        "  total:         {:.3} / {:.3} / {:.3}",
+        total_mean, total_min, total_max
+    );
     eprintln!("");
     eprintln!("Readback bandwidth: {:.2} GB/s", bandwidth_gb_s);
 
@@ -421,9 +475,15 @@ async fn profile_decode_sweep() -> Result<()> {
         .expect("failed to find adapter");
 
     let adapter_info = adapter.get_info();
-    eprintln!("Adapter: {} ({:?})\n", adapter_info.name, adapter_info.backend);
+    eprintln!(
+        "Adapter: {} ({:?})\n",
+        adapter_info.name, adapter_info.backend
+    );
 
-    eprintln!("{:>10} {:>12} {:>12} {:>12}", "batch_size", "tok/s", "step_ms", "total_ms");
+    eprintln!(
+        "{:>10} {:>12} {:>12} {:>12}",
+        "batch_size", "tok/s", "step_ms", "total_ms"
+    );
     eprintln!("{}", "-".repeat(50));
 
     for &batch_size in &batch_sizes {
@@ -444,7 +504,7 @@ async fn profile_decode_sweep() -> Result<()> {
             let batches: Vec<_> = (0..batch_size)
                 .map(|_| RnnInputBatch::new(vec![1u32], RnnOption::Last))
                 .collect();
-            let input = RnnInput::new(batches, 1);  // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
+            let input = RnnInput::new(batches, 1); // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
             let _ = runtime.infer(input).await?;
         }
 
@@ -457,7 +517,7 @@ async fn profile_decode_sweep() -> Result<()> {
                     RnnInputBatch::new(vec![token], RnnOption::Last)
                 })
                 .collect();
-            let input = RnnInput::new(batches, 1);  // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
+            let input = RnnInput::new(batches, 1); // rounds to 32 (MIN_TOKEN_CHUNK_SIZE)
             let _ = runtime.infer(input).await?;
         }
         let elapsed = start.elapsed();
@@ -467,7 +527,10 @@ async fn profile_decode_sweep() -> Result<()> {
         let step_ms = elapsed.as_secs_f64() * 1000.0 / decode_steps as f64;
         let total_ms = elapsed.as_secs_f64() * 1000.0;
 
-        eprintln!("{:>10} {:>12.1} {:>12.3} {:>12.1}", batch_size, tokens_per_sec, step_ms, total_ms);
+        eprintln!(
+            "{:>10} {:>12.1} {:>12.3} {:>12.1}",
+            batch_size, tokens_per_sec, step_ms, total_ms
+        );
     }
 
     eprintln!("\nDone.");

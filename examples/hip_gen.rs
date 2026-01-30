@@ -92,7 +92,7 @@ impl Default for GenerationConfig {
         Self {
             max_tokens: 100,
             temperature: 1.0,
-            top_k: 10,  // Only consider top-10 logits
+            top_k: 10, // Only consider top-10 logits
             top_p: 0.9,
             stop_tokens: vec![0], // EOS token
         }
@@ -110,7 +110,9 @@ fn generate_single(
     runtime.reset_state();
 
     // Encode prompt
-    let prompt_tokens = tokenizer.encode(prompt.as_bytes()).expect("Failed to encode prompt");
+    let prompt_tokens = tokenizer
+        .encode(prompt.as_bytes())
+        .expect("Failed to encode prompt");
     println!("  Prompt tokens: {} tokens", prompt_tokens.len());
 
     // Prefill: process entire prompt
@@ -124,7 +126,12 @@ fn generate_single(
     let last_logits = &logits.data()[last_token_start..last_token_start + vocab_size];
 
     // Sample first generated token
-    let mut generated_tokens = vec![sample_top_k_nucleus(last_logits, config.top_k, config.top_p, config.temperature)];
+    let mut generated_tokens = vec![sample_top_k_nucleus(
+        last_logits,
+        config.top_k,
+        config.top_p,
+        config.temperature,
+    )];
 
     // Decode loop
     for _ in 1..config.max_tokens {
@@ -137,7 +144,12 @@ fn generate_single(
 
         // Run single token through model
         let logits = runtime.infer_one(&[token]).expect("Failed to run decode");
-        let next_token = sample_top_k_nucleus(logits.data(), config.top_k, config.top_p, config.temperature);
+        let next_token = sample_top_k_nucleus(
+            logits.data(),
+            config.top_k,
+            config.top_p,
+            config.temperature,
+        );
         generated_tokens.push(next_token);
     }
 
@@ -172,7 +184,9 @@ fn generate_batched(
 
     // Prefill with variable-length sequences
     let token_refs: Vec<&[u32]> = prompt_tokens.iter().map(|t| t.as_slice()).collect();
-    let logits = runtime.infer(&token_refs).expect("Failed to run batched prefill");
+    let logits = runtime
+        .infer(&token_refs)
+        .expect("Failed to run batched prefill");
     let vocab_size = runtime.info().n_vocab;
 
     // Get last token logits for each sequence (accounting for variable lengths)
@@ -183,7 +197,8 @@ fn generate_batched(
         let seq_len = lengths[b];
         let last_pos = offset + (seq_len - 1) * vocab_size;
         let last_logits = &logits.data()[last_pos..last_pos + vocab_size];
-        let token = sample_top_k_nucleus(last_logits, config.top_k, config.top_p, config.temperature);
+        let token =
+            sample_top_k_nucleus(last_logits, config.top_k, config.top_p, config.temperature);
         generated[b].push(token);
         offset += seq_len * vocab_size;
     }
@@ -197,12 +212,19 @@ fn generate_batched(
         }
 
         let token_slices: Vec<&[u32]> = tokens.iter().map(|t| std::slice::from_ref(t)).collect();
-        let logits = runtime.infer(&token_slices).expect("Failed to run batched decode");
+        let logits = runtime
+            .infer(&token_slices)
+            .expect("Failed to run batched decode");
 
         for b in 0..batch_size {
             if !config.stop_tokens.contains(generated[b].last().unwrap()) {
                 let batch_logits = &logits.data()[b * vocab_size..(b + 1) * vocab_size];
-                let next_token = sample_top_k_nucleus(batch_logits, config.top_k, config.top_p, config.temperature);
+                let next_token = sample_top_k_nucleus(
+                    batch_logits,
+                    config.top_k,
+                    config.top_p,
+                    config.temperature,
+                );
                 generated[b].push(next_token);
             }
         }
@@ -372,11 +394,7 @@ Assistant:"#;
     println!("Example 5: Variable-length batched generation");
     println!("{}", "=".repeat(70));
 
-    let var_prompts = [
-        "Hi",
-        "Hello, how are you?",
-        "What is the meaning of life?",
-    ];
+    let var_prompts = ["Hi", "Hello, how are you?", "What is the meaning of life?"];
 
     let var_config = GenerationConfig {
         max_tokens: 20,

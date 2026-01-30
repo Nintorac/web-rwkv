@@ -49,8 +49,8 @@ async fn test_wgpu_against_ground_truth() {
     };
 
     // Load config
-    let config = TestFixture::load("tests/fixtures/ground_truth/config.npz")
-        .expect("Failed to load config");
+    let config =
+        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
@@ -93,8 +93,8 @@ async fn test_wgpu_against_ground_truth() {
     for step in 0..n_steps {
         let token = tokens_i64[step] as u32;
         let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
-        let fixture = TestFixture::load(&fixture_path)
-            .expect(&format!("Failed to load {}", fixture_path));
+        let fixture =
+            TestFixture::load(&fixture_path).expect(&format!("Failed to load {}", fixture_path));
 
         // Run single token through WGPU
         let batch = RnnInputBatch::new(vec![token], RnnOption::Full);
@@ -106,16 +106,21 @@ async fn test_wgpu_against_ground_truth() {
         let expected_logits = fixture.f32("logits");
 
         // Compare
-        let (pass_count, total, max_diff) = count_within_tolerance(&logits, expected_logits, 1e-2, 1e-2);
+        let (pass_count, total, max_diff) =
+            count_within_tolerance(&logits, expected_logits, 1e-2, 1e-2);
         let pass_pct = 100.0 * pass_count as f64 / total as f64;
 
         // Find top predictions
-        let (wgpu_top1, wgpu_logit) = logits.iter().enumerate()
+        let (wgpu_top1, wgpu_logit) = logits
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, v)| (i, *v))
             .unwrap();
 
-        let (expected_top1, expected_logit) = expected_logits.iter().enumerate()
+        let (expected_top1, expected_logit) = expected_logits
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, v)| (i, *v))
             .unwrap();
@@ -123,11 +128,15 @@ async fn test_wgpu_against_ground_truth() {
         let top1_match = wgpu_top1 == expected_top1;
 
         if pass_pct >= WARN_PASS_PCT && top1_match {
-            println!("  Step {}: token {} -> WGPU top1={} (expected {}) {:.2}% within tol OK",
-                     step, token, wgpu_top1, expected_top1, pass_pct);
+            println!(
+                "  Step {}: token {} -> WGPU top1={} (expected {}) {:.2}% within tol OK",
+                step, token, wgpu_top1, expected_top1, pass_pct
+            );
         } else if pass_pct >= MIN_PASS_PCT && top1_match {
-            eprintln!("  Step {}: token {} -> WGPU top1={} (expected {}) {:.2}% within tol WARNING",
-                     step, token, wgpu_top1, expected_top1, pass_pct);
+            eprintln!(
+                "  Step {}: token {} -> WGPU top1={} (expected {}) {:.2}% within tol WARNING",
+                step, token, wgpu_top1, expected_top1, pass_pct
+            );
         } else {
             eprintln!("  Step {}: token {} -> WGPU top1={}, expected={} top1_match={} {:.2}% within tol {}",
                      step, token, wgpu_top1, expected_top1, top1_match, pass_pct,
@@ -137,11 +146,18 @@ async fn test_wgpu_against_ground_truth() {
             let mut wgpu_indexed: Vec<(usize, f32)> = logits.iter().cloned().enumerate().collect();
             wgpu_indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
 
-            let mut expected_indexed: Vec<(usize, f32)> = expected_logits.iter().cloned().enumerate().collect();
+            let mut expected_indexed: Vec<(usize, f32)> =
+                expected_logits.iter().cloned().enumerate().collect();
             expected_indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
 
-            eprintln!("    WGPU top-5: {:?}", wgpu_indexed.iter().take(5).collect::<Vec<_>>());
-            eprintln!("    Expected top-5: {:?}", expected_indexed.iter().take(5).collect::<Vec<_>>());
+            eprintln!(
+                "    WGPU top-5: {:?}",
+                wgpu_indexed.iter().take(5).collect::<Vec<_>>()
+            );
+            eprintln!(
+                "    Expected top-5: {:?}",
+                expected_indexed.iter().take(5).collect::<Vec<_>>()
+            );
 
             if pass_pct < MIN_PASS_PCT || !top1_match {
                 all_passed = false;
@@ -156,7 +172,12 @@ async fn test_wgpu_against_ground_truth() {
     }
 }
 
-fn count_within_tolerance(actual: &[f32], expected: &[f32], rtol: f32, atol: f32) -> (usize, usize, f32) {
+fn count_within_tolerance(
+    actual: &[f32],
+    expected: &[f32],
+    rtol: f32,
+    atol: f32,
+) -> (usize, usize, f32) {
     let mut pass_count = 0;
     let mut max_diff = 0.0f32;
     for (&a, &e) in actual.iter().zip(expected.iter()) {

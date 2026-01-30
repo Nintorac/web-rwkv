@@ -1385,6 +1385,11 @@
             prefill_uniform: 'seq_len',
             prefill_mixed: 'mixed_case_id',
             decode_only: 'decode_steps'
+        },
+        logX: {
+            prefill_uniform: false,
+            prefill_mixed: false,
+            decode_only: false
         }
     };
 
@@ -2285,9 +2290,21 @@
             <label for="line-axis-select">X-axis</label>
             <select id="line-axis-select" class="line-axis-select"></select>
         `;
+        const logToggle = document.createElement('div');
+        logToggle.className = 'line-axis-log';
+        logToggle.innerHTML = `
+            <label class="line-axis-log-label">
+                <input type="checkbox" id="line-axis-log" />
+                Log X
+            </label>
+        `;
+        const axisControls = document.createElement('div');
+        axisControls.className = 'line-axis-controls';
+        axisControls.appendChild(axisPicker);
+        axisControls.appendChild(logToggle);
 
         controls.appendChild(tabs);
-        controls.appendChild(axisPicker);
+        controls.appendChild(axisControls);
 
         const chartContainer = document.createElement('div');
         chartContainer.className = 'line-chart-view';
@@ -2325,6 +2342,7 @@
 
     function updateLineAxisOptions() {
         const select = document.getElementById('line-axis-select');
+        const logToggle = document.getElementById('line-axis-log');
         if (!select) return;
 
         const scenario = lineChartState.scenario;
@@ -2349,12 +2367,30 @@
             lineChartState.xAxis[scenario] = select.value;
             renderLineChart();
         };
+
+        if (logToggle) {
+            const axisType = options.find(opt => opt.key === selectedKey)?.type || 'numeric';
+            if (axisType !== 'numeric') {
+                lineChartState.logX[scenario] = false;
+                logToggle.checked = false;
+                logToggle.disabled = true;
+            } else {
+                logToggle.disabled = false;
+                logToggle.checked = !!lineChartState.logX[scenario];
+            }
+            logToggle.onchange = () => {
+                if (axisType !== 'numeric') return;
+                lineChartState.logX[scenario] = logToggle.checked;
+                renderLineChart();
+            };
+        }
     }
 
     function getLineChartConfig(scenario) {
         const axisKey = lineChartState.xAxis[scenario] || getLineChartAxisOptions(scenario)[0].key;
         const axisOptions = getLineChartAxisOptions(scenario);
         const axis = axisOptions.find(opt => opt.key === axisKey) || axisOptions[0];
+        const logX = axis.type === 'numeric' ? !!lineChartState.logX[scenario] : false;
 
         switch (scenario) {
             case 'decode_only':
@@ -2364,6 +2400,7 @@
                     xKey: axis.key,
                     xLabel: axis.label,
                     xType: axis.type,
+                    logX,
                     yKey: 'decode_tok_per_s',
                     yLabel: 'Decode tok/s',
                     yUnit: 'tok/s'
@@ -2375,6 +2412,7 @@
                     xKey: axis.key,
                     xLabel: axis.label,
                     xType: axis.type,
+                    logX,
                     yKey: 'prefill_tok_per_s',
                     yLabel: 'Prefill tok/s',
                     yUnit: 'tok/s'
@@ -2386,6 +2424,7 @@
                     xKey: axis.key,
                     xLabel: axis.label,
                     xType: axis.type,
+                    logX,
                     yKey: 'prefill_tok_per_s',
                     yLabel: 'Prefill tok/s',
                     yUnit: 'tok/s',
@@ -2558,11 +2597,30 @@
         minValue = Math.max(0, minValue - valuePadding);
         maxValue = maxValue + valuePadding;
 
-        // X scale (seq_len) - linear scale
+        // X scale (seq_len) - linear or log scale
+        let useLogX = config.logX && config.xType === 'numeric';
+        let minPositive = Infinity;
+        if (useLogX) {
+            seriesData.forEach(series => {
+                series.points.forEach(pt => {
+                    if (pt.x > 0 && pt.x < minPositive) {
+                        minPositive = pt.x;
+                    }
+                });
+            });
+            if (!Number.isFinite(minPositive)) {
+                useLogX = false;
+            }
+        }
+
         const xScale = config.xType === 'numeric'
-            ? d3.scaleLinear()
-                .domain([minSeqLen, maxSeqLen])
-                .range([0, width])
+            ? (useLogX
+                ? d3.scaleLog()
+                    .domain([minPositive, maxSeqLen])
+                    .range([0, width])
+                : d3.scaleLinear()
+                    .domain([minSeqLen, maxSeqLen])
+                    .range([0, width]))
             : d3.scalePoint()
                 .domain(xValues)
                 .range([0, width])
@@ -2636,9 +2694,11 @@
 
         // X axis
         const xAxisBuilder = config.xType === 'numeric'
-            ? d3.axisBottom(xScale)
-                .tickValues(xValues)
-                .tickFormat(config.xFormatter || (d => d.toString()))
+            ? (useLogX
+                ? d3.axisBottom(xScale).ticks(6, '~g')
+                : d3.axisBottom(xScale)
+                    .tickValues(xValues)
+                    .tickFormat(config.xFormatter || (d => d.toString())))
             : d3.axisBottom(xScale);
 
         const xAxis = g.append('g')

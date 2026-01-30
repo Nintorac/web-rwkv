@@ -9,7 +9,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use web_rwkv::hip::{HipRuntime, Rwkv7Hip, HipRuntimeConfig};
+use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
 const MODEL_PATH: &str = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
 
@@ -51,14 +51,20 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("\n=== HIP Decode Profiling: batch_size={}, decode_steps={} ===\n", batch_size, decode_steps);
+    eprintln!(
+        "\n=== HIP Decode Profiling: batch_size={}, decode_steps={} ===\n",
+        batch_size, decode_steps
+    );
 
     // Load model
     let model = Rwkv7Hip::load(MODEL_PATH)?;
     let info = &model.info;
 
     eprintln!("Model: {} v7", MODEL_PATH);
-    eprintln!("  Vocab: {}, Layers: {}, Embed: {}", info.n_vocab, info.n_layer, info.n_embd);
+    eprintln!(
+        "  Vocab: {}, Layers: {}, Embed: {}",
+        info.n_vocab, info.n_layer, info.n_embd
+    );
 
     // Create HIP runtime with chunk_size=1 for decode-only workload
     // This enables the fast path that skips GPU→CPU token staging roundtrip
@@ -69,9 +75,7 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
     eprintln!("\nWarming up (3 iterations)...");
     for _ in 0..3 {
         // Create batch of single tokens
-        let sequences: Vec<Vec<u32>> = (0..batch_size)
-            .map(|_| vec![1u32])
-            .collect();
+        let sequences: Vec<Vec<u32>> = (0..batch_size).map(|_| vec![1u32]).collect();
         let seq_refs: Vec<&[u32]> = sequences.iter().map(|s| s.as_slice()).collect();
         let _ = runtime.infer(&seq_refs)?;
     }
@@ -106,10 +110,16 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
     let total_tokens = batch_size * decode_steps;
     let tokens_per_sec = total_tokens as f64 / total_time.as_secs_f64();
 
-    let step_times_ms: Vec<f64> = step_times.iter().map(|d| d.as_secs_f64() * 1000.0).collect();
+    let step_times_ms: Vec<f64> = step_times
+        .iter()
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .collect();
     let mean_step_ms = step_times_ms.iter().sum::<f64>() / step_times_ms.len() as f64;
     let min_step_ms = step_times_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_step_ms = step_times_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_step_ms = step_times_ms
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
 
     let mut sorted = step_times_ms.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -121,7 +131,10 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
     eprintln!("Batch size:      {}", batch_size);
     eprintln!("Decode steps:    {}", decode_steps);
     eprintln!("Total tokens:    {}", total_tokens);
-    eprintln!("Total time:      {:.3} ms", total_time.as_secs_f64() * 1000.0);
+    eprintln!(
+        "Total time:      {:.3} ms",
+        total_time.as_secs_f64() * 1000.0
+    );
     eprintln!("Throughput:      {:.1} tokens/sec", tokens_per_sec);
     eprintln!("");
     eprintln!("Step latency:");
@@ -146,11 +159,14 @@ async fn profile_decode_sweep() -> Result<()> {
     eprintln!("\n=== HIP Decode Batch Size Sweep ===\n");
 
     let batch_sizes = [32, 64, 128, 256];
-    let decode_steps = 8;  // Match benchmark config
+    let decode_steps = 8; // Match benchmark config
 
     eprintln!("Model: {}", MODEL_PATH);
 
-    eprintln!("\n{:>10} {:>12} {:>12} {:>12}", "batch_size", "tok/s", "step_ms", "total_ms");
+    eprintln!(
+        "\n{:>10} {:>12} {:>12} {:>12}",
+        "batch_size", "tok/s", "step_ms", "total_ms"
+    );
     eprintln!("{}", "-".repeat(50));
 
     for &batch_size in &batch_sizes {
@@ -161,9 +177,7 @@ async fn profile_decode_sweep() -> Result<()> {
 
         // Warmup
         for _ in 0..3 {
-            let sequences: Vec<Vec<u32>> = (0..batch_size)
-                .map(|_| vec![1u32])
-                .collect();
+            let sequences: Vec<Vec<u32>> = (0..batch_size).map(|_| vec![1u32]).collect();
             let seq_refs: Vec<&[u32]> = sequences.iter().map(|s| s.as_slice()).collect();
             let _ = runtime.infer(&seq_refs)?;
         }
@@ -190,7 +204,10 @@ async fn profile_decode_sweep() -> Result<()> {
         let step_ms = elapsed.as_secs_f64() * 1000.0 / decode_steps as f64;
         let total_ms = elapsed.as_secs_f64() * 1000.0;
 
-        eprintln!("{:>10} {:>12.1} {:>12.3} {:>12.1}", batch_size, tokens_per_sec, step_ms, total_ms);
+        eprintln!(
+            "{:>10} {:>12.1} {:>12.3} {:>12.1}",
+            batch_size, tokens_per_sec, step_ms, total_ms
+        );
     }
 
     eprintln!("\nDone.");

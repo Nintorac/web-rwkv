@@ -7,7 +7,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::config::{BackendConfig, BenchmarkCase, CustomRule, Limits, ModelConfig, SkipConditions};
+use crate::config::{
+    BackendConfig, BenchmarkCase, CustomRule, Limits, ModelConfig, SkipConditions,
+};
 
 /// Reason why a benchmark case was skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,13 +40,9 @@ pub enum SkipReason {
         description: String,
     },
     /// Model is marked as skipped in config
-    ModelSkipped {
-        model_name: String,
-    },
+    ModelSkipped { model_name: String },
     /// Backend is marked as skipped in config
-    BackendSkipped {
-        backend_id: String,
-    },
+    BackendSkipped { backend_id: String },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -340,7 +338,12 @@ fn split_comparison<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
         if op == "<" && after.starts_with('=') {
             return None;
         }
-        if op == "=" && (before.ends_with('!') || before.ends_with('<') || before.ends_with('>') || after.starts_with('=')) {
+        if op == "="
+            && (before.ends_with('!')
+                || before.ends_with('<')
+                || before.ends_with('>')
+                || after.starts_with('='))
+        {
             return None;
         }
 
@@ -375,8 +378,14 @@ fn resolve_value(s: &str, ctx: &RuleContext) -> Value {
     match s {
         "batch_size" => Value::Number(ctx.batch_size as i64),
         "token_chunk_size" => Value::Number(ctx.token_chunk_size as i64),
-        "seq_len" => ctx.seq_len.map(|v| Value::Number(v as i64)).unwrap_or(Value::None),
-        "decode_steps" => ctx.decode_steps.map(|v| Value::Number(v as i64)).unwrap_or(Value::None),
+        "seq_len" => ctx
+            .seq_len
+            .map(|v| Value::Number(v as i64))
+            .unwrap_or(Value::None),
+        "decode_steps" => ctx
+            .decode_steps
+            .map(|v| Value::Number(v as i64))
+            .unwrap_or(Value::None),
         "model_name" => Value::String(ctx.model_name.to_string()),
         "backend_id" => Value::String(ctx.backend_id.to_string()),
         _ => Value::None,
@@ -399,16 +408,29 @@ pub enum StopReason {
 impl std::fmt::Display for StopReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StopReason::MaxCasesReached { total_cases, max_cases } => {
+            StopReason::MaxCasesReached {
+                total_cases,
+                max_cases,
+            } => {
                 write!(f, "max cases reached: {} >= {}", total_cases, max_cases)
             }
-            StopReason::MaxRuntimeExceeded { elapsed_secs, max_secs } => {
-                write!(f, "max runtime exceeded: {}s >= {}s", elapsed_secs, max_secs)
+            StopReason::MaxRuntimeExceeded {
+                elapsed_secs,
+                max_secs,
+            } => {
+                write!(
+                    f,
+                    "max runtime exceeded: {}s >= {}s",
+                    elapsed_secs, max_secs
+                )
             }
             StopReason::FailFastError { error_count } => {
                 write!(f, "fail_fast: {} error(s) encountered", error_count)
             }
-            StopReason::MaxErrorsReached { error_count, max_errors } => {
+            StopReason::MaxErrorsReached {
+                error_count,
+                max_errors,
+            } => {
                 write!(f, "max errors reached: {} >= {}", error_count, max_errors)
             }
         }
@@ -743,7 +765,10 @@ mod tests {
         tracker.record_case();
         assert!(matches!(
             tracker.should_stop(),
-            Some(StopReason::MaxCasesReached { total_cases: 3, max_cases: 3 })
+            Some(StopReason::MaxCasesReached {
+                total_cases: 3,
+                max_cases: 3
+            })
         ));
     }
 
@@ -780,7 +805,10 @@ mod tests {
         tracker.record_error();
         assert!(matches!(
             tracker.should_stop(),
-            Some(StopReason::MaxErrorsReached { error_count: 3, max_errors: 3 })
+            Some(StopReason::MaxErrorsReached {
+                error_count: 3,
+                max_errors: 3
+            })
         ));
     }
 
@@ -823,7 +851,10 @@ mod tests {
             rule_name: "test_rule".to_string(),
             description: "Test description".to_string(),
         };
-        assert_eq!(reason.to_string(), "custom rule 'test_rule': Test description");
+        assert_eq!(
+            reason.to_string(),
+            "custom rule 'test_rule': Test description"
+        );
     }
 
     #[test]

@@ -41,6 +41,8 @@ use std::fs;
 use std::path::Path;
 use tokio::fs::File as TokioFile;
 
+#[cfg(feature = "hip")]
+use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
@@ -50,15 +52,12 @@ use web_rwkv::{
         v4, v5, v6, v7, Runtime, TokioRuntime,
     },
 };
-#[cfg(feature = "hip")]
-use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
 use web_rwkv_bench::{
     collect_run_metadata, generate_case_id, generate_run_id, generate_timestamp_utc,
-    round_chunk_size, CaseIdParams, CaseIdentity, DecodeConfig, DecodeResults,
-    JsonlGpuInfo, JsonlHostInfo as HostInfo, JsonlWriter, MeasureRecord, Metrics,
-    PrefillMetrics, PrefillResult, PrefillUniformConfig, RunHeader, Scenario,
-    ScenarioParams, Status, TokenGenerator,
+    round_chunk_size, CaseIdParams, CaseIdentity, DecodeConfig, DecodeResults, JsonlGpuInfo,
+    JsonlHostInfo as HostInfo, JsonlWriter, MeasureRecord, Metrics, PrefillMetrics, PrefillResult,
+    PrefillUniformConfig, RunHeader, Scenario, ScenarioParams, Status, TokenGenerator,
 };
 
 /// Default config file path
@@ -537,8 +536,8 @@ pub fn load_config(path: &str) -> Result<BenchConfig, ConfigError> {
 
 /// Load config from environment variable or default path
 pub fn load_config_from_env() -> Result<BenchConfig, ConfigError> {
-    let config_path = env::var("WEB_RWKV_BENCH_CONFIG")
-        .unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+    let config_path =
+        env::var("WEB_RWKV_BENCH_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
 
     println!("[bench] Loading config from: {}", config_path);
     load_config(&config_path)
@@ -558,7 +557,10 @@ pub fn get_profile<'a>(config: &'a BenchConfig, name: &str) -> Result<&'a Profil
 }
 
 /// Resolve model entries from a list of model names
-pub fn resolve_models(config: &BenchConfig, names: &[String]) -> Result<Vec<ModelEntry>, ConfigError> {
+pub fn resolve_models(
+    config: &BenchConfig,
+    names: &[String],
+) -> Result<Vec<ModelEntry>, ConfigError> {
     let mut models = Vec::new();
     for name in names {
         let model = config
@@ -574,7 +576,10 @@ pub fn resolve_models(config: &BenchConfig, names: &[String]) -> Result<Vec<Mode
 }
 
 /// Resolve backend entries from a list of backend IDs
-pub fn resolve_backends(config: &BenchConfig, ids: &[String]) -> Result<Vec<BackendEntry>, ConfigError> {
+pub fn resolve_backends(
+    config: &BenchConfig,
+    ids: &[String],
+) -> Result<Vec<BackendEntry>, ConfigError> {
     let mut backends = Vec::new();
     for id in ids {
         let backend = config
@@ -639,7 +644,10 @@ impl BenchCase {
 }
 
 /// Expand a profile into a list of benchmark cases
-pub fn expand_profile(config: &BenchConfig, profile: &Profile) -> Result<Vec<BenchCase>, ConfigError> {
+pub fn expand_profile(
+    config: &BenchConfig,
+    profile: &Profile,
+) -> Result<Vec<BenchCase>, ConfigError> {
     let models = resolve_models(config, &profile.models)?;
     let backends = resolve_backends(config, &profile.backends)?;
 
@@ -855,7 +863,10 @@ async fn run_decode_benchmark(
                 })
                 .collect();
             let input = RnnInput::new(batches, token_chunk_size);
-            let (_remaining, _output) = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let (_remaining, _output) = runtime
+                .infer(input)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
     }
 
@@ -887,7 +898,10 @@ async fn run_decode_benchmark(
                 .map(|&token| RnnInputBatch::new(vec![token], RnnOption::Last))
                 .collect();
             let input = RnnInput::new(batches, token_chunk_size);
-            let (_remaining, _output) = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+            let (_remaining, _output) = runtime
+                .infer(input)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
         }
 
         let elapsed = start.elapsed();
@@ -988,7 +1002,10 @@ async fn run_prefill_benchmark(
             .collect();
 
         let input = RnnInput::new(batches, token_chunk_size);
-        let _ = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        let _ = runtime
+            .infer(input)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 
     // === Measurement Phase ===
@@ -1015,7 +1032,10 @@ async fn run_prefill_benchmark(
 
         // Timed prefill call - single inference with full sequence
         let start = Instant::now();
-        let _ = runtime.infer(input).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        let _ = runtime
+            .infer(input)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         let elapsed = start.elapsed();
 
         let prefill_total_ms = elapsed.as_secs_f64() * 1000.0;
@@ -1113,15 +1133,35 @@ async fn bench_smoke_async() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[bench] Failed to load config: {}", e);
-            eprintln!("[bench] Make sure {} exists or set WEB_RWKV_BENCH_CONFIG", DEFAULT_CONFIG_PATH);
+            eprintln!(
+                "[bench] Make sure {} exists or set WEB_RWKV_BENCH_CONFIG",
+                DEFAULT_CONFIG_PATH
+            );
             return;
         }
     };
 
     println!("[bench] Config schema version: {}", config.schema_version);
-    println!("[bench] Available profiles: {:?}", config.profiles.keys().collect::<Vec<_>>());
-    println!("[bench] Available models: {:?}", config.models.iter().map(|m| &m.model_name).collect::<Vec<_>>());
-    println!("[bench] Available backends: {:?}", config.backends.iter().map(|b| &b.backend_id).collect::<Vec<_>>());
+    println!(
+        "[bench] Available profiles: {:?}",
+        config.profiles.keys().collect::<Vec<_>>()
+    );
+    println!(
+        "[bench] Available models: {:?}",
+        config
+            .models
+            .iter()
+            .map(|m| &m.model_name)
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "[bench] Available backends: {:?}",
+        config
+            .backends
+            .iter()
+            .map(|b| &b.backend_id)
+            .collect::<Vec<_>>()
+    );
 
     // Get selected profile
     let profile_name = get_profile_name();
@@ -1181,7 +1221,9 @@ async fn bench_smoke_async() {
     // Generate run ID and output file path
     let run_id = generate_run_id();
     let timestamp = generate_timestamp_utc();
-    let output_filename = config.output.filename_pattern
+    let output_filename = config
+        .output
+        .filename_pattern
         .replace("{profile}", &profile_name)
         .replace("{timestamp}", &timestamp.replace(":", "").replace("-", ""))
         .replace("{run_id}", &run_id);
@@ -1204,13 +1246,33 @@ async fn bench_smoke_async() {
     let run_header = RunHeader {
         run_id: run_id.clone(),
         started_at_utc: timestamp.clone(),
-        git_sha: metadata.git.sha.clone().unwrap_or_else(|| "unknown".to_string()),
+        git_sha: metadata
+            .git
+            .sha
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
         git_dirty: metadata.git.dirty.unwrap_or(true),
-        crate_version: metadata.build.crate_version.clone().unwrap_or_else(|| "unknown".to_string()),
-        rustc_version: metadata.build.rustc_version.clone().unwrap_or_else(|| "unknown".to_string()),
+        crate_version: metadata
+            .build
+            .crate_version
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        rustc_version: metadata
+            .build
+            .rustc_version
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
         host: HostInfo {
-            os: metadata.host.os.clone().unwrap_or_else(|| "unknown".to_string()),
-            cpu: metadata.host.cpu.clone().unwrap_or_else(|| "unknown".to_string()),
+            os: metadata
+                .host
+                .os
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            cpu: metadata
+                .host
+                .cpu
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
             ram_gb: metadata.host.ram_gb.unwrap_or(0.0),
         },
         gpu: JsonlGpuInfo {
@@ -1245,18 +1307,24 @@ async fn bench_smoke_async() {
         let decode_steps = match case.decode_steps {
             Some(steps) => steps,
             None => {
-                println!("[bench] Skipping case without decode_steps: {}", case.case_id());
+                println!(
+                    "[bench] Skipping case without decode_steps: {}",
+                    case.case_id()
+                );
                 continue;
             }
         };
 
         // Check if we need to reload the model (different model or batch size)
-        let need_reload = current_model_path.as_ref() != Some(&case.model.path) ||
-                         current_batch_size != Some(case.batch_size) ||
-                         current_backend_id.as_ref() != Some(&case.backend.backend_id);
+        let need_reload = current_model_path.as_ref() != Some(&case.model.path)
+            || current_batch_size != Some(case.batch_size)
+            || current_backend_id.as_ref() != Some(&case.backend.backend_id);
 
         if need_reload {
-            println!("\n[bench] Loading model: {} (batch={})", case.model.model_name, case.batch_size);
+            println!(
+                "\n[bench] Loading model: {} (batch={})",
+                case.model.model_name, case.batch_size
+            );
 
             // Check model file exists
             if !Path::new(&case.model.path).exists() {
@@ -1270,7 +1338,9 @@ async fn bench_smoke_async() {
                 case.batch_size as usize,
                 case.token_chunk_size as usize,
                 &case.backend.backend_id,
-            ).await {
+            )
+            .await
+            {
                 Ok(model) => {
                     println!("[bench] Model loaded: {:?}", model.info.version);
                     current_model_path = Some(case.model.path.clone());
@@ -1309,8 +1379,10 @@ async fn bench_smoke_async() {
         };
         let case_id = generate_case_id(&case_id_params);
 
-        println!("[bench] Running: {} (steps={}, warmup={}, repeats={})",
-            case_id, decode_steps, case.warmup_runs, case.repeats);
+        println!(
+            "[bench] Running: {} (steps={}, warmup={}, repeats={})",
+            case_id, decode_steps, case.warmup_runs, case.repeats
+        );
 
         // Run the benchmark
         match run_decode_benchmark(
@@ -1320,10 +1392,14 @@ async fn bench_smoke_async() {
             decode_steps,
             case.warmup_runs,
             case.repeats,
-        ).await {
+        )
+        .await
+        {
             Ok(results) => {
-                println!("[bench]   Median: {:.1} tok/s, Mean: {:.1} tok/s",
-                    results.median_tok_per_s, results.mean_tok_per_s);
+                println!(
+                    "[bench]   Median: {:.1} tok/s, Mean: {:.1} tok/s",
+                    results.median_tok_per_s, results.mean_tok_per_s
+                );
 
                 // Write measure records for each repeat
                 for (repeat_idx, _repeat) in results.repeats.iter().enumerate() {
@@ -1383,18 +1459,24 @@ async fn bench_smoke_async() {
         let seq_len = match case.seq_len {
             Some(len) => len,
             None => {
-                println!("[bench] Skipping prefill case without seq_len: {}", case.case_id());
+                println!(
+                    "[bench] Skipping prefill case without seq_len: {}",
+                    case.case_id()
+                );
                 continue;
             }
         };
 
         // Check if we need to reload the model (different model or batch size)
-        let need_reload = current_model_path.as_ref() != Some(&case.model.path) ||
-                         current_batch_size != Some(case.batch_size) ||
-                         current_backend_id.as_ref() != Some(&case.backend.backend_id);
+        let need_reload = current_model_path.as_ref() != Some(&case.model.path)
+            || current_batch_size != Some(case.batch_size)
+            || current_backend_id.as_ref() != Some(&case.backend.backend_id);
 
         if need_reload {
-            println!("\n[bench] Loading model: {} (batch={})", case.model.model_name, case.batch_size);
+            println!(
+                "\n[bench] Loading model: {} (batch={})",
+                case.model.model_name, case.batch_size
+            );
 
             // Check model file exists
             if !Path::new(&case.model.path).exists() {
@@ -1408,7 +1490,9 @@ async fn bench_smoke_async() {
                 case.batch_size as usize,
                 case.token_chunk_size as usize,
                 &case.backend.backend_id,
-            ).await {
+            )
+            .await
+            {
                 Ok(model) => {
                     println!("[bench] Model loaded: {:?}", model.info.version);
                     current_model_path = Some(case.model.path.clone());
@@ -1447,8 +1531,10 @@ async fn bench_smoke_async() {
         };
         let case_id = generate_case_id(&case_id_params);
 
-        println!("[bench] Running: {} (seq_len={}, warmup={}, repeats={})",
-            case_id, seq_len, case.warmup_runs, case.repeats);
+        println!(
+            "[bench] Running: {} (seq_len={}, warmup={}, repeats={})",
+            case_id, seq_len, case.warmup_runs, case.repeats
+        );
 
         // Run the prefill benchmark
         match run_prefill_benchmark(
@@ -1458,10 +1544,14 @@ async fn bench_smoke_async() {
             seq_len,
             case.warmup_runs,
             case.repeats,
-        ).await {
+        )
+        .await
+        {
             Ok(results) => {
-                println!("[bench]   Median: {:.1} tok/s, Mean: {:.1} tok/s",
-                    results.median_tok_per_s, results.mean_tok_per_s);
+                println!(
+                    "[bench]   Median: {:.1} tok/s, Mean: {:.1} tok/s",
+                    results.median_tok_per_s, results.mean_tok_per_s
+                );
 
                 // Write measure records for each repeat
                 for (repeat_idx, repeat) in results.repeats.iter().enumerate() {
@@ -1561,11 +1651,19 @@ fn bench_validate_config() {
     for (name, profile) in &config.profiles {
         for model_name in &profile.models {
             let found = config.models.iter().any(|m| &m.model_name == model_name);
-            assert!(found, "Profile '{}' references unknown model: {}", name, model_name);
+            assert!(
+                found,
+                "Profile '{}' references unknown model: {}",
+                name, model_name
+            );
         }
         for backend_id in &profile.backends {
             let found = config.backends.iter().any(|b| &b.backend_id == backend_id);
-            assert!(found, "Profile '{}' references unknown backend: {}", name, backend_id);
+            assert!(
+                found,
+                "Profile '{}' references unknown backend: {}",
+                name, backend_id
+            );
         }
     }
 

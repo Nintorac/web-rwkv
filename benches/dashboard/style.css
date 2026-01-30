@@ -587,7 +587,7 @@ body {
 
 .line-chart-controls {
     display: flex;
-    align-items: flex-end;
+    align-items: flex-start;
     justify-content: space-between;
     gap: var(--space-md);
     margin-bottom: var(--space-md);
@@ -620,6 +620,25 @@ body {
     gap: var(--space-xs);
     font-size: 12px;
     color: var(--text-secondary);
+}
+
+.line-axis-controls {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: var(--space-xs);
+}
+
+.line-axis-log {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.line-axis-log-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
 }
 
 .line-axis-select {

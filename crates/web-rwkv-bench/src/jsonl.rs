@@ -458,16 +458,27 @@ impl MeasureRecord {
         let (decode_steps, seq_len, seq_lens, mixed_case_id) = match &self.scenario_params {
             ScenarioParams::Decode { decode_steps } => (Some(*decode_steps), None, None, None),
             ScenarioParams::PrefillUniform { seq_len } => (None, Some(*seq_len), None, None),
-            ScenarioParams::PrefillMixed { seq_lens, mixed_case_id } => {
-                (None, None, Some(seq_lens), Some(mixed_case_id.as_str()))
-            }
+            ScenarioParams::PrefillMixed {
+                seq_lens,
+                mixed_case_id,
+            } => (None, None, Some(seq_lens), Some(mixed_case_id.as_str())),
         };
 
         // Extract metrics
         let (
-            decode_total_ms, decode_tokens, decode_tok_per_s, decode_step_ms_p50, decode_step_ms_p95,
-            prefill_total_ms, total_prompt_tokens, prefill_tok_per_s, num_infer_calls,
-            ttft_ms_local, ttft_min_ms, ttft_p50_ms, ttft_max_ms,
+            decode_total_ms,
+            decode_tokens,
+            decode_tok_per_s,
+            decode_step_ms_p50,
+            decode_step_ms_p95,
+            prefill_total_ms,
+            total_prompt_tokens,
+            prefill_tok_per_s,
+            num_infer_calls,
+            ttft_ms_local,
+            ttft_min_ms,
+            ttft_p50_ms,
+            ttft_max_ms,
         ) = match &self.metrics {
             Some(Metrics::Decode(m)) => (
                 Some(m.decode_total_ms),
@@ -475,10 +486,21 @@ impl MeasureRecord {
                 Some(m.decode_tok_per_s),
                 m.decode_step_ms_p50,
                 m.decode_step_ms_p95,
-                None, None, None, None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             ),
             Some(Metrics::Prefill(m)) => (
-                None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some(m.prefill_total_ms),
                 Some(m.total_prompt_tokens),
                 Some(m.prefill_tok_per_s),
@@ -489,8 +511,7 @@ impl MeasureRecord {
                 Some(m.ttft_max_ms),
             ),
             Some(Metrics::None) | None => (
-                None, None, None, None, None,
-                None, None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None, None, None, None, None,
             ),
         };
 
@@ -641,10 +662,7 @@ impl JsonlWriter {
     ///
     /// Returns an error if the file already exists.
     pub fn create(path: &Path) -> JsonlResult<Self> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
 
         Ok(Self {
             writer: BufWriter::new(file),
@@ -898,7 +916,10 @@ mod tests {
         };
 
         let case_id = generate_case_id(&params);
-        assert_eq!(case_id, "decode_only:rwkv7_0.1b:wgpu:Vulkan:bs4:c2048:steps100");
+        assert_eq!(
+            case_id,
+            "decode_only:rwkv7_0.1b:wgpu:Vulkan:bs4:c2048:steps100"
+        );
     }
 
     #[test]
@@ -916,7 +937,10 @@ mod tests {
         };
 
         let case_id = generate_case_id(&params);
-        assert_eq!(case_id, "prefill_uniform:rwkv7_0.1b:wgpu:Vulkan:bs4:c2048:len512");
+        assert_eq!(
+            case_id,
+            "prefill_uniform:rwkv7_0.1b:wgpu:Vulkan:bs4:c2048:len512"
+        );
     }
 
     #[test]
@@ -934,7 +958,10 @@ mod tests {
         };
 
         let case_id = generate_case_id(&params);
-        assert_eq!(case_id, "prefill_mixed:rwkv7_0.1b:wgpu:Vulkan:bs8:c256:staircase_8");
+        assert_eq!(
+            case_id,
+            "prefill_mixed:rwkv7_0.1b:wgpu:Vulkan:bs8:c256:staircase_8"
+        );
     }
 
     #[test]
@@ -1345,11 +1372,7 @@ mod tests {
     fn test_prefill_result_to_prefill_metrics() {
         use crate::prefill_uniform::PrefillResult;
 
-        let result = PrefillResult::from_ttft(
-            vec![10.0, 20.0, 30.0, 40.0],
-            512,
-            2,
-        );
+        let result = PrefillResult::from_ttft(vec![10.0, 20.0, 30.0, 40.0], 512, 2);
 
         let metrics: PrefillMetrics = result.into();
 

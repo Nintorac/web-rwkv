@@ -141,7 +141,9 @@ async fn test_single_token_parity() {
 
     // Process single token
     let tokens = vec![42u32]; // Arbitrary token
-    let hip_logits = hip_runtime.infer_one(&tokens).expect("HIP inference failed");
+    let hip_logits = hip_runtime
+        .infer_one(&tokens)
+        .expect("HIP inference failed");
     let hip_data = hip_logits.data();
 
     // === WGPU Backend ===
@@ -178,18 +180,31 @@ async fn test_single_token_parity() {
     // Compare
     let stats = LogitStats::compute(hip_data, wgpu_data);
 
-    println!("Single token ({}): cosine={:.6}, top1={} (HIP={}, WGPU={}), max_diff={:.6e}",
-             tokens[0],
-             stats.cosine_sim,
-             if stats.top1_match { "✓" } else { "✗" },
-             stats.top1_hip,
-             stats.top1_wgpu,
-             stats.max_diff);
+    println!(
+        "Single token ({}): cosine={:.6}, top1={} (HIP={}, WGPU={}), max_diff={:.6e}",
+        tokens[0],
+        stats.cosine_sim,
+        if stats.top1_match { "✓" } else { "✗" },
+        stats.top1_hip,
+        stats.top1_wgpu,
+        stats.max_diff
+    );
 
     // Single token should have very high parity
-    assert!(stats.cosine_sim > 0.999, "Single token cosine should be > 0.999, got {:.6}", stats.cosine_sim);
-    assert!(stats.top1_match, "Single token should have matching top-1 prediction");
-    assert!(stats.top10_overlap >= 9, "Single token should have >= 9/10 top-10 overlap, got {}", stats.top10_overlap);
+    assert!(
+        stats.cosine_sim > 0.999,
+        "Single token cosine should be > 0.999, got {:.6}",
+        stats.cosine_sim
+    );
+    assert!(
+        stats.top1_match,
+        "Single token should have matching top-1 prediction"
+    );
+    assert!(
+        stats.top10_overlap >= 9,
+        "Single token should have >= 9/10 top-10 overlap, got {}",
+        stats.top10_overlap
+    );
 
     println!("\n✓ Single token parity test PASSED");
 }
@@ -247,7 +262,9 @@ async fn test_token_by_token_with_reset() {
         hip_runtime.reset_state();
 
         // HIP forward
-        let hip_logits = hip_runtime.infer_one(&[token]).expect("HIP inference failed");
+        let hip_logits = hip_runtime
+            .infer_one(&[token])
+            .expect("HIP inference failed");
         let hip_data = hip_logits.data();
 
         // WGPU forward (fresh state per call? need to check)
@@ -270,9 +287,15 @@ async fn test_token_by_token_with_reset() {
 
         let stats = LogitStats::compute(hip_data, wgpu_data);
 
-        let status = if stats.top1_match && stats.cosine_sim > 0.999 { "✓" } else { "✗" };
-        println!("Token {:5}: {} cosine={:.6}, top1={}/{}, top10={}/10",
-                 token, status, stats.cosine_sim, stats.top1_hip, stats.top1_wgpu, stats.top10_overlap);
+        let status = if stats.top1_match && stats.cosine_sim > 0.999 {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "Token {:5}: {} cosine={:.6}, top1={}/{}, top10={}/10",
+            token, status, stats.cosine_sim, stats.top1_hip, stats.top1_wgpu, stats.top10_overlap
+        );
     }
 
     println!("\nToken-by-token with reset test complete.");
@@ -297,7 +320,9 @@ async fn test_multi_token_prefill() {
     let vocab_size = hip_model.info.n_vocab;
     let hip_runtime = HipRuntime::new(hip_model, 1);
 
-    let hip_logits = hip_runtime.infer_one(&tokens).expect("HIP inference failed");
+    let hip_logits = hip_runtime
+        .infer_one(&tokens)
+        .expect("HIP inference failed");
     let hip_data = hip_logits.data();
 
     // === WGPU Backend ===
@@ -348,10 +373,22 @@ async fn test_multi_token_prefill() {
             all_top1_match = false;
         }
 
-        let status = if stats.top1_match && stats.cosine_sim > 0.99 { "✓" } else { "✗" };
-        println!("Token {} ({}): {} cos={:.6}, top1={}/{}, top10={}/10, KL={:.2e}",
-                 t, tokens[t], status, stats.cosine_sim, stats.top1_hip, stats.top1_wgpu,
-                 stats.top10_overlap, stats.kl_divergence);
+        let status = if stats.top1_match && stats.cosine_sim > 0.99 {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "Token {} ({}): {} cos={:.6}, top1={}/{}, top10={}/10, KL={:.2e}",
+            t,
+            tokens[t],
+            status,
+            stats.cosine_sim,
+            stats.top1_hip,
+            stats.top1_wgpu,
+            stats.top10_overlap,
+            stats.kl_divergence
+        );
     }
 
     // Summary
@@ -416,7 +453,9 @@ async fn test_sequential_generation_parity() {
 
     for (i, &token) in prompt_tokens.iter().enumerate() {
         // HIP: Process single token (state maintained internally)
-        let hip_logits = hip_runtime.infer_one(&[token]).expect("HIP inference failed");
+        let hip_logits = hip_runtime
+            .infer_one(&[token])
+            .expect("HIP inference failed");
         let hip_data = hip_logits.data();
 
         // WGPU: Process single token (state maintained internally)
@@ -427,10 +466,22 @@ async fn test_sequential_generation_parity() {
 
         let stats = LogitStats::compute(hip_data, wgpu_data);
 
-        let status = if stats.top1_match && stats.cosine_sim > 0.99 { "✓" } else { "✗" };
-        println!("Step {:2} (token {:5}): {} cos={:.6}, top1={}/{}, top10={}/10, KL={:.2e}",
-                 i, token, status, stats.cosine_sim, stats.top1_hip, stats.top1_wgpu,
-                 stats.top10_overlap, stats.kl_divergence);
+        let status = if stats.top1_match && stats.cosine_sim > 0.99 {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "Step {:2} (token {:5}): {} cos={:.6}, top1={}/{}, top10={}/10, KL={:.2e}",
+            i,
+            token,
+            status,
+            stats.cosine_sim,
+            stats.top1_hip,
+            stats.top1_wgpu,
+            stats.top10_overlap,
+            stats.kl_divergence
+        );
 
         // Track when divergence starts
         if !stats.top1_match && divergence_started_at.is_none() {
@@ -440,8 +491,14 @@ async fn test_sequential_generation_parity() {
 
     println!("\n=== Analysis ===");
     if let Some(step) = divergence_started_at {
-        println!("Divergence started at step {} (token {})", step, prompt_tokens[step]);
-        println!("This suggests state accumulation issues starting after {} tokens", step);
+        println!(
+            "Divergence started at step {} (token {})",
+            step, prompt_tokens[step]
+        );
+        println!(
+            "This suggests state accumulation issues starting after {} tokens",
+            step
+        );
     } else {
         println!("✓ No divergence detected in sequential processing");
     }
@@ -467,7 +524,9 @@ async fn test_hip_prefill_vs_sequential() {
     let vocab_size = hip_model_prefill.info.n_vocab;
     let runtime_prefill = HipRuntime::new(hip_model_prefill, 1);
 
-    let prefill_logits = runtime_prefill.infer_one(&tokens).expect("Prefill inference failed");
+    let prefill_logits = runtime_prefill
+        .infer_one(&tokens)
+        .expect("Prefill inference failed");
     let prefill_data = prefill_logits.data();
 
     // === Sequential mode ===
@@ -476,7 +535,9 @@ async fn test_hip_prefill_vs_sequential() {
 
     let mut seq_logits_all: Vec<f32> = Vec::new();
     for &token in &tokens {
-        let logits = runtime_seq.infer_one(&[token]).expect("Sequential inference failed");
+        let logits = runtime_seq
+            .infer_one(&[token])
+            .expect("Sequential inference failed");
         seq_logits_all.extend_from_slice(logits.data());
     }
 
@@ -492,9 +553,15 @@ async fn test_hip_prefill_vs_sequential() {
 
         let stats = LogitStats::compute(prefill_slice, seq_slice);
 
-        let status = if stats.cosine_sim > 0.9999 { "✓" } else { "✗" };
-        println!("Token {} ({}): {} cos={:.6}, max_diff={:.2e}",
-                 t, tokens[t], status, stats.cosine_sim, stats.max_diff);
+        let status = if stats.cosine_sim > 0.9999 {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!(
+            "Token {} ({}): {} cos={:.6}, max_diff={:.2e}",
+            t, tokens[t], status, stats.cosine_sim, stats.max_diff
+        );
 
         if stats.cosine_sim < 0.9999 {
             all_match = false;
@@ -529,7 +596,9 @@ async fn test_divergence_deep_dive() {
     let vocab_size = hip_model.info.n_vocab;
     let hip_runtime = HipRuntime::new(hip_model, 1);
 
-    let hip_logits = hip_runtime.infer_one(&tokens).expect("HIP inference failed");
+    let hip_logits = hip_runtime
+        .infer_one(&tokens)
+        .expect("HIP inference failed");
     let hip_data = hip_logits.data();
 
     // WGPU prefill
@@ -582,8 +651,14 @@ async fn test_divergence_deep_dive() {
         let wgpu_mean: f32 = wgpu_slice.iter().sum::<f32>() / wgpu_slice.len() as f32;
 
         println!("Logit ranges:");
-        println!("  HIP:  min={:.4}, max={:.4}, mean={:.4}", hip_min, hip_max, hip_mean);
-        println!("  WGPU: min={:.4}, max={:.4}, mean={:.4}", wgpu_min, wgpu_max, wgpu_mean);
+        println!(
+            "  HIP:  min={:.4}, max={:.4}, mean={:.4}",
+            hip_min, hip_max, hip_mean
+        );
+        println!(
+            "  WGPU: min={:.4}, max={:.4}, mean={:.4}",
+            wgpu_min, wgpu_max, wgpu_mean
+        );
 
         // Top-5 predictions
         let mut hip_indexed: Vec<(usize, f32)> = hip_slice.iter().cloned().enumerate().collect();
@@ -592,8 +667,22 @@ async fn test_divergence_deep_dive() {
         wgpu_indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
         println!("\nTop-5 predictions:");
-        println!("  HIP:  {:?}", hip_indexed.iter().take(5).map(|(i, v)| (*i, format!("{:.3}", v))).collect::<Vec<_>>());
-        println!("  WGPU: {:?}", wgpu_indexed.iter().take(5).map(|(i, v)| (*i, format!("{:.3}", v))).collect::<Vec<_>>());
+        println!(
+            "  HIP:  {:?}",
+            hip_indexed
+                .iter()
+                .take(5)
+                .map(|(i, v)| (*i, format!("{:.3}", v)))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  WGPU: {:?}",
+            wgpu_indexed
+                .iter()
+                .take(5)
+                .map(|(i, v)| (*i, format!("{:.3}", v)))
+                .collect::<Vec<_>>()
+        );
 
         // Overall stats
         let stats = LogitStats::compute(hip_slice, wgpu_slice);
@@ -601,7 +690,10 @@ async fn test_divergence_deep_dive() {
         println!("  Cosine similarity: {:.6}", stats.cosine_sim);
         println!("  Max difference: {:.6e}", stats.max_diff);
         println!("  Mean difference: {:.6e}", stats.mean_diff);
-        println!("  Top-1 match: {} (HIP={}, WGPU={})", stats.top1_match, stats.top1_hip, stats.top1_wgpu);
+        println!(
+            "  Top-1 match: {} (HIP={}, WGPU={})",
+            stats.top1_match, stats.top1_hip, stats.top1_wgpu
+        );
         println!("  Top-10 overlap: {}/10", stats.top10_overlap);
         println!("  KL divergence: {:.6e}", stats.kl_divergence);
     }

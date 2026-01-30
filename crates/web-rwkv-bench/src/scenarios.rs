@@ -173,7 +173,12 @@ impl DecodeResults {
             let p95_idx = (sorted.len() as f64 * 0.95) as usize;
             (
                 Some(sorted.get(p50_idx).copied().unwrap_or(0.0)),
-                Some(sorted.get(p95_idx.min(sorted.len() - 1)).copied().unwrap_or(0.0)),
+                Some(
+                    sorted
+                        .get(p95_idx.min(sorted.len() - 1))
+                        .copied()
+                        .unwrap_or(0.0),
+                ),
             )
         } else {
             (None, None)
@@ -284,15 +289,15 @@ impl DecodeScenario {
     /// # Returns
     ///
     /// Returns `Ok(DecodeResults)` with all repeat results, or an error if any step fails.
-    pub fn run<F, E>(
-        &self,
-        vocab_size: u32,
-        mut infer: F,
-    ) -> Result<DecodeResults, E>
+    pub fn run<F, E>(&self, vocab_size: u32, mut infer: F) -> Result<DecodeResults, E>
     where
         F: FnMut(&[Vec<u16>]) -> Result<(), E>,
     {
-        self.run_with_prefill(vocab_size, &mut infer, None::<fn(&[Vec<u16>]) -> Result<(), E>>)
+        self.run_with_prefill(
+            vocab_size,
+            &mut infer,
+            None::<fn(&[Vec<u16>]) -> Result<(), E>>,
+        )
     }
 
     /// Execute the decode benchmark with optional prefill support.
@@ -320,11 +325,8 @@ impl DecodeScenario {
             // Prime prefill if configured (also during warmup)
             if let Some(prime_len) = self.config.prime_prefill_len {
                 if let Some(ref mut pf) = prefill {
-                    let prefill_tokens = rng.generate_prefill_tokens(
-                        self.config.batch_size,
-                        prime_len,
-                        vocab_size,
-                    );
+                    let prefill_tokens =
+                        rng.generate_prefill_tokens(self.config.batch_size, prime_len, vocab_size);
                     pf(&prefill_tokens)?;
                 }
             }
@@ -351,11 +353,8 @@ impl DecodeScenario {
             // Prime prefill if configured (untimed)
             if let Some(prime_len) = self.config.prime_prefill_len {
                 if let Some(ref mut pf) = prefill {
-                    let prefill_tokens = rng.generate_prefill_tokens(
-                        self.config.batch_size,
-                        prime_len,
-                        vocab_size,
-                    );
+                    let prefill_tokens =
+                        rng.generate_prefill_tokens(self.config.batch_size, prime_len, vocab_size);
                     pf(&prefill_tokens)?;
                 }
             }
