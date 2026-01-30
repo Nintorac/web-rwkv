@@ -3497,6 +3497,160 @@ hipError_t launch_wkv7_fused_t1(
 }
 
 // ============================================================================
+// WKV7 Batch-Loop T=1 Kernel
+//
+// Combines fused_t1's column-parallel algorithm with a serial batch loop.
+// Each block processes ALL batches for one head (or a chunk of batches).
+//
+// Fixes vs the naive row-parallel version:
+//   1. Column-parallel: 32 lanes read adjacent columns → coalesced memory access
+//      (row-parallel had stride-256B scattered reads → 32 cache lines per wave)
+//   2. Register cache: state read once into 2 VGPRs, reused for sa + update + y
+//      (row-parallel read state twice: sa pass + update pass)
+//   3. 256 threads (8 waves) instead of 64 (2 waves) → better latency hiding
+//
+// Grid: (H, ceil(B/BATCH_CHUNK)), Block: 256 (8 waves)
+// Each block processes BATCH_CHUNK consecutive batches.
+// ============================================================================
+
+__global__ __launch_bounds__(256, 4)
+void kernel_wkv7_batch_loop_t1(
+    const __half* __restrict__ w_decay,
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    const __half* __restrict__ a,
+    const __half* __restrict__ b,
+    float* __restrict__ state,       // in-place: [B, H, N, N]
+    __half* __restrict__ output,
+    const int* __restrict__ lengths,
+    int N, int H, int B,
+    int batch_chunk                  // batches per block (blockIdx.y selects chunk)
+) {
+    const int hh = blockIdx.x;
+    const int chunk_id = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    if (hh >= H) return;
+
+    const int batch_start = chunk_id * batch_chunk;
+    const int batch_end = min(batch_start + batch_chunk, B);
+
+    __shared__ float sh_q[64];
+    __shared__ float sh_k[64];
+    __shared__ float sh_w[64];
+    __shared__ float sh_a[64];
+    __shared__ float sh_b[64];
+
+    for (int bb = batch_start; bb < batch_end; bb++) {
+        if (lengths[bb] <= 0) continue;
+
+        const int param_base = hh * N + bb * H * N;
+        const int state_base = hh * N * N + bb * N * N * H;
+
+        // Load params to LDS (threads 0-63 load, others idle)
+        if (tid < 64) {
+            int idx = param_base + tid;
+            sh_q[tid] = __half2float(q[idx]);
+            sh_w[tid] = __half2float(w_decay[idx]);
+            sh_k[tid] = __half2float(k[idx]);
+            sh_a[tid] = __half2float(a[idx]);
+            sh_b[tid] = __half2float(b[idx]);
+        }
+        __syncthreads();
+
+        // 8 waves × 8 iterations = 64 rows (same as fused_t1)
+        for (int row_base = 0; row_base < 64; row_base += 8) {
+            int i = row_base + wave_id;
+
+            // Phase 1: Read state into registers + compute sa
+            float state_cache[2];
+            float partial_sa = 0.0f;
+
+            #pragma unroll 2
+            for (int jj = 0; jj < 64; jj += 32) {
+                int j = jj + lane_id;
+                float s = state[state_base + i * 64 + j];
+                state_cache[jj >> 5] = s;
+                partial_sa += sh_a[j] * s;
+            }
+
+            // Wave-level reduction for sa
+            #pragma unroll 5
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                partial_sa += __shfl_down(partial_sa, offset, 32);
+            }
+            float sa_i = __shfl(partial_sa, 0, 32);
+
+            // Phase 2: Update state + compute y (from cached state)
+            float v_i = __half2float(v[param_base + i]);
+            float partial_y = 0.0f;
+
+            #pragma unroll 2
+            for (int jj = 0; jj < 64; jj += 32) {
+                int j = jj + lane_id;
+                float s = state_cache[jj >> 5];
+                float new_s = sh_w[j] * s + sh_b[j] * sa_i + sh_k[j] * v_i;
+                state[state_base + i * 64 + j] = new_s;
+                partial_y += sh_q[j] * new_s;
+            }
+
+            // Wave-level reduction for y
+            #pragma unroll 5
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                partial_y += __shfl_down(partial_y, offset, 32);
+            }
+
+            if (lane_id == 0) {
+                output[param_base + i] = __float2half(partial_y);
+            }
+        }
+
+        __syncthreads();  // ensure all waves done before next batch loads params
+    }
+}
+
+hipError_t launch_wkv7_batch_loop_t1(
+    const __half* w_decay,
+    const __half* q,
+    const __half* k,
+    const __half* v,
+    const __half* a,
+    const __half* b,
+    float* state,
+    __half* output,
+    const int* lengths,
+    int N, int H, int B,
+    hipStream_t stream
+) {
+    if (N != 64 || H <= 0 || B <= 0) {
+        return hipErrorInvalidValue;
+    }
+
+    // Batch chunk: each block processes this many batches serially.
+    // Tune for the target GPU: fewer chunks = more blocks = more parallelism.
+    //   1 = one block per (head, batch) → identical grid to fused_t1
+    //   B = one block per head → maximum serial work, minimum waves
+    // Tunable via WEB_RWKV_HIP_WKV_BATCH_CHUNK env var (default: 16).
+    static int batch_chunk_cached = -1;
+    if (batch_chunk_cached < 0) {
+        const char* env = getenv("WEB_RWKV_HIP_WKV_BATCH_CHUNK");
+        batch_chunk_cached = (env && atoi(env) > 0) ? atoi(env) : 16;
+    }
+    const int batch_chunk = (B <= batch_chunk_cached) ? B : batch_chunk_cached;
+    const int num_chunks = (B + batch_chunk - 1) / batch_chunk;
+
+    dim3 grid(H, num_chunks);
+    dim3 block(256);
+    hipLaunchKernelGGL(kernel_wkv7_batch_loop_t1, grid, block, 0, stream,
+                       w_decay, q, k, v, a, b, state, output, lengths,
+                       N, H, B, batch_chunk);
+    return hipGetLastError();
+}
+
+// ============================================================================
 // F16 to F32 conversion kernel (for GPU-side logits conversion)
 // ============================================================================
 

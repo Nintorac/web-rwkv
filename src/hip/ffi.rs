@@ -577,6 +577,22 @@ extern "C" {
         stream: HipStream,
     ) -> HipError;
 
+    pub fn launch_wkv7_batch_loop_t1(
+        w_decay: *const f16,
+        q: *const f16,
+        k: *const f16,
+        v: *const f16,
+        a: *const f16,
+        b: *const f16,
+        state: *mut f32,     // in-place
+        output: *mut f16,
+        lengths: *const c_int,
+        n: c_int,
+        h: c_int,
+        b: c_int,
+        stream: HipStream,
+    ) -> HipError;
+
     // Elementwise operations for GPU-native forward pass
     pub fn launch_add_f32(
         a: *const f32,

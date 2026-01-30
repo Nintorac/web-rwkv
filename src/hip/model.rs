@@ -37,6 +37,7 @@ use super::kernels::{
     wkv7_wave_reduce_t1,
     wkv7_colmajor_t1,
     wkv7_fused_t1,
+    wkv7_batch_loop_t1,
     wkv_bonus_f16,
 };
 use super::pinned::PinnedBuffer;
@@ -1003,7 +1004,7 @@ impl Rwkv7Hip {
                 }
             }
             // T=1 only kernels fall back to wave_reduce for T>1
-            WkvKernelKind::WaveReduceT1 | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 if tokens != 1 => {
+            WkvKernelKind::WaveReduceT1 | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 | WkvKernelKind::BatchLoopT1 if tokens != 1 => {
                 WkvKernelKind::WaveReduce
             }
             other => other,
@@ -1317,8 +1318,7 @@ impl Rwkv7Hip {
         let t = tokens[0].len();
         let mut prof = HipProf::new("forward_inner");
 
-        // Create BLAS context for all GEMM operations
-        let ctx = HipBlasContext::with_null_stream()?;
+        let ctx = &scratch.blas_ctx;
         let stream = ctx.stream();
 
         let n_embd = self.info.n_embd;
@@ -1752,14 +1752,28 @@ impl Rwkv7Hip {
                                 stream,
                             )?;
                         }
+                        WkvKernelKind::BatchLoopT1 => {
+                            wkv7_batch_loop_t1(
+                                &w_decay_wkv,
+                                &r_wkv,
+                                &k_ctrl_wkv,
+                                &v_wkv,
+                                &wkv_a_wkv,
+                                &wkv_b_wkv,
+                                &mut wkv_state_gpu[layer_idx],
+                                &mut wkv_out_wkv,
+                                &lens_gpu,
+                                stream,
+                            )?;
+                        }
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                // In-place kernels (Tiled, ColmajorT1, FusedT1) already updated wkv_state_gpu;
+                // In-place kernels (Tiled, ColmajorT1, FusedT1, BatchLoopT1) already updated wkv_state_gpu;
                 // only swap for kernels that write to new_wkv_state.
-                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1) {
+                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 | WkvKernelKind::BatchLoopT1) {
                     std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
                 }
 
@@ -1942,15 +1956,13 @@ impl Rwkv7Hip {
         state: &mut HipState,
         scratch: &mut HipScratch,
         lens: &[usize],
-        logits_dst: &mut PinnedBuffer<f32>,
     ) -> Result<()> {
         let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
         let t = tokens[0].len();
         let mut prof = HipProf::new("forward_inner_async");
 
-        // Create BLAS context for all GEMM operations
-        let ctx = HipBlasContext::with_null_stream()?;
+        let ctx = &scratch.blas_ctx;
         let stream = ctx.stream();
 
         let n_embd = self.info.n_embd;
@@ -2379,12 +2391,26 @@ impl Rwkv7Hip {
                                 stream,
                             )?;
                         }
+                        WkvKernelKind::BatchLoopT1 => {
+                            wkv7_batch_loop_t1(
+                                &w_decay_wkv,
+                                &r_wkv,
+                                &k_ctrl_wkv,
+                                &v_wkv,
+                                &wkv_a_wkv,
+                                &wkv_b_wkv,
+                                &mut wkv_state_gpu[layer_idx],
+                                &mut wkv_out_wkv,
+                                &lens_gpu,
+                                stream,
+                            )?;
+                        }
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1) {
+                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 | WkvKernelKind::BatchLoopT1) {
                     std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
                 }
 
@@ -2517,7 +2543,7 @@ impl Rwkv7Hip {
             prof.time("logits_download", || {
                 // Convert f16 logits to f32 on GPU, then download asynchronously
                 copy_f16_to_f32(&logits, &mut logits_f32, stream)?;
-                logits_f32.copy_to_slice_async(logits_dst.as_slice_mut(), stream)?;
+                logits_f32.copy_to_slice_async(scratch.logits_staging.as_slice_mut(), stream)?;
                 Ok(())
             })?;
 
@@ -2593,7 +2619,7 @@ impl Rwkv7Hip {
         &self,
         x: &[&[u32]],
         state: Option<HipState>,
-    ) -> Result<ForwardCompletion> {
+    ) -> Result<(Vec<f32>, HipState)> {
         let batch_size = x.len();
         if batch_size == 0 {
             return Err(HipErrorKind {
@@ -2664,15 +2690,6 @@ impl Rwkv7Hip {
             None => HipState::new(&self.info, batch_size)?,
         };
 
-        // Create stream for async operations (with fallback to null)
-        let stream = match Stream::new() {
-            Ok(s) => s,
-            Err(_) => {
-                // Fall back to null stream if creation fails
-                Stream::null()
-            }
-        };
-
         // Pad sequences to chunk_size
         let chunk_tokens: Vec<Vec<u32>> = x
             .iter()
@@ -2684,10 +2701,7 @@ impl Rwkv7Hip {
             .collect();
         let chunk_refs: Vec<&[u32]> = chunk_tokens.iter().map(|v| v.as_slice()).collect();
 
-        // Allocate pinned buffer for f32 logits (GPU does f16→f32 conversion)
         let n_vocab = self.info.n_vocab;
-        let logits_size = n_vocab * chunk_size * batch_size;
-        let mut logits_buffer: PinnedBuffer<f32> = PinnedBuffer::new(logits_size)?;
 
         // Run the async forward pass (queues work but doesn't sync)
         let mut current_state = current_state;
@@ -2696,32 +2710,23 @@ impl Rwkv7Hip {
             &mut current_state,
             scratch,
             &lens,
-            &mut logits_buffer,
         )?;
 
-        // Record event after all GPU work and D→H transfers are queued
-        let event = Event::new()?;
-        event.record(&stream)?;
+        // Sync the stream — all GPU work and D→H transfers are now complete
+        let stream = scratch.blas_ctx.stream();
+        stream.synchronize()?;
 
-        // Build state buffers (already updated by forward_inner_async)
-        let state_buffers = ForwardStateBuffers {
-            att_states: current_state.att_states,
-            att_shift_states: current_state.att_shift_states,
-            ffn_states: current_state.ffn_states,
-            v_first: current_state.v_first,
-        };
+        // Extract real tokens from padded staging buffer
+        let padded = scratch.logits_staging.as_slice();
+        let mut logits = Vec::new();
+        for (b, &real_len) in lens.iter().enumerate() {
+            for t in 0..real_len {
+                let offset = (b * chunk_size + t) * n_vocab;
+                logits.extend_from_slice(&padded[offset..offset + n_vocab]);
+            }
+        }
 
-        Ok(ForwardCompletion {
-            event,
-            stream,
-            logits_buffer,
-            state_buffers,
-            n_layer: self.info.n_layer,
-            batch_size,
-            lens,
-            chunk_size,
-            n_vocab,
-        })
+        Ok((logits, current_state))
     }
 }
 

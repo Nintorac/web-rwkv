@@ -12,6 +12,7 @@
 //! - LoRA buffers: `[lora_dim, max_seq_len, batch_size]`
 //! - Output buffer: `[n_vocab, max_seq_len, batch_size]`
 
+use super::blas::HipBlasContext;
 use super::ffi::Result;
 use super::model::Rwkv7ModelInfo;
 use super::pinned::PinnedBuffer;
@@ -28,6 +29,7 @@ use half::f16;
 /// - `lds`       : LDS + atomics kernel for experimentation
 /// - `wave_t1`   : wave-cooperative kernel specialized for decode (T=1)
 /// - `colmajor_t1`: row-owned kernel — 1 thread/row, in-place state, no reductions (T=1)
+/// - `batch_loop_t1`: embed-parallel, serial batch loop — mirrors WGPU strategy (T=1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WkvKernelKind {
     Auto,
@@ -38,6 +40,7 @@ pub enum WkvKernelKind {
     Lds,
     ColmajorT1,
     FusedT1,
+    BatchLoopT1,
 }
 
 impl WkvKernelKind {
@@ -53,6 +56,7 @@ impl WkvKernelKind {
                 "lds" | "shared" => Self::Lds,
                 "colmajor_t1" | "colmajor-t1" | "rowowned" | "row_owned" => Self::ColmajorT1,
                 "fused_t1" | "fused-t1" | "fused" => Self::FusedT1,
+                "batch_loop_t1" | "batch-loop-t1" | "batch_loop" => Self::BatchLoopT1,
                 "auto" | "" => Self::Auto,
                 _ => Self::Auto,
             },
@@ -174,6 +178,9 @@ pub struct LoraDims {
 pub struct HipScratch {
     /// Configuration used to allocate these buffers
     pub config: HipRuntimeConfig,
+
+    /// Reusable BLAS context (rocBLAS handle + null stream)
+    pub blas_ctx: HipBlasContext,
 
     /// Model dimensions for validation
     pub n_embd: usize,
@@ -372,8 +379,11 @@ impl HipScratch {
             wkv_state_gpu.push(TensorHip::zeros(wkv_state_shape)?);
         }
 
+        let blas_ctx = HipBlasContext::with_null_stream()?;
+
         Ok(Self {
             config,
+            blas_ctx,
             n_embd: c,
             n_hidden: h,
             n_vocab: v,

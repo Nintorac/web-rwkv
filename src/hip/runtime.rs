@@ -175,11 +175,7 @@ impl HipRuntime {
             })
         };
 
-        // Use async path with pre-allocated pinned buffers (avoids memory pinning overhead)
-        let (logits, new_state) = self
-            .model
-            .forward_async(sequences, Some(old_state))?
-            .wait()?;
+        let (logits, new_state) = self.model.forward_async(sequences, Some(old_state))?;
 
         // Store the updated state
         let mut state_guard = self.state.lock().unwrap();

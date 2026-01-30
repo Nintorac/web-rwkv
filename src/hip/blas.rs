@@ -54,6 +54,18 @@ pub struct HipBlasContext {
     stream: Stream,
 }
 
+// SAFETY: rocBLAS handles are GPU-side state accessed via the HIP runtime,
+// which serializes access internally. The handle can safely be sent to another thread.
+unsafe impl Send for HipBlasContext {}
+
+impl std::fmt::Debug for HipBlasContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HipBlasContext")
+            .field("handle", &format_args!("{:?}", self.handle))
+            .finish()
+    }
+}
+
 impl HipBlasContext {
     /// Create a new BLAS context with a dedicated stream.
     pub fn new() -> Result<Self> {
