@@ -37,6 +37,7 @@ pub enum WkvKernelKind {
     WaveReduce,
     Lds,
     ColmajorT1,
+    FusedT1,
 }
 
 impl WkvKernelKind {
@@ -51,6 +52,7 @@ impl WkvKernelKind {
                 "wave" | "wave32" | "wave-reduce" | "wave_reduce" => Self::WaveReduce,
                 "lds" | "shared" => Self::Lds,
                 "colmajor_t1" | "colmajor-t1" | "rowowned" | "row_owned" => Self::ColmajorT1,
+                "fused_t1" | "fused-t1" | "fused" => Self::FusedT1,
                 "auto" | "" => Self::Auto,
                 _ => Self::Auto,
             },

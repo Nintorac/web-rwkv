@@ -36,6 +36,7 @@ use super::kernels::{
     wkv7_wave_reduce,
     wkv7_wave_reduce_t1,
     wkv7_colmajor_t1,
+    wkv7_fused_t1,
     wkv_bonus_f16,
 };
 use super::pinned::PinnedBuffer;
@@ -1002,7 +1003,7 @@ impl Rwkv7Hip {
                 }
             }
             // T=1 only kernels fall back to wave_reduce for T>1
-            WkvKernelKind::WaveReduceT1 | WkvKernelKind::ColmajorT1 if tokens != 1 => {
+            WkvKernelKind::WaveReduceT1 | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 if tokens != 1 => {
                 WkvKernelKind::WaveReduce
             }
             other => other,
@@ -1737,14 +1738,28 @@ impl Rwkv7Hip {
                                 stream,
                             )?;
                         }
+                        WkvKernelKind::FusedT1 => {
+                            wkv7_fused_t1(
+                                &w_decay_wkv,
+                                &r_wkv,
+                                &k_ctrl_wkv,
+                                &v_wkv,
+                                &wkv_a_wkv,
+                                &wkv_b_wkv,
+                                &mut wkv_state_gpu[layer_idx],
+                                &mut wkv_out_wkv,
+                                &lens_gpu,
+                                stream,
+                            )?;
+                        }
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                // In-place kernels (Tiled, ColmajorT1) already updated wkv_state_gpu;
+                // In-place kernels (Tiled, ColmajorT1, FusedT1) already updated wkv_state_gpu;
                 // only swap for kernels that write to new_wkv_state.
-                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1) {
+                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1) {
                     std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
                 }
 
@@ -2350,12 +2365,26 @@ impl Rwkv7Hip {
                                 stream,
                             )?;
                         }
+                        WkvKernelKind::FusedT1 => {
+                            wkv7_fused_t1(
+                                &w_decay_wkv,
+                                &r_wkv,
+                                &k_ctrl_wkv,
+                                &v_wkv,
+                                &wkv_a_wkv,
+                                &wkv_b_wkv,
+                                &mut wkv_state_gpu[layer_idx],
+                                &mut wkv_out_wkv,
+                                &lens_gpu,
+                                stream,
+                            )?;
+                        }
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1) {
+                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1) {
                     std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
                 }
 

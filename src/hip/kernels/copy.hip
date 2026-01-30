@@ -3347,6 +3347,156 @@ hipError_t launch_wkv7_colmajor_t1(
 }
 
 // ============================================================================
+// FUSED WKV7 KERNEL (T=1 decode specialization)
+//
+// Same 256-thread wave-reduce architecture as wave_reduce_t1 but with:
+//
+// 1. FUSED sa + update + y in a single per-row pass:
+//    - State is read ONCE into 2 VGPRs (state_cache[2]), then reused for both
+//      the sa dot product and the update+y computation.
+//    - Eliminates the second global state read (saves 16KB/block at high batch).
+//
+// 2. ZERO barriers between sa and update/y passes:
+//    - sa is reduced via __shfl_down then broadcast via __shfl to all lanes.
+//    - No shared memory needed for sa or y results.
+//    - Only barrier is the initial __syncthreads() after param loading.
+//
+// 3. IN-PLACE state update:
+//    - Single state buffer (not separate state_in / state_out).
+//    - Halves L2 write allocation pressure.
+//    - Safe because each (head, batch) block has exclusive ownership.
+//
+// 4. Params as f32 in LDS (no per-use __half2float conversion):
+//    - 5 × 64 × 4 = 1280 bytes LDS (vs 640 f16 + 512 for sh_sa/sh_y = 1152)
+//
+// Grid: (H, B), Block: 256 threads (8 waves). Lengths[b] == 0 → early return.
+// ============================================================================
+
+__global__ __launch_bounds__(256, 4)
+void kernel_wkv7_fused_t1(
+    const __half* __restrict__ w_decay,
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    const __half* __restrict__ a,
+    const __half* __restrict__ b,
+    float* __restrict__ state,       // in-place: [N, N, H, B]
+    __half* __restrict__ output,
+    const int* __restrict__ lengths,
+    int N, int H, int B
+) {
+    const int hh = blockIdx.x;
+    const int bb = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int wave_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    if (hh >= H || bb >= B) return;
+
+    const int real_len = lengths[bb];
+    if (real_len <= 0) {
+        // In-place state: nothing to copy. Just return.
+        return;
+    }
+
+    // Store parameters as f32 in LDS — eliminates per-use __half2float.
+    __shared__ float sh_q[64];
+    __shared__ float sh_k[64];
+    __shared__ float sh_w[64];
+    __shared__ float sh_a[64];
+    __shared__ float sh_b[64];
+
+    const int state_base = hh * N * N + bb * N * N * H;
+    const int param_base = hh * N + bb * H * N;  // t = 0 only
+
+    // 256 threads load 5 × 64 = 320 values (threads 0–63 load first array, etc.)
+    if (tid < 64) {
+        int idx = param_base + tid;
+        sh_q[tid] = __half2float(q[idx]);
+        sh_w[tid] = __half2float(w_decay[idx]);
+        sh_k[tid] = __half2float(k[idx]);
+        sh_a[tid] = __half2float(a[idx]);
+        sh_b[tid] = __half2float(b[idx]);
+    }
+    __syncthreads();
+    // --- No more barriers after this point ---
+
+    // Fused loop: each wave processes one row per iteration.
+    // 8 waves × 8 iterations = 64 rows.
+    for (int row_base = 0; row_base < 64; row_base += 8) {
+        int i = row_base + wave_id;
+
+        // --- Phase 1: Read state into registers + compute sa ---
+        float state_cache[2];  // 2 chunks × 1 lane = 2 VGPRs
+        float partial_sa = 0.0f;
+
+        #pragma unroll 2
+        for (int jj = 0; jj < 64; jj += 32) {
+            int j = jj + lane_id;
+            float s = state[state_base + i * 64 + j];
+            state_cache[jj >> 5] = s;          // cache for reuse
+            partial_sa += sh_a[j] * s;
+        }
+
+        // Wave-level reduction for sa
+        #pragma unroll 5
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial_sa += __shfl_down(partial_sa, offset, 32);
+        }
+        // Broadcast sa from lane 0 to all lanes
+        float sa_i = __shfl(partial_sa, 0, 32);
+
+        // --- Phase 2: Update state in-place + compute y (from cached state) ---
+        float v_i = __half2float(v[param_base + i]);
+        float partial_y = 0.0f;
+
+        #pragma unroll 2
+        for (int jj = 0; jj < 64; jj += 32) {
+            int j = jj + lane_id;
+            float s = state_cache[jj >> 5];    // reuse cached value
+            float new_s = sh_w[j] * s + sh_b[j] * sa_i + sh_k[j] * v_i;
+            state[state_base + i * 64 + j] = new_s;  // in-place write
+            partial_y += sh_q[j] * new_s;
+        }
+
+        // Wave-level reduction for y
+        #pragma unroll 5
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial_y += __shfl_down(partial_y, offset, 32);
+        }
+
+        // Direct output write — no shared memory needed
+        if (lane_id == 0) {
+            output[param_base + i] = __float2half(partial_y);
+        }
+    }
+}
+
+hipError_t launch_wkv7_fused_t1(
+    const __half* w_decay,
+    const __half* q,
+    const __half* k,
+    const __half* v,
+    const __half* a,
+    const __half* b,
+    float* state,
+    __half* output,
+    const int* lengths,
+    int N, int H, int B,
+    hipStream_t stream
+) {
+    if (N != 64 || H <= 0 || B <= 0) {
+        return hipErrorInvalidValue;
+    }
+    dim3 grid(H, B);
+    dim3 block(256);
+    hipLaunchKernelGGL(kernel_wkv7_fused_t1, grid, block, 0, stream,
+                       w_decay, q, k, v, a, b, state, output, lengths,
+                       N, H, B);
+    return hipGetLastError();
+}
+
+// ============================================================================
 // F16 to F32 conversion kernel (for GPU-side logits conversion)
 // ============================================================================
 

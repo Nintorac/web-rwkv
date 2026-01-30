@@ -3187,6 +3187,122 @@ pub fn wkv7_colmajor_t1(
     }
 }
 
+/// Fused WKV7 kernel for T=1 decode.
+///
+/// Same 256-thread wave-reduce architecture as wave_reduce_t1 but with:
+/// - Fused sa + update + y in a single per-row pass (state read once, cached in VGPRs)
+/// - Zero barriers between sa/update/y phases
+/// - In-place state (single mutable tensor, no separate in/out)
+/// - Params as f32 in LDS (no per-use half→float conversion)
+pub fn wkv7_fused_t1(
+    w_decay: &TensorHip<f16>,
+    q: &TensorHip<f16>,
+    k: &TensorHip<f16>,
+    v: &TensorHip<f16>,
+    a: &TensorHip<f16>,
+    b: &TensorHip<f16>,
+    state: &mut TensorHip<f32>,  // in-place
+    output: &mut TensorHip<f16>,
+    lengths: &TensorHip<i32>,
+    stream: &Stream,
+) -> Result<()> {
+    use crate::hip::ffi::launch_wkv7_fused_t1;
+
+    let n = w_decay.shape()[0];
+    let h = w_decay.shape()[1];
+    let t = w_decay.shape()[2];
+    let b_size = w_decay.shape()[3];
+
+    if t != 1 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_fused_t1 requires T=1".to_string(),
+        });
+    }
+
+    let input_shape = w_decay.shape();
+    if q.shape() != input_shape
+        || k.shape() != input_shape
+        || v.shape() != input_shape
+        || a.shape() != input_shape
+        || b.shape() != input_shape
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "Input shape mismatch".to_string(),
+        });
+    }
+
+    let state_shape = TensorShape::new(n, n, h, b_size);
+    if state.shape() != state_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "State shape mismatch: expected {}, got {}",
+                state_shape,
+                state.shape()
+            ),
+        });
+    }
+
+    let output_shape = TensorShape::new(n, h, t, b_size);
+    if output.shape() != output_shape {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "Output shape mismatch: expected {}, got {}",
+                output_shape,
+                output.shape()
+            ),
+        });
+    }
+
+    if lengths.shape().len() != b_size {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "lengths size mismatch: expected {}, got {}",
+                b_size,
+                lengths.shape().len()
+            ),
+        });
+    }
+
+    if !w_decay.is_contiguous()
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !a.is_contiguous()
+        || !b.is_contiguous()
+        || !state.is_contiguous()
+        || !output.is_contiguous()
+        || !lengths.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "wkv7_fused_t1 requires contiguous tensors".to_string(),
+        });
+    }
+
+    unsafe {
+        check(launch_wkv7_fused_t1(
+            w_decay.as_ptr(),
+            q.as_ptr(),
+            k.as_ptr(),
+            v.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            state.as_mut_ptr(),
+            output.as_mut_ptr(),
+            lengths.as_ptr(),
+            n as c_int,
+            h as c_int,
+            b_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
 /// Extract shift states at the correct positions based on per-batch lengths.
 ///
 /// For each batch element b, extracts x[:, length[b]-1, b] instead of x[:, T-1, b].
