@@ -27,6 +27,7 @@ use half::f16;
 /// - `wave`      : high-occupancy wave-cooperative kernel (shared memory)
 /// - `lds`       : LDS + atomics kernel for experimentation
 /// - `wave_t1`   : wave-cooperative kernel specialized for decode (T=1)
+/// - `colmajor_t1`: row-owned kernel — 1 thread/row, in-place state, no reductions (T=1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WkvKernelKind {
     Auto,
@@ -35,6 +36,7 @@ pub enum WkvKernelKind {
     WaveReduceT1,
     WaveReduce,
     Lds,
+    ColmajorT1,
 }
 
 impl WkvKernelKind {
@@ -48,6 +50,7 @@ impl WkvKernelKind {
                 "wave_t1" | "wave-t1" | "wave32_t1" => Self::WaveReduceT1,
                 "wave" | "wave32" | "wave-reduce" | "wave_reduce" => Self::WaveReduce,
                 "lds" | "shared" => Self::Lds,
+                "colmajor_t1" | "colmajor-t1" | "rowowned" | "row_owned" => Self::ColmajorT1,
                 "auto" | "" => Self::Auto,
                 _ => Self::Auto,
             },

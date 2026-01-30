@@ -1717,6 +1717,7 @@ impl Rwkv7Hip {
                             &lens_gpu,
                             stream,
                         )?,
+                        WkvKernelKind::ColmajorT1 => todo!("ColmajorT1 integration in bd-2eg.3"),
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
@@ -2312,6 +2313,7 @@ impl Rwkv7Hip {
                             &lens_gpu,
                             stream,
                         )?,
+                        WkvKernelKind::ColmajorT1 => todo!("ColmajorT1 integration in bd-2eg.3"),
                         WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
                     }
                     prof_sync(stream)?;
