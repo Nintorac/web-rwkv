@@ -3237,6 +3237,116 @@ hipError_t launch_wkv7_wave_reduce_t1(
 }
 
 // ============================================================================
+// ROW-OWNED WKV7 KERNEL (T=1 decode specialization)
+//
+// Each thread owns one ROW of the 64×64 state matrix and iterates all columns
+// sequentially.  This eliminates cross-lane reductions entirely:
+//
+//   sa[row] = Σ_col a[col] * state[row, col]   → per-thread sum
+//   new_s[row, col] = w[col]*s[row,col] + b[col]*sa[row] + k[col]*v[row]
+//   y[row]  = Σ_col q[col] * new_s[row, col]   → per-thread sum
+//
+// Key differences from wave_reduce_t1:
+//   - 1 thread per row (64 threads, 2 waves)  → no __shfl_down
+//   - In-place state (single pointer)          → halves L2 pressure
+//   - No __syncthreads() between sa & update   → sa is thread-local
+//   - Params as f32 in LDS                     → no __half2float in loops
+//
+// Processes state in column-tiles of 8 to keep register pressure low.
+//
+// Grid: (H, B), Block: 64 threads
+// ============================================================================
+
+__global__ __launch_bounds__(64, 8)
+void kernel_wkv7_colmajor_t1(
+    const __half* __restrict__ w_decay,
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    const __half* __restrict__ a,
+    const __half* __restrict__ b,
+    float* __restrict__ state,        // in-place: [N, N, H, B]
+    __half* __restrict__ output,
+    const int* __restrict__ lengths,
+    int N, int H, int B
+) {
+    const int hh = blockIdx.x;
+    const int bb = blockIdx.y;
+    const int row = threadIdx.x;  // row index [0..63]
+
+    if (hh >= H || bb >= B) return;
+
+    const int real_len = lengths[bb];
+    if (real_len <= 0) return;  // state unchanged for zero-length
+
+    // Parameters in LDS as f32 — 6 arrays × 64 × 4 = 1536 bytes total.
+    __shared__ float sh_q[64];
+    __shared__ float sh_k[64];
+    __shared__ float sh_w[64];
+    __shared__ float sh_a[64];
+    __shared__ float sh_b[64];
+    __shared__ float sh_v[64];
+
+    const int param_base = hh * N + bb * H * N;
+    sh_q[row] = __half2float(q[param_base + row]);
+    sh_k[row] = __half2float(k[param_base + row]);
+    sh_w[row] = __half2float(w_decay[param_base + row]);
+    sh_a[row] = __half2float(a[param_base + row]);
+    sh_b[row] = __half2float(b[param_base + row]);
+    sh_v[row] = __half2float(v[param_base + row]);
+    __syncthreads();
+
+    const int state_base = hh * N * N + bb * N * N * H;
+    const int row_off = state_base + row * 64;  // start of this thread's row
+    const float v_row = sh_v[row];
+
+    // Pass 1: sa[row] = Σ_col a[col] * state[row, col]
+    float sa = 0.0f;
+    #pragma unroll 8
+    for (int col = 0; col < 64; col++) {
+        sa += sh_a[col] * state[row_off + col];
+    }
+
+    // Pass 2: Update state in-place AND accumulate y[row].
+    // No barrier needed — sa is per-thread, no shared dependency.
+    float y = 0.0f;
+    #pragma unroll 8
+    for (int col = 0; col < 64; col++) {
+        float s = state[row_off + col];
+        float new_s = sh_w[col] * s + sh_b[col] * sa + sh_k[col] * v_row;
+        state[row_off + col] = new_s;
+        y += sh_q[col] * new_s;
+    }
+
+    // Write output y[row]
+    output[param_base + row] = __float2half(y);
+}
+
+hipError_t launch_wkv7_colmajor_t1(
+    const __half* w_decay,
+    const __half* q,
+    const __half* k,
+    const __half* v,
+    const __half* a,
+    const __half* b,
+    float* state,
+    __half* output,
+    const int* lengths,
+    int N, int H, int B,
+    hipStream_t stream
+) {
+    if (N != 64 || H <= 0 || B <= 0) {
+        return hipErrorInvalidValue;
+    }
+    dim3 grid(H, B);
+    dim3 block(64);
+    hipLaunchKernelGGL(kernel_wkv7_colmajor_t1, grid, block, 0, stream,
+                       w_decay, q, k, v, a, b, state, output, lengths,
+                       N, H, B);
+    return hipGetLastError();
+}
+
+// ============================================================================
 // F16 to F32 conversion kernel (for GPU-side logits conversion)
 // ============================================================================
 
