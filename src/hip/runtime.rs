@@ -166,7 +166,7 @@ impl HipRuntime {
             });
         }
 
-        // Take state from mutex, run forward, put new state back
+        // Take state from mutex, run step, put new state back
         let old_state = {
             let mut state_guard = self.state.lock().unwrap();
             state_guard.take().unwrap_or_else(|| {
@@ -175,7 +175,7 @@ impl HipRuntime {
             })
         };
 
-        let (logits, new_state) = self.model.forward_async(sequences, Some(old_state))?;
+        let (logits, new_state) = self.model.step(sequences, Some(old_state))?;
 
         // Store the updated state
         let mut state_guard = self.state.lock().unwrap();
@@ -231,7 +231,7 @@ impl HipRuntime {
 
     /// Extract logits for the last real token of each sequence.
     ///
-    /// The new forward() output contains only real token logits (no padding).
+    /// The step() output contains only real token logits (no padding).
     /// Layout: `[batch_0_tokens..., batch_1_tokens..., ...]`
     ///
     /// # Arguments
@@ -260,7 +260,7 @@ impl HipRuntime {
 
     /// Extract all logits for each sequence.
     ///
-    /// The new forward() output contains only real token logits (no padding).
+    /// The step() output contains only real token logits (no padding).
     /// This method splits the flat output by sequence.
     ///
     /// # Arguments
@@ -360,7 +360,7 @@ impl HipRuntime {
             .collect();
         let token_refs: Vec<&[u32]> = token_vecs.iter().map(|v| v.as_slice()).collect();
 
-        // 4. Run forward pass
+        // 4. Run step
         let logits_tensor = self.infer(&token_refs).map_err(|_e| {
             // Convert HIP error to RuntimeError via TensorError
             RuntimeError::TensorError(TensorError::new(TensorErrorKind::Deduce))
@@ -1305,7 +1305,7 @@ mod tests {
         println!("test_hip_runtime_input_exhausted PASSED");
     }
 
-    /// Test that chunked inference via Runtime matches direct forward
+    /// Test that chunked inference via Runtime matches direct step
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn test_hip_runtime_chunked_matches_direct() {
@@ -1318,7 +1318,7 @@ mod tests {
         // Generate 64 tokens
         let tokens: Vec<u32> = (1..=64).collect();
 
-        // === Direct forward (single call) ===
+        // === Direct step (single call) ===
         let model1 = Rwkv7Hip::load(model_path).expect("Failed to load model");
         let runtime_direct = HipRuntime::new(model1, 1);
         let direct_logits = runtime_direct

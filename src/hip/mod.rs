@@ -1352,9 +1352,9 @@ mod tests {
         println!("HipState batched sizing test passed (B=4)");
     }
 
-    /// Test that forward() API works with new (logits, state) return.
+    /// Test that step() API works with (logits, state) return.
     #[test]
-    fn test_forward_basic() {
+    fn test_step_basic() {
         use super::scratch::HipRuntimeConfig;
         use std::path::Path;
 
@@ -1372,7 +1372,7 @@ mod tests {
 
         let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
 
-        let (logits, _state) = model.forward(&[&tokens], None).expect("forward() failed");
+        let (logits, _state) = model.step(&[&tokens], None).expect("step() failed");
 
         // Should return vocab_size * T logits
         let expected_len = model.info.n_vocab * tokens.len();
@@ -1384,7 +1384,7 @@ mod tests {
             logits.len()
         );
 
-        println!("forward() basic test passed");
+        println!("step() basic test passed");
     }
 
     /// Test batched inference with B=2 produces same results as sequential B=1.
@@ -1424,13 +1424,13 @@ mod tests {
         let t = seq1.len();
 
         // Run sequentially with B=1 (fresh state each time)
-        let (logits1, _) = model1.forward(&[&seq1], None).expect("seq1 forward failed");
-        let (logits2, _) = model2.forward(&[&seq2], None).expect("seq2 forward failed");
+        let (logits1, _) = model1.step(&[&seq1], None).expect("seq1 step failed");
+        let (logits2, _) = model2.step(&[&seq2], None).expect("seq2 step failed");
 
         // Run batched with B=2 (fresh state)
         let (batched_logits, _) = model_batch
-            .forward(&[&seq1, &seq2], None)
-            .expect("batched forward failed");
+            .step(&[&seq1, &seq2], None)
+            .expect("batched step failed");
 
         // Batched output: [seq1 tokens, seq2 tokens] concatenated
         let vocab = model1.info.n_vocab;
@@ -1495,18 +1495,18 @@ mod tests {
 
         let tokens: Vec<u32> = vec![1, 2, 3];
 
-        // Single-sequence batch forward (all tokens at once)
+        // Single-sequence batch step (all tokens at once)
         let (logits_batch, _) = model
-            .forward(&[&tokens], None)
-            .expect("batch forward failed");
+            .step(&[&tokens], None)
+            .expect("batch step failed");
 
         // Single-sequence streaming (token by token, chain state)
         let mut logits_stream = Vec::new();
         let mut state: Option<HipState> = None;
         for &tok in &tokens {
             let (logits, new_state) = model
-                .forward(&[&[tok]], state)
-                .expect("streaming forward failed");
+                .step(&[&[tok]], state)
+                .expect("streaming step failed");
             logits_stream.extend(logits);
             state = Some(new_state);
         }
@@ -1554,18 +1554,18 @@ mod tests {
         let tokens: Vec<u32> = (1..=10).collect();
         let chunk_size = 4;
 
-        // Full forward
+        // Full step
         let (logits_full, _) = model
-            .forward(&[&tokens], None)
-            .expect("full forward failed");
+            .step(&[&tokens], None)
+            .expect("full step failed");
 
-        // Chunked forward (manual chunking)
+        // Chunked step (manual chunking)
         let mut logits_chunked = Vec::new();
         let mut state: Option<HipState> = None;
         for chunk in tokens.chunks(chunk_size) {
             let (logits, new_state) = model
-                .forward(&[chunk], state)
-                .expect("chunked forward failed");
+                .step(&[chunk], state)
+                .expect("chunked step failed");
             logits_chunked.extend(logits);
             state = Some(new_state);
         }
@@ -1612,10 +1612,10 @@ mod tests {
         let seq1: Vec<u32> = vec![1, 2, 3];
         let seq2: Vec<u32> = vec![4, 5, 6];
 
-        // Run forward with fresh state (None)
+        // Run step with fresh state (None)
         let (_, state) = model
-            .forward(&[&seq1, &seq2], None)
-            .expect("forward failed");
+            .step(&[&seq1, &seq2], None)
+            .expect("step failed");
 
         // Returned state should have evolved (non-zero)
         let att_sum: f32 = state
@@ -1624,7 +1624,7 @@ mod tests {
             .flat_map(|v| v.as_slice().iter())
             .map(|x| x.abs())
             .sum();
-        assert!(att_sum > 0.0, "att_states should be non-zero after forward");
+        assert!(att_sum > 0.0, "att_states should be non-zero after step");
 
         println!("Batched state evolution test PASSED");
     }
@@ -1649,7 +1649,7 @@ mod tests {
 
         // State with batch_size=2, but provide 3 sequences
         let state = HipState::new(&model.info, 2).expect("Failed to allocate state");
-        let result = model.forward(&[&[1u32], &[2u32], &[3u32]], Some(state));
+        let result = model.step(&[&[1u32], &[2u32], &[3u32]], Some(state));
 
         assert!(result.is_err(), "Should error on batch size mismatch");
         println!("Batch size mismatch error test PASSED");
@@ -1676,7 +1676,7 @@ mod tests {
         // Two sequences with different lengths - should now work
         let seq1: Vec<u32> = vec![1, 2, 3]; // length 3
         let seq2: Vec<u32> = vec![4, 5]; // length 2
-        let result = model.forward(&[&seq1, &seq2], None);
+        let result = model.step(&[&seq1, &seq2], None);
 
         assert!(
             result.is_ok(),
