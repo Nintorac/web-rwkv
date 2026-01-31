@@ -987,3 +987,121 @@ pub fn hip_wkv7_gemv(
 
     Ok((output, state_out))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === Acceptance Criteria Tests for bd-2sh.4.9 (Token Shift Kernel) ===
+
+    #[test]
+    fn test_token_shift_basic() {
+        // Test token shift with 2 channels and 3 tokens
+        // x shape: [2, 3, 1, 1]
+        let x = vec![
+            // Token 0: [1.0, 2.0]
+            1.0, 2.0, // Token 1: [3.0, 4.0]
+            3.0, 4.0, // Token 2: [5.0, 6.0]
+            5.0, 6.0,
+        ];
+
+        // Initial state: [0.0, 0.0]
+        let state_in = vec![0.0, 0.0];
+
+        // Mix factor: 0.5 (blend 50% of previous into current)
+        let mix = vec![0.5, 0.5];
+
+        let c = 2;
+        let t = 3;
+
+        let (output, state_out) =
+            hip_token_shift(&x, &state_in, &mix, c, t).expect("token_shift kernel failed");
+
+        // Formula: output[t] = x[t] + mix * (prev - x[t])
+        // Token 0: x[0] + 0.5*(state - x[0]) = 1 + 0.5*(0-1) = [0.5, 1.0]
+        // Token 1: x[1] + 0.5*(x[0] - x[1]) = 3 + 0.5*(1-3) = [2.0, 3.0]
+        // Token 2: x[2] + 0.5*(x[1] - x[2]) = 5 + 0.5*(3-5) = [4.0, 5.0]
+        let expected = vec![
+            0.5, 1.0, // Token 0
+            2.0, 3.0, // Token 1
+            4.0, 5.0, // Token 2
+        ];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Output mismatch at index {}: actual={:.6}, expected={:.6}",
+                i,
+                actual,
+                exp
+            );
+        }
+
+        // State out should be x[last] = [5.0, 6.0]
+        assert!(
+            (state_out[0] - 5.0).abs() < 1e-5,
+            "state_out[0] should be 5.0"
+        );
+        assert!(
+            (state_out[1] - 6.0).abs() < 1e-5,
+            "state_out[1] should be 6.0"
+        );
+
+        println!("Token shift basic test passed");
+    }
+
+    #[test]
+    fn test_token_shift_no_mix() {
+        // Test with mix=0 (pass through current, no blending)
+        let x = vec![1.0, 2.0, 3.0, 4.0]; // [2, 2]
+        let state_in = vec![10.0, 20.0];
+        let mix = vec![0.0, 0.0];
+
+        let (output, _) =
+            hip_token_shift(&x, &state_in, &mix, 2, 2).expect("token_shift no mix failed");
+
+        // With mix=0: output = x + 0*(prev - x) = x
+        // So output equals x directly
+        let expected = vec![1.0, 2.0, 3.0, 4.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - exp).abs() < 1e-5,
+                "Mismatch at {}: {} vs {}",
+                i,
+                actual,
+                exp
+            );
+        }
+        println!("Token shift no mix test passed");
+    }
+
+    #[test]
+    fn test_token_shift_full_mix() {
+        // Test with mix=1 (full blending with previous)
+        let x = vec![1.0, 2.0, 3.0, 4.0]; // [2, 2]
+        let state_in = vec![10.0, 20.0];
+        let mix = vec![1.0, 1.0];
+
+        let (output, _) =
+            hip_token_shift(&x, &state_in, &mix, 2, 2).expect("token_shift full mix failed");
+
+        // With mix=1: output = x + 1*(prev - x) = prev
+        // Token 0: prev = state_in = [10.0, 20.0]
+        // Token 1: prev = x[0] = [1.0, 2.0]
+        let expected = vec![10.0, 20.0, 1.0, 2.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - exp).abs() < 1e-5,
+                "Mismatch at {}: {} vs {}",
+                i,
+                actual,
+                exp
+            );
+        }
+        println!("Token shift full mix test passed");
+    }
+}

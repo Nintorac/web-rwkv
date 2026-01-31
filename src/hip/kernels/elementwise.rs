@@ -1094,3 +1094,463 @@ pub fn broadcast_mul_f16(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === Acceptance Criteria Tests for bd-2sh.4.3 (Decay Exponential Kernel) ===
+
+    #[test]
+    fn test_decay_exp() {
+        // Test basic decay_exp functionality: out = exp(-exp(x))
+        // Also serves as the primary acceptance test when fixtures are loaded
+
+        // Test known values
+        let input = vec![
+            0.0,  // exp(-exp(0)) = exp(-1) ≈ 0.3679
+            -1.0, // exp(-exp(-1)) = exp(-0.3679) ≈ 0.6922
+            1.0,  // exp(-exp(1)) = exp(-2.718) ≈ 0.0660
+            -5.0, // exp(-exp(-5)) ≈ exp(-0.0067) ≈ 0.9933
+            5.0,  // exp(-exp(5)) ≈ exp(-148.4) ≈ 0
+        ];
+
+        let output = hip_decay_exp(&input).expect("decay_exp kernel failed");
+
+        // Expected values (computed with Python: np.exp(-np.exp(x)))
+        let expected = vec![
+            0.36787944, // exp(-1)
+            0.69220066, // exp(-exp(-1))
+            0.06598804, // exp(-exp(1))
+            0.99330715, // exp(-exp(-5))
+            0.0,        // exp(-exp(5)) ≈ 0 (underflow)
+        ];
+
+        // Check each value with tolerance
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-3 + 1e-3 * exp.abs(); // rtol=1e-3, atol=1e-3
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i,
+                actual,
+                exp,
+                diff
+            );
+        }
+        println!(
+            "Basic decay_exp test passed: {} values verified",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_decay_exp_numerical_stability() {
+        // Test edge cases that could cause numerical issues
+        let input = vec![
+            -50.0, // Very negative: exp(-exp(-50)) ≈ 1
+            -10.0, // Negative: exp(-exp(-10)) ≈ 1
+            -5.0,  // Moderate negative
+            -1.0,  // Small negative
+            0.0,   // Zero
+            1.0,   // Small positive
+            5.0,   // Moderate positive: exp(-exp(5)) ≈ 0
+            10.0,  // exp(-exp(10)) ≈ 0 (extreme underflow)
+            80.0,  // At clamping boundary
+            100.0, // Beyond clamping: should be 0, not NaN/Inf
+        ];
+
+        let output = hip_decay_exp(&input).expect("decay_exp stability test failed");
+
+        // Verify no NaN or Inf values
+        for (i, &val) in output.iter().enumerate() {
+            assert!(!val.is_nan(), "NaN at index {} (input={})", i, input[i]);
+            assert!(
+                !val.is_infinite(),
+                "Inf at index {} (input={})",
+                i,
+                input[i]
+            );
+            assert!(
+                val >= 0.0 && val <= 1.0,
+                "Value out of [0,1] range at index {}: {} (input={})",
+                i,
+                val,
+                input[i]
+            );
+        }
+
+        // Verify expected behavior at extremes
+        assert!(
+            output[0] > 0.999,
+            "exp(-exp(-50)) should be ≈1, got {}",
+            output[0]
+        );
+        assert!(
+            output[1] > 0.999,
+            "exp(-exp(-10)) should be ≈1, got {}",
+            output[1]
+        );
+        assert!(
+            output[7] < 0.001,
+            "exp(-exp(10)) should be ≈0, got {}",
+            output[7]
+        );
+        assert!(
+            output[8] < 0.001,
+            "exp(-exp(80)) should be ≈0, got {}",
+            output[8]
+        );
+        assert_eq!(output[9], 0.0, "exp(-exp(100)) should be exactly 0");
+
+        println!(
+            "Numerical stability test passed: all {} values are finite and in [0,1]",
+            output.len()
+        );
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.4 (Lerp Kernel) ===
+
+    #[test]
+    fn test_lerp() {
+        // Test basic lerp functionality: out = a + t * (b - a)
+        let a = vec![0.0, 1.0, 2.0, 10.0, -5.0];
+        let b = vec![10.0, 5.0, 2.0, 0.0, 5.0];
+        let t = vec![0.0, 0.5, 1.0, 0.25, 0.5];
+
+        let output = hip_lerp(&a, &b, &t).expect("lerp kernel failed");
+
+        // Expected: lerp(a, b, t) = a + t * (b - a)
+        // [0] lerp(0, 10, 0) = 0
+        // [1] lerp(1, 5, 0.5) = 1 + 0.5 * 4 = 3
+        // [2] lerp(2, 2, 1) = 2
+        // [3] lerp(10, 0, 0.25) = 10 + 0.25 * (-10) = 7.5
+        // [4] lerp(-5, 5, 0.5) = -5 + 0.5 * 10 = 0
+        let expected = vec![0.0, 3.0, 2.0, 7.5, 0.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i,
+                actual,
+                exp,
+                diff
+            );
+        }
+        println!("Basic lerp test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_lerp_edge_cases() {
+        // Test edge cases: t outside [0, 1] (extrapolation)
+        let a = vec![0.0, 0.0, 100.0];
+        let b = vec![10.0, 10.0, 0.0];
+        let t = vec![-0.5, 1.5, 2.0];
+
+        let output = hip_lerp(&a, &b, &t).expect("lerp edge case test failed");
+
+        // Expected with extrapolation:
+        // [0] lerp(0, 10, -0.5) = 0 + (-0.5) * 10 = -5
+        // [1] lerp(0, 10, 1.5) = 0 + 1.5 * 10 = 15
+        // [2] lerp(100, 0, 2.0) = 100 + 2.0 * (-100) = -100
+        let expected = vec![-5.0, 15.0, -100.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-4;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i,
+                actual,
+                exp,
+                diff
+            );
+        }
+        println!("Lerp edge case test passed: extrapolation works correctly");
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.1 (Sigmoid Kernel) ===
+
+    #[test]
+    fn test_sigmoid() {
+        // Test basic sigmoid functionality: out = 1 / (1 + exp(-x))
+        let input = vec![0.0, 1.0, -1.0, 2.0, -2.0];
+
+        let output = hip_sigmoid(&input).expect("sigmoid kernel failed");
+
+        // Expected: sigmoid(x) = 1 / (1 + exp(-x))
+        // sigmoid(0) = 0.5
+        // sigmoid(1) ≈ 0.7311
+        // sigmoid(-1) ≈ 0.2689
+        // sigmoid(2) ≈ 0.8808
+        // sigmoid(-2) ≈ 0.1192
+        let expected = vec![0.5, 0.7310586, 0.26894143, 0.880797, 0.11920292];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i,
+                actual,
+                exp,
+                diff
+            );
+        }
+        println!(
+            "Basic sigmoid test passed: {} values verified",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_sigmoid_edge_cases() {
+        // Test edge cases that could cause numerical issues
+        let input = vec![
+            -100.0, // Very negative: sigmoid → 0
+            -50.0,  // Large negative
+            -10.0,  // Moderate negative
+            0.0,    // Zero: sigmoid = 0.5
+            10.0,   // Moderate positive
+            50.0,   // Large positive
+            100.0,  // Very positive: sigmoid → 1
+        ];
+
+        let output = hip_sigmoid(&input).expect("sigmoid edge case test failed");
+
+        // Verify no NaN or Inf values
+        for (i, &val) in output.iter().enumerate() {
+            assert!(!val.is_nan(), "NaN at index {} (input={})", i, input[i]);
+            assert!(
+                !val.is_infinite(),
+                "Inf at index {} (input={})",
+                i,
+                input[i]
+            );
+            assert!(
+                val >= 0.0 && val <= 1.0,
+                "Value out of [0,1] range at index {}: {} (input={})",
+                i,
+                val,
+                input[i]
+            );
+        }
+
+        // Verify expected behavior at extremes
+        assert!(
+            output[0] < 1e-10,
+            "sigmoid(-100) should be ≈0, got {}",
+            output[0]
+        );
+        assert!(
+            output[1] < 1e-10,
+            "sigmoid(-50) should be ≈0, got {}",
+            output[1]
+        );
+        assert!(
+            (output[3] - 0.5).abs() < 1e-6,
+            "sigmoid(0) should be 0.5, got {}",
+            output[3]
+        );
+        assert!(
+            output[5] >= 1.0 - 1e-10,
+            "sigmoid(50) should be ≈1, got {}",
+            output[5]
+        );
+        assert!(
+            output[6] >= 1.0 - 1e-10,
+            "sigmoid(100) should be ≈1, got {}",
+            output[6]
+        );
+
+        println!(
+            "Sigmoid edge case test passed: all {} values are finite and in [0,1]",
+            output.len()
+        );
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.2 (Squared ReLU Kernel) ===
+
+    #[test]
+    fn test_squared_relu() {
+        // Test basic squared ReLU: out = max(0, x)^2
+        let input = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+
+        let output = hip_squared_relu(&input).expect("squared_relu kernel failed");
+
+        // Expected: max(0, x)^2
+        // [-2] -> 0^2 = 0
+        // [-1] -> 0^2 = 0
+        // [0]  -> 0^2 = 0
+        // [1]  -> 1^2 = 1
+        // [2]  -> 2^2 = 4
+        // [3]  -> 3^2 = 9
+        let expected = vec![0.0, 0.0, 0.0, 1.0, 4.0, 9.0];
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i,
+                actual,
+                exp,
+                diff
+            );
+        }
+        println!("Squared ReLU test passed: {} values verified", output.len());
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.14 (Softplus Decay Kernel) ===
+
+    #[test]
+    fn test_softplus_decay() {
+        // Test softplus decay: out = log(sigmoid(x)) - 0.5
+        let input = vec![0.0, 1.0, -1.0, 5.0, -5.0];
+
+        let output = hip_softplus_decay(&input).expect("softplus_decay kernel failed");
+
+        // Expected: log(sigmoid(x)) - 0.5
+        // log(sigmoid(0)) - 0.5 = log(0.5) - 0.5 ≈ -0.693 - 0.5 = -1.193
+        // log(sigmoid(1)) - 0.5 ≈ -0.313 - 0.5 = -0.813
+        // log(sigmoid(-1)) - 0.5 ≈ -1.313 - 0.5 = -1.813
+        // log(sigmoid(5)) - 0.5 ≈ -0.0067 - 0.5 ≈ -0.507
+        // log(sigmoid(-5)) - 0.5 ≈ -5.0067 - 0.5 ≈ -5.507
+        let expected: Vec<f32> = input
+            .iter()
+            .map(|&x| {
+                let log_sigmoid = -(1.0f32 + (-x).exp()).ln();
+                log_sigmoid - 0.5
+            })
+            .collect();
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-4;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={}, expected={}, diff={}",
+                i,
+                actual,
+                exp,
+                diff
+            );
+        }
+        println!(
+            "Softplus decay test passed: {} values verified",
+            output.len()
+        );
+    }
+
+    #[test]
+    fn test_softplus_decay_numerical_stability() {
+        // Test edge cases that could cause numerical issues
+        let input = vec![
+            -100.0, // Very negative: result ≈ x - 0.5 = -100.5
+            -50.0,  // Large negative
+            -20.0,  // At clamping boundary
+            0.0,    // Zero
+            20.0,   // At clamping boundary
+            50.0,   // Large positive
+            100.0,  // Very positive: result ≈ -0.5
+        ];
+
+        let output = hip_softplus_decay(&input).expect("softplus_decay stability test failed");
+
+        // Verify no NaN or Inf values
+        for (i, &val) in output.iter().enumerate() {
+            assert!(!val.is_nan(), "NaN at index {} (input={})", i, input[i]);
+            assert!(
+                !val.is_infinite(),
+                "Inf at index {} (input={})",
+                i,
+                input[i]
+            );
+        }
+
+        // Verify expected behavior at extremes
+        // For large negative x: result ≈ x - 0.5
+        assert!(
+            (output[0] - (-100.5)).abs() < 0.1,
+            "softplus_decay(-100) should be ≈-100.5, got {}",
+            output[0]
+        );
+        // For large positive x: result ≈ -0.5
+        assert!(
+            (output[6] - (-0.5)).abs() < 0.01,
+            "softplus_decay(100) should be ≈-0.5, got {}",
+            output[6]
+        );
+
+        println!(
+            "Softplus decay stability test passed: all {} values are finite",
+            output.len()
+        );
+    }
+
+    // === Acceptance Criteria Tests for bd-2sh.4.13 (Tanh Kernel) ===
+
+    #[test]
+    fn test_tanh_basic() {
+        let input = vec![0.0, 1.0, -1.0, 2.0, -2.0];
+
+        let output = hip_tanh(&input).expect("tanh kernel failed");
+
+        // Expected: tanh(x)
+        let expected: Vec<f32> = input.iter().map(|&x| x.tanh()).collect();
+
+        for (i, (actual, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            let diff = (actual - exp).abs();
+            let tol = 1e-5;
+            assert!(
+                diff <= tol,
+                "Mismatch at index {}: actual={:.6}, expected={:.6}, diff={:.6}",
+                i,
+                actual,
+                exp,
+                diff
+            );
+        }
+        println!("Basic tanh test passed: {} values verified", output.len());
+    }
+
+    #[test]
+    fn test_tanh_edge_cases() {
+        let input = vec![
+            -100.0, // Very negative: tanh → -1
+            -10.0, 0.0, // tanh(0) = 0
+            10.0, 100.0, // Very positive: tanh → 1
+        ];
+
+        let output = hip_tanh(&input).expect("tanh edge cases failed");
+
+        // Verify no NaN or Inf
+        for (i, &val) in output.iter().enumerate() {
+            assert!(!val.is_nan(), "NaN at index {}", i);
+            assert!(!val.is_infinite(), "Inf at index {}", i);
+            assert!(
+                val >= -1.0 && val <= 1.0,
+                "Value out of [-1,1] at index {}: {}",
+                i,
+                val
+            );
+        }
+
+        // Check extremes
+        assert!(
+            (output[0] - (-1.0)).abs() < 1e-6,
+            "tanh(-100) should be ≈-1"
+        );
+        assert!(output[2].abs() < 1e-6, "tanh(0) should be ≈0");
+        assert!((output[4] - 1.0).abs() < 1e-6, "tanh(100) should be ≈1");
+
+        println!("Tanh edge cases test passed");
+    }
+}

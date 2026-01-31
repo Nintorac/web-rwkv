@@ -120,3 +120,27 @@ pub enum MemoryType {
     /// Managed/unified memory (hipMallocManaged) - accessible from CPU and GPU
     Managed,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hip_memory_roundtrip() {
+        let stream = Stream::null();
+        let host_data: Vec<f32> = (0..1024).map(|i| i as f32).collect();
+
+        let mut device_buf = DeviceBuffer::<f32>::new(1024).expect("Failed to allocate");
+        device_buf
+            .copy_from_host(&host_data, &stream)
+            .expect("Failed to copy to device");
+
+        let mut result = vec![0.0f32; 1024];
+        device_buf
+            .copy_to_host(&mut result, &stream)
+            .expect("Failed to copy to host");
+        stream.synchronize().expect("Failed to synchronize");
+
+        assert_eq!(host_data, result, "Memcpy roundtrip failed");
+    }
+}

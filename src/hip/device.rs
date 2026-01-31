@@ -420,4 +420,63 @@ mod tests {
         // AMD GPUs typically have warp size 64
         assert!(warp.unwrap() > 0, "Warp size should be > 0");
     }
+
+    #[test]
+    fn test_hip_context_creation() {
+        let ctx = HipContext::new().expect("Failed to create context");
+        assert!(ctx.device_id() >= 0, "Device ID should be non-negative");
+
+        let name = ctx.device_name().expect("Failed to get device name");
+        let arch = ctx.gcn_arch_name().unwrap_or_default();
+        println!("Context created for device: {} ({})", name, arch);
+
+        assert!(
+            arch.contains("gfx") || name.contains("Radeon") || name.contains("AMD"),
+            "Expected AMD GPU, got: {} ({})",
+            name,
+            arch
+        );
+    }
+
+    #[test]
+    fn test_hip_context_device_query() {
+        let ctx = HipContext::new().expect("Failed to create context");
+
+        let name = ctx.device_name().expect("Failed to get device name");
+        let arch = ctx
+            .gcn_arch_name()
+            .unwrap_or_else(|_| "unknown".to_string());
+        let memory = ctx.total_memory().unwrap_or(0);
+        let mp_count = ctx.multiprocessor_count().unwrap_or(0);
+        let warp_size = ctx.warp_size().unwrap_or(0);
+        let (major, minor) = ctx.compute_capability().unwrap_or((0, 0));
+        let is_integrated = ctx.is_integrated().unwrap_or(false);
+        let supports_coop = ctx.supports_cooperative_launch().unwrap_or(false);
+
+        println!("Device: {}", name);
+        println!("  Architecture: {}", arch);
+        println!("  Total memory: {} MB", memory / (1024 * 1024));
+        println!("  Multiprocessors: {}", mp_count);
+        println!("  Warp size: {}", warp_size);
+        println!("  Compute capability: {}.{}", major, minor);
+        println!("  Integrated (APU): {}", is_integrated);
+        println!("  Cooperative launch: {}", supports_coop);
+
+        assert!(!name.is_empty(), "Device name should not be empty");
+
+        if arch.contains("gfx1151") {
+            if warp_size > 0 {
+                assert_eq!(warp_size, 32, "gfx1151 should have warp size 32");
+                println!("  Verified gfx1151 warp size");
+            }
+        }
+    }
+
+    #[test]
+    fn test_hip_stream_sync() {
+        let ctx = HipContext::new().expect("Failed to create context");
+        ctx.synchronize()
+            .expect("Failed to synchronize null stream");
+        println!("Null stream synchronization test passed");
+    }
 }

@@ -881,4 +881,105 @@ mod tests {
             assert_eq!(v, 0.0, "Value should be 0.0 after fill_zero");
         }
     }
+
+    #[test]
+    fn test_tensor_alloc() {
+        let stream = Stream::null();
+
+        let shape = TensorShape::new(2, 3, 4, 1);
+        let tensor = TensorHip::<f32>::new(shape).expect("Failed to allocate device tensor");
+        assert_eq!(tensor.shape(), shape);
+        assert_eq!(tensor.len(), 24);
+        assert!(tensor.is_contiguous());
+        assert_eq!(tensor.memory_type(), MemoryType::Device);
+
+        let managed_tensor =
+            TensorHip::<f32>::managed(shape).expect("Failed to allocate managed tensor");
+        assert_eq!(managed_tensor.shape(), shape);
+        assert_eq!(managed_tensor.memory_type(), MemoryType::Managed);
+
+        let zeros_tensor = TensorHip::<f32>::zeros(shape).expect("Failed to allocate zeros tensor");
+        let data = zeros_tensor.to_vec(&stream).expect("Failed to read zeros");
+        assert!(
+            data.iter().all(|&x| x == 0.0),
+            "Zeros tensor should be all zeros"
+        );
+
+        let empty_shape = TensorShape::new(0, 1, 1, 1);
+        let empty_tensor =
+            TensorHip::<f32>::new(empty_shape).expect("Failed to allocate empty tensor");
+        assert!(empty_tensor.is_empty());
+    }
+
+    #[test]
+    fn test_tensor_copy_roundtrip() {
+        let stream = Stream::null();
+
+        let shape = TensorShape::new(4, 3, 2, 1);
+        let host_data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+
+        let tensor = TensorHip::from_slice(&host_data, shape, &stream)
+            .expect("Failed to create tensor from slice");
+        assert_eq!(tensor.shape(), shape);
+        assert_eq!(tensor.len(), 24);
+
+        let result = tensor
+            .to_vec(&stream)
+            .expect("Failed to copy tensor to host");
+        assert_eq!(host_data, result, "Roundtrip data should match");
+
+        let mut tensor2 = TensorHip::<f32>::new(shape).expect("Failed to allocate tensor");
+        tensor2
+            .copy_from_slice(&host_data, &stream)
+            .expect("Failed to copy from slice");
+        stream.synchronize().expect("Failed to sync");
+
+        let result2 = tensor2.to_vec(&stream).expect("Failed to read tensor2");
+        assert_eq!(host_data, result2, "copy_from_slice data should match");
+    }
+
+    #[test]
+    fn test_tensor_view_strides() {
+        let stream = Stream::null();
+
+        let shape = TensorShape::new(4, 3, 2, 1);
+        let host_data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let tensor =
+            TensorHip::from_slice(&host_data, shape, &stream).expect("Failed to create tensor");
+
+        let strides = tensor.strides();
+        assert_eq!(strides, [1, 4, 12, 24], "Strides should be [1, 4, 12, 24]");
+
+        let idx = shape.linear_index(1, 2, 1, 0);
+        assert_eq!(idx, 21, "Linear index (1,2,1,0) should be 21");
+
+        let view = tensor
+            .view((0, 4), (0, 1), (0, 2), (0, 1))
+            .expect("Failed to create view");
+        assert_eq!(view.shape(), TensorShape::new(4, 1, 2, 1));
+        assert_eq!(view.len(), 8);
+        assert!(
+            !view.is_contiguous(),
+            "View with gap in y should not be contiguous"
+        );
+
+        let view_strides = view.strides();
+        assert_eq!(view_strides, strides, "View should inherit parent strides");
+
+        let tv = tensor.tensor_view();
+        assert_eq!(tv.offset, 0, "Original tensor offset should be 0");
+
+        let view2 = tensor
+            .view((2, 4), (1, 3), (0, 2), (0, 1))
+            .expect("Failed to create view2");
+        let expected_offset = 2 * 1 + 1 * 4 + 0 * 12; // = 6
+        assert_eq!(view2.offset(), expected_offset, "View offset should be 6");
+
+        assert_eq!(view2.shape(), TensorShape::new(2, 2, 2, 1));
+
+        let full_view = tensor
+            .view((0, 4), (0, 3), (0, 2), (0, 1))
+            .expect("Failed to create full view");
+        assert!(full_view.is_contiguous(), "Full view should be contiguous");
+    }
 }
