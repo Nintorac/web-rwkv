@@ -1,10 +1,12 @@
 //! RWKV7 HIP model loading and step (inference) implementation.
 
+pub mod prefill;
 pub mod state;
 mod step;
 pub mod weights;
 
 // Re-export all public types from submodules
+pub use prefill::{FusedT1Wkv, WaveReduceWkv, WkvInput, WkvKernel};
 pub use state::{ForwardCompletion, HipState};
 pub use weights::{
     AttentionHip, EmbedHip, FfnHip, HeadHip, LayerHip, LayerNormHip,

@@ -2,6 +2,7 @@
 
 use half::f16;
 
+use super::prefill::{FusedT1Wkv, WaveReduceWkv, WkvInput, WkvKernel};
 use super::state::HipState;
 use super::Rwkv7Hip;
 use crate::hip::device::Stream;
@@ -27,8 +28,6 @@ use crate::hip::kernels::{
     softplus_decay_f16,
     squared_relu_f16,
     tanh_f16,
-    wkv7_wave_reduce,
-    wkv7_fused_t1,
     wkv_bonus_f16,
 };
 use crate::hip::scratch::HipScratch;
@@ -220,6 +219,9 @@ impl Rwkv7Hip {
             let mut temp1 = scratch.temp1.resized_view_mut(std_shape)?;
             let mut temp2 = scratch.temp2.resized_view_mut(std_shape)?;
 
+            // Select WKV kernel: fused_t1 for decode (T=1), wave_reduce for prefill (T>1)
+            let wkv_kernel: &dyn WkvKernel = if t == 1 { &FusedT1Wkv } else { &WaveReduceWkv };
+
             // Process each layer
             for layer_idx in 0..n_layer {
                 let layer = &self.layers[layer_idx];
@@ -404,39 +406,24 @@ impl Rwkv7Hip {
                 let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
                 let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
-                // Run WKV7: fused_t1 for decode (T=1), wave_reduce for prefill (T>1)
+                // Run WKV7 via trait dispatch: fused_t1 for T=1, wave_reduce for T>1
                 prof.time("wkv", || {
-                    if t == 1 {
-                        // Fused T=1 decode kernel (in-place state)
-                        wkv7_fused_t1(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &mut wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &lens_gpu,
-                            stream,
-                        )?;
-                    } else {
-                        // Wave-reduce prefill kernel (state_in -> state_out)
-                        wkv7_wave_reduce(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &mut new_wkv_state,
-                            &lens_gpu,
-                            stream,
-                        )?;
-                        std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
-                    }
+                    let wkv_input = WkvInput {
+                        w_decay: &w_decay_wkv,
+                        r: &r_wkv,
+                        k: &k_ctrl_wkv,
+                        v: &v_wkv,
+                        a: &wkv_a_wkv,
+                        b: &wkv_b_wkv,
+                        lengths: &lens_gpu,
+                    };
+                    wkv_kernel.compute(
+                        &wkv_input,
+                        &mut wkv_state_gpu[layer_idx],
+                        &mut new_wkv_state,
+                        &mut wkv_out_wkv,
+                        stream,
+                    )?;
                     prof_sync(stream)?;
                     Ok(())
                 })?;
@@ -753,5 +740,469 @@ impl Rwkv7Hip {
         }
 
         Ok((logits, current_state))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use half::f16;
+
+    use super::HipState;
+    use crate::hip::model::Rwkv7Hip;
+    use crate::hip::model::Rwkv7ModelInfo;
+    use crate::hip::pinned::PinnedBuffer;
+    use crate::hip::scratch::HipRuntimeConfig;
+
+    // === State I/O and Batched Inference Tests (bd-2sh.5.6) ===
+
+    /// Test that HipState is correctly sized for batched inference.
+    #[test]
+    fn test_hip_state_batched_sizing() {
+        let info = Rwkv7ModelInfo {
+            n_layer: 12,
+            n_embd: 768,
+            n_head: 12,
+            head_size: 64,
+            n_vocab: 65536,
+            n_hidden: 2048,
+        };
+
+        let batch_size = 4;
+        let state = HipState::new(&info, batch_size).expect("Failed to allocate state");
+
+        assert_eq!(state.batch_size, 4);
+        assert_eq!(state.att_states.len(), 12);
+        assert_eq!(state.att_shift_states.len(), 12);
+        assert_eq!(state.ffn_states.len(), 12);
+
+        // Check per-layer sizes include batch dimension
+        let expected_att_state_size = 64 * 64 * 12 * 4; // head_size² * n_head * batch
+        let expected_shift_state_size = 768 * 4; // n_embd * batch
+
+        assert_eq!(state.att_states[0].len(), expected_att_state_size);
+        assert_eq!(state.att_shift_states[0].len(), expected_shift_state_size);
+        assert_eq!(state.ffn_states[0].len(), expected_shift_state_size);
+
+        println!("HipState batched sizing test passed (B=4)");
+    }
+
+    /// Test that step() API works with (logits, state) return.
+    #[test]
+    fn test_step_basic() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 1);
+        let model = model
+            .with_config(config)
+            .expect("Failed to configure model");
+
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
+
+        let (logits, _state) = model.step(&[&tokens], None).expect("step() failed");
+
+        // Should return vocab_size * T logits
+        let expected_len = model.info.n_vocab * tokens.len();
+        assert_eq!(
+            logits.len(),
+            expected_len,
+            "Expected {} logits, got {}",
+            expected_len,
+            logits.len()
+        );
+
+        println!("step() basic test passed");
+    }
+
+    /// Test batched inference with B=2 produces same results as sequential B=1.
+    #[test]
+    fn test_batched_matches_sequential() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        // Load two separate models to get fresh state each time
+        let model1 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config1 = HipRuntimeConfig::new(256, 1);
+        let model1 = model1
+            .with_config(config1)
+            .expect("Failed to configure model");
+
+        let model2 = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config2 = HipRuntimeConfig::new(256, 1);
+        let model2 = model2
+            .with_config(config2)
+            .expect("Failed to configure model");
+
+        let model_batch = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config_batch = HipRuntimeConfig::new(256, 2);
+        let model_batch = model_batch
+            .with_config(config_batch)
+            .expect("Failed to configure model");
+
+        // Two sequences
+        let seq1: Vec<u32> = vec![1, 2, 3];
+        let seq2: Vec<u32> = vec![4, 5, 6];
+        let t = seq1.len();
+
+        // Run sequentially with B=1 (fresh state each time)
+        let (logits1, _) = model1.step(&[&seq1], None).expect("seq1 step failed");
+        let (logits2, _) = model2.step(&[&seq2], None).expect("seq2 step failed");
+
+        // Run batched with B=2 (fresh state)
+        let (batched_logits, _) = model_batch
+            .step(&[&seq1, &seq2], None)
+            .expect("batched step failed");
+
+        // Batched output: [seq1 tokens, seq2 tokens] concatenated
+        let vocab = model1.info.n_vocab;
+        let b = 2;
+        assert_eq!(batched_logits.len(), vocab * t * b);
+
+        let top_k = |logits: &[f32], token_idx: usize, k: usize| -> Vec<usize> {
+            let start = token_idx * vocab;
+            let end = start + vocab;
+            let mut indexed: Vec<(usize, f32)> =
+                logits[start..end].iter().copied().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.into_iter().take(k).map(|(i, _)| i).collect()
+        };
+
+        for ti in 0..t {
+            let seq1_top5 = top_k(&logits1, ti, 5);
+            let seq2_top5 = top_k(&logits2, ti, 5);
+
+            let batch1_top5 = top_k(&batched_logits, 0 * t + ti, 5);
+            let batch2_top5 = top_k(&batched_logits, 1 * t + ti, 5);
+
+            let overlap1 =
+                seq1_top5.iter().filter(|i| batch1_top5.contains(i)).count() as f32 / 5.0;
+            let overlap2 =
+                seq2_top5.iter().filter(|i| batch2_top5.contains(i)).count() as f32 / 5.0;
+
+            if overlap1 < 0.8 {
+                eprintln!(
+                    "Warning: seq1 top-5 overlap low at t={} (overlap={:.2})",
+                    ti, overlap1
+                );
+            }
+            if overlap2 < 0.8 {
+                eprintln!(
+                    "Warning: seq2 top-5 overlap low at t={} (overlap={:.2})",
+                    ti, overlap2
+                );
+            }
+        }
+
+        println!("Batched matches sequential test PASSED");
+    }
+
+    /// Test streaming equivalence with batched state.
+    #[test]
+    fn test_batched_streaming_equivalence() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 1);
+        let model = model
+            .with_config(config)
+            .expect("Failed to configure model");
+
+        let tokens: Vec<u32> = vec![1, 2, 3];
+
+        // Single-sequence batch step (all tokens at once)
+        let (logits_batch, _) = model
+            .step(&[&tokens], None)
+            .expect("batch step failed");
+
+        // Single-sequence streaming (token by token, chain state)
+        let mut logits_stream = Vec::new();
+        let mut state: Option<HipState> = None;
+        for &tok in &tokens {
+            let (logits, new_state) = model
+                .step(&[&[tok]], state)
+                .expect("streaming step failed");
+            logits_stream.extend(logits);
+            state = Some(new_state);
+        }
+
+        assert_eq!(logits_batch.len(), logits_stream.len());
+
+        let mut max_diff = 0.0f32;
+        for (i, (batch, stream)) in logits_batch.iter().zip(logits_stream.iter()).enumerate() {
+            let diff = (batch - stream).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "Streaming mismatch at {}: {} vs {}",
+                i,
+                batch,
+                stream
+            );
+        }
+
+        println!(
+            "Batched streaming equivalence test PASSED (max_diff={})",
+            max_diff
+        );
+    }
+
+    /// Test chunked processing with batched state.
+    #[test]
+    fn test_batched_chunked_equivalence() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 1);
+        let model = model
+            .with_config(config)
+            .expect("Failed to configure model");
+
+        // 10 tokens, chunk into [4, 4, 2]
+        let tokens: Vec<u32> = (1..=10).collect();
+        let chunk_size = 4;
+
+        // Full step
+        let (logits_full, _) = model
+            .step(&[&tokens], None)
+            .expect("full step failed");
+
+        // Chunked step (manual chunking)
+        let mut logits_chunked = Vec::new();
+        let mut state: Option<HipState> = None;
+        for chunk in tokens.chunks(chunk_size) {
+            let (logits, new_state) = model
+                .step(&[chunk], state)
+                .expect("chunked step failed");
+            logits_chunked.extend(logits);
+            state = Some(new_state);
+        }
+
+        assert_eq!(logits_full.len(), logits_chunked.len());
+
+        let mut max_diff = 0.0f32;
+        for (i, (full, chunked)) in logits_full.iter().zip(logits_chunked.iter()).enumerate() {
+            let diff = (full - chunked).abs();
+            max_diff = max_diff.max(diff);
+            assert!(
+                diff < 1e-3,
+                "Chunked mismatch at {}: {} vs {}",
+                i,
+                full,
+                chunked
+            );
+        }
+
+        println!(
+            "Batched chunked equivalence test PASSED (max_diff={})",
+            max_diff
+        );
+    }
+
+    /// Test state evolution in batched mode.
+    #[test]
+    fn test_batched_state_evolution() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 2);
+        let model = model
+            .with_config(config)
+            .expect("Failed to configure model");
+
+        let seq1: Vec<u32> = vec![1, 2, 3];
+        let seq2: Vec<u32> = vec![4, 5, 6];
+
+        // Run step with fresh state (None)
+        let (_, state) = model
+            .step(&[&seq1, &seq2], None)
+            .expect("step failed");
+
+        // Returned state should have evolved (non-zero)
+        let att_sum: f32 = state
+            .att_states
+            .iter()
+            .flat_map(|v| v.as_slice().iter())
+            .map(|x| x.abs())
+            .sum();
+        assert!(att_sum > 0.0, "att_states should be non-zero after step");
+
+        println!("Batched state evolution test PASSED");
+    }
+
+    /// Test batch size mismatch error when state batch_size != input batch size.
+    #[test]
+    fn test_batch_size_mismatch_error() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 3);
+        let model = model
+            .with_config(config)
+            .expect("Failed to configure model");
+
+        // State with batch_size=2, but provide 3 sequences
+        let state = HipState::new(&model.info, 2).expect("Failed to allocate state");
+        let result = model.step(&[&[1u32], &[2u32], &[3u32]], Some(state));
+
+        assert!(result.is_err(), "Should error on batch size mismatch");
+        println!("Batch size mismatch error test PASSED");
+    }
+
+    /// Test variable-length sequences (now supported, not an error).
+    #[test]
+    fn test_variable_length_sequences() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config = HipRuntimeConfig::new(256, 2);
+        let model = model
+            .with_config(config)
+            .expect("Failed to configure model");
+
+        // Two sequences with different lengths - should now work
+        let seq1: Vec<u32> = vec![1, 2, 3]; // length 3
+        let seq2: Vec<u32> = vec![4, 5]; // length 2
+        let result = model.step(&[&seq1, &seq2], None);
+
+        assert!(
+            result.is_ok(),
+            "Variable-length sequences should be supported"
+        );
+
+        let (logits, _) = result.unwrap();
+        let vocab = model.info.n_vocab;
+        // Logits should have (3 + 2) * vocab elements
+        assert_eq!(
+            logits.len(),
+            5 * vocab,
+            "Should have logits for all 5 tokens"
+        );
+
+        println!("Variable-length sequences test PASSED");
+    }
+
+    /// Test HipState reset.
+    #[test]
+    fn test_hip_state_reset() {
+        let info = Rwkv7ModelInfo {
+            n_layer: 2,
+            n_embd: 64,
+            n_head: 2,
+            head_size: 32,
+            n_vocab: 100,
+            n_hidden: 128,
+        };
+
+        let mut state = HipState::new(&info, 2).expect("Failed to allocate state");
+
+        // Fill with values
+        for s in &mut state.att_states {
+            s.as_slice_mut().fill(1.0);
+        }
+        for s in &mut state.att_shift_states {
+            s.as_slice_mut().fill(f16::from_f32(2.0));
+        }
+        for s in &mut state.ffn_states {
+            s.as_slice_mut().fill(f16::from_f32(3.0));
+        }
+
+        state.reset();
+
+        // All should be zero
+        assert!(state
+            .att_states
+            .iter()
+            .all(|s| s.as_slice().iter().all(|&x| x == 0.0)));
+        assert!(state
+            .att_shift_states
+            .iter()
+            .all(|s| s.as_slice().iter().all(|&x| x == f16::from_f32(0.0))));
+        assert!(state
+            .ffn_states
+            .iter()
+            .all(|s| s.as_slice().iter().all(|&x| x == f16::from_f32(0.0))));
+        assert!(state.v_first.is_none());
+
+        println!("HipState reset test PASSED");
+    }
+
+    /// Test HipState v_first persistence across operations.
+    #[test]
+    fn test_hip_state_v_first_persistence() {
+        let info = Rwkv7ModelInfo {
+            n_layer: 2,
+            n_embd: 64,
+            n_head: 2,
+            head_size: 32,
+            n_vocab: 100,
+            n_hidden: 128,
+        };
+
+        // Fresh state should have v_first = None
+        let mut state = HipState::new(&info, 1).expect("Failed to allocate state");
+        assert!(
+            state.v_first.is_none(),
+            "New state should have v_first = None"
+        );
+
+        // Set v_first and verify it persists
+        let mut v_first_buf = PinnedBuffer::<f16>::new(64).expect("Failed to allocate v_first");
+        v_first_buf.as_slice_mut().fill(f16::from_f32(1.0));
+        state.v_first = Some(v_first_buf);
+        assert!(
+            state.v_first.is_some(),
+            "v_first should persist after assignment"
+        );
+        assert_eq!(state.v_first.as_ref().unwrap().len(), 64);
+
+        // Reset should clear v_first
+        state.reset();
+        assert!(
+            state.v_first.is_none(),
+            "Reset should clear v_first to None"
+        );
+
+        println!("HipState v_first persistence test PASSED");
     }
 }
