@@ -19,7 +19,6 @@ use crate::hip::kernels::{
     decay_exp_f16,
     group_norm_f16,
     l2_norm_f16,
-    // GPU-native kernels used in forward
     layer_norm_f16,
     lerp_f16,
     mul_f16,

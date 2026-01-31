@@ -322,7 +322,7 @@ impl Rwkv7Hip {
 
     /// Get a reference to the embedding table (CPU storage).
     ///
-    /// The embedding table is kept on CPU to avoid GPU->CPU transfer overhead per forward call.
+    /// The embedding table is kept on CPU to avoid GPU->CPU transfer overhead per step() call.
     /// Shape: [n_vocab, n_embd] in row-major order (token_id * n_embd + c).
     pub fn get_embedding(&self) -> &[f16] {
         &self.embed.w
@@ -404,5 +404,3 @@ impl Rwkv7Hip {
     }
 }
 
-// Old forward_with_state, forward_with_state_masked, forward_with_scratch, forward() deleted.
-// See step() for the unified async-only API.

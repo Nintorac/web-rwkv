@@ -92,11 +92,11 @@ pub struct LoraDims {
     pub v_dim: Option<usize>,
 }
 
-/// Pre-allocated scratch buffers for HIP forward pass.
+/// Pre-allocated scratch buffers for HIP inference.
 ///
 /// All buffers are sized for `[dim, max_seq_len, batch_size]` to support
 /// any sequence length up to `max_prefill_chunk`. Buffers are reused across
-/// forward calls, eliminating allocation overhead.
+/// `step()` calls, eliminating allocation overhead.
 ///
 /// # Buffer Categories
 ///
@@ -108,11 +108,11 @@ pub struct LoraDims {
 /// # Usage
 ///
 /// ```rust,ignore
-/// let config = HipRuntimeConfig::default();
-/// let scratch = HipScratch::new(&model.info, &config)?;
+/// let config = HipRuntimeConfig::new(256, 4);
+/// let model = Rwkv7Hip::load("model.st")?.with_config(config)?;
 ///
-/// // Forward pass reuses scratch buffers
-/// let logits = model.forward_with_scratch(&tokens, &mut state, &mut scratch)?;
+/// // step() reuses scratch buffers internally
+/// let (logits, state) = model.step(&[&tokens], None)?;
 /// ```
 #[derive(Debug)]
 pub struct HipScratch {

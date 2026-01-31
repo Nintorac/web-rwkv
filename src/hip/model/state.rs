@@ -22,17 +22,15 @@ use crate::hip::pinned::PinnedBuffer;
 /// # Usage
 /// ```ignore
 /// // Batched inference (B=4 sequences)
-/// let mut state = HipState::new(&model.info, 4);
 /// let tokens: Vec<&[u32]> = vec![&seq1, &seq2, &seq3, &seq4];
-/// let logits = model.forward_with_state(&tokens, &mut state)?;
+/// let (logits, state) = model.step(&tokens, None)?;
 ///
 /// // Streaming with batching: process one token per sequence
 /// let next_tokens: Vec<&[u32]> = vec![&[t1], &[t2], &[t3], &[t4]];
-/// let logits = model.forward_with_state(&next_tokens, &mut state)?;
+/// let (logits, state) = model.step(&next_tokens, Some(state))?;
 ///
 /// // Single sequence (B=1) for simple use cases
-/// let mut state = HipState::new(&model.info, 1);
-/// let logits = model.forward_with_state(&[&tokens], &mut state)?;
+/// let (logits, state) = model.step(&[&tokens], None)?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct HipState {
@@ -170,7 +168,7 @@ impl ForwardCompletion {
         // Block until all GPU work is done
         self.event.synchronize()?;
 
-        // Extract only real tokens from padded output (matches sync forward behavior)
+        // Extract only real tokens from padded output
         // Layout: [n_vocab, chunk_size, batch_size] column-major
         // For batch b, token t: offset = (b * chunk_size + t) * n_vocab
         // Data is already f32 (GPU did f16->f32 conversion before download)
