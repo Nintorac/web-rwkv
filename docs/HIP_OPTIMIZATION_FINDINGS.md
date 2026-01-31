@@ -531,6 +531,118 @@ WGPU reference (decode, same point): **~4.0 ms WKV**, still ~1.5× faster than o
 
 Target: Match or exceed WGPU's 4.0ms.
 
+### Why WGPU's WKV Is Faster: Parallelization Strategy Analysis
+
+SQTT hardware thread traces (via RADV RGP capture) and rocprofv3 kernel-level profiling
+reveal a **fundamental architectural difference** between HIP and WGPU's WKV implementations.
+
+#### Dispatch Structure Comparison
+
+| | WGPU `time_mix_v7` | HIP `wave_reduce_t1` |
+|---|---|---|
+| Workgroup size | 32 threads (1 wave32) | 256 threads (8 waves) |
+| Grid (0.1b, B=256) | **6 workgroups** | **3072 blocks** |
+| Total waves | **6** | **24,576** |
+| Parallelism axis | Embedding dimension | (head × batch) |
+| Batch handling | Serial loop in each WG | One block per batch |
+
+WGPU partitions across the **embedding dimension** — `ceil(H×S/128)` workgroups, each
+containing 32 threads that handle 32 vec4 elements. Each workgroup loops over **all 256
+batches** sequentially (`for t in 0..shape[2]`), processing the full cursor array.
+
+HIP partitions across **(head × batch)** — `dim3(H, B)` = 3072 blocks, each with 256
+threads processing a single (head, batch) pair.
+
+The wave count ratio is **4096×** (24,576 vs 6), independent of model size. This holds
+because HIP launches `H × B × 8` waves while WGPU launches `H × S / 128` waves.
+
+#### Why Fewer Waves Wins at Batch=256 (0.1b Model)
+
+**1. Active memory working set**
+
+WGPU processes batches one at a time. At any instant, only **1 batch's state** (~192KB
+for 12 heads × 64 × 64 × 4B) is being accessed across all workgroups. This fits in L2
+cache (~4MB on RDNA3). The second state read (for the update loop) hits L2.
+
+HIP has ~160 concurrent blocks (4 blocks/CU × 40 CUs), each accessing a **different**
+(head, batch) pair's state (16KB each). Per-CU working set: 4 × 16KB = 64KB, which
+**exceeds the 16KB L0 cache**. The second state read (loop 2) misses L0.
+
+**2. Zero-cost barriers**
+
+WGPU workgroups have 1 wave (32 threads). `workgroupBarrier()` is free — the wave is
+already in SIMD lockstep.
+
+HIP blocks have 8 waves. `__syncthreads()` between the sa-compute and state-update loops
+forces all 8 waves to drain. During the stall, the SQ schedules other blocks' waves on
+the same CU, which access different state data, evicting our state from L1.
+
+**3. In-place state update**
+
+WGPU writes state back to the **same buffer** (`state: array<vec4<f32>>` is read-write).
+The write address was just loaded, so it's likely still in cache.
+
+HIP writes to a **separate `state_out` buffer** (`state_in` and `state_out` are different
+pointers). Every state write is a cold write to a new cache line.
+
+#### Profiling Evidence
+
+| Metric | HIP (rocprofv3) | WGPU (SQTT) |
+|--------|-----------------|-------------|
+| Per-dispatch time | **441 μs** avg | — |
+| Per-wave duration | — | **343 μs** avg (CU4) |
+| Instructions/wave | ~40 (est.) | **30,920** (measured) |
+| VGPRs | 48 | ~72 (PAL ELF metadata) |
+| LDS | 1,152 B/block | 2,560–3,072 B/WG |
+| Concurrent waves | ~160 blocks (1,280 waves) | 6–8 total |
+| State reads per kernel | 2× (miss L0 on 2nd) | 2× (hit L2 on 2nd) |
+
+WGPU's 30,920 instructions per wave confirms the serial batch loop — each wave does work
+equivalent to 256 HIP blocks' worth of computation.
+
+#### Why the Advantage Reverses at Larger Models (2.9b)
+
+At batch=256, HIP is **1.19× faster** for the 2.9b model but **0.86×** for 0.1b. The
+crossover occurs because the bottleneck shifts from **cache efficiency** to **memory
+bandwidth saturation**.
+
+| | 0.1b (12 heads, 768 dim) | 2.9b (~48 heads, 3072 dim) |
+|---|---|---|
+| Total state I/O | ~150 MB | ~600 MB |
+| WGPU workgroups | 6 | 24 |
+| HIP concurrent waves | ~1,280 | ~1,280 |
+| Bottleneck | Cache efficiency | Memory bandwidth |
+
+To sustain Strix Halo's ~120 GB/s bandwidth, the GPU needs hundreds of outstanding memory
+requests to fill the pipeline (~200–400 cycle latency). HIP's ~1,280 concurrent waves
+generate tens of thousands of outstanding loads, easily saturating bandwidth. WGPU's 24
+waves have far less latency-hiding capacity.
+
+At 0.1b the total traffic (150 MB) is small enough that cache behavior matters more than
+raw bandwidth — WGPU's clean L2 hits win. At 2.9b the total traffic (600 MB) makes
+bandwidth the bottleneck — HIP's massive parallelism wins.
+
+Additionally, GEMMs dominate at larger model sizes, and HIP's rocBLAS leverages hardware
+WMMA units while WGPU uses generic compute shaders.
+
+#### Implication for HIP Optimization
+
+The fused_t1 kernel addresses HIP-specific overhead (double state read, barriers, separate
+output buffer) but retains the (head × batch) grid structure. A hypothetical
+"embed-parallel" HIP kernel adopting WGPU's strategy would:
+
+- Launch `ceil(H×S/128)` workgroups (6–32 depending on model)
+- Loop over batches within each workgroup
+- Eliminate L0/L1 cache thrashing at the cost of reduced bandwidth saturation
+
+This would likely win at small models / high batch, and lose at large models where
+bandwidth saturation is critical. A hybrid approach with a batch-size threshold could
+select the optimal strategy at runtime.
+
+**Batch size note**: WGPU's cursor encoding packs the batch index into 8 bits
+(`cursor.batch = x & 0xff`), limiting batch to 256. This is a packing format choice, not
+an architectural limit — repacking to 10+ bits would support larger batches.
+
 ## Recommendations
 
 ### Short-term
@@ -572,6 +684,8 @@ Target: Match or exceed WGPU's 4.0ms.
 
 ## Appendix: Benchmark Commands
 
+### HIP Profiling
+
 ```bash
 # Run decode batch sweep
 WEB_RWKV_BENCH_PROFILE=decode_batch_sweep cargo test --release --features hip \
@@ -581,13 +695,6 @@ WEB_RWKV_BENCH_PROFILE=decode_batch_sweep cargo test --release --features hip \
 WEB_RWKV_HIP_PROF=1 cargo test --release --features hip,hip-prof \
     --test hip_profiling -- --ignored --nocapture profile_decode_batch_256
 
-# Run WGPU profiling (GPU timestamp-based per-operation timing)
-cargo test --release --features wgpu-prof \
-    --test wgpu_profiling -- --ignored --nocapture profile_decode_detailed
-
-# Profile with rocprof (legacy)
-rocprof --hip-trace ./target/release/examples/wkv_profile
-
 # Profile with rocprofv3 (includes kernel dispatch timing)
 rocprofv3 --hip-trace --hsa-trace --kernel-trace --memory-copy-trace \
     -o /tmp/rocprof_results -- ./target/release/deps/hip_profiling-* \
@@ -595,11 +702,128 @@ rocprofv3 --hip-trace --hsa-trace --kernel-trace --memory-copy-trace \
 
 # Query rocprofv3 results (SQLite database)
 sqlite3 /tmp/rocprof_results_results.db "
-SELECT ks.display_name, COUNT(*) as n, SUM(d.end-d.start)/1e6 as total_ms
+SELECT ks.display_name, COUNT(*) as n,
+       printf('%.1f', AVG(d.end-d.start)/1000.0) as avg_us,
+       printf('%.1f', SUM(d.end-d.start)/1e6) as total_ms,
+       ks.arch_vgpr_count as vgprs, ks.group_segment_size as lds
 FROM rocpd_kernel_dispatch d
-JOIN rocpd_info_kernel_symbol ks ON d.kernel_id = ks.id
-GROUP BY ks.display_name ORDER BY total_ms DESC LIMIT 10"
+JOIN kernel_symbols ks ON d.kernel_id = ks.kernel_id
+GROUP BY ks.display_name ORDER BY total_ms DESC LIMIT 15"
 
 # Compare rocBLAS vs hipBLASLt
 cargo test --release --features hip --test hipblaslt_benchmark -- --ignored --nocapture
 ```
+
+### WGPU / Vulkan Profiling
+
+WGPU runs on RADV (Mesa's Vulkan driver). rocprofv3 only works for HIP, so WGPU
+profiling requires different tools.
+
+#### GPU Timestamp Queries (per-operation timing)
+
+The `wgpu-prof` feature adds GPU timestamp queries around each operation. This
+introduces some overhead but gives per-operation wall-clock GPU timing.
+
+```bash
+# Per-operation breakdown (wkv, att_proj, ffn_v, etc.)
+cargo test --release --features wgpu-prof \
+    --test wgpu_profiling -- --ignored --nocapture profile_decode_detailed
+
+# Batch size sweep
+cargo test --release --features wgpu-prof \
+    --test wgpu_profiling -- --ignored --nocapture profile_decode_sweep
+```
+
+#### RADV RGP Trace Capture (hardware thread traces)
+
+RADV can capture RGP (Radeon GPU Profiler) traces containing SQTT (SQ Thread
+Trace) data — per-wavefront execution timing on the instruction-traced CU.
+This has zero overhead on non-traced CUs and gives cycle-accurate wave timing.
+
+```bash
+# Capture one .rgp file per VkQueueSubmit
+MESA_VK_TRACE=rgp \
+MESA_VK_TRACE_PER_SUBMIT=1 \
+RADV_THREAD_TRACE_BUFFER_SIZE=32768 \
+    cargo test --release --features wgpu-prof \
+    --test wgpu_profiling -- --ignored --nocapture profile_decode_batch_256
+
+# Traces are written to /tmp/<binary>_<timestamp>.rgp
+ls -lhS /tmp/wgpu_profiling*.rgp
+```
+
+Environment variables:
+
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `MESA_VK_TRACE` | `rgp` | Enable RGP capture (must be `rgp`, not `1`) |
+| `MESA_VK_TRACE_PER_SUBMIT` | `1` | One `.rgp` per VkQueueSubmit (required for compute-only workloads — frame-based capture only works for graphics) |
+| `RADV_THREAD_TRACE_BUFFER_SIZE` | `32768` | SQTT buffer size in bytes per SE (larger = more data, bigger files) |
+
+#### Decoding RGP / SQTT Traces
+
+The `.rgp` files from RADV use the SQTT binary format (magic `0x50303042` / `B00P`),
+not the newer RDF container format. AMD's `rocprof-trace-decoder` library can
+parse the SQTT token stream into per-wave execution events.
+
+```bash
+# Decode SQTT tokens → SQLite (wave executions + occupancy events)
+python3 scripts/rgp_decode_sqtt.py /tmp/wgpu_profiling-*.rgp
+
+# Output: <input>_sqtt.db with tables:
+#   wave_executions(wave_id, cu, simd, begin_time, end_time, duration_ticks, duration_ns, duration_us, instructions)
+#   occupancy_events(wave_id, cu, simd, time, start)
+```
+
+**Dependencies**: The decoder script requires `tinygrad` (for ctypes bindings to
+the AMD decoder library) and `librocprof-trace-decoder.so`:
+
+```bash
+# Install tinygrad (provides rocprof autogen bindings)
+uv pip install -e repos/tinygrad
+
+# Symlink the decoder library (ships with rocm-sdk-core pip package)
+sudo ln -sf /opt/venv/lib/python3.12/site-packages/_rocm_sdk_core/lib/librocprof-trace-decoder.so \
+    /usr/local/lib/rocprof-trace-decoder.so
+sudo ldconfig
+```
+
+#### Querying SQTT Results
+
+```bash
+# Top kernels by CU-time (instruction count is a kernel fingerprint)
+sqlite3 /tmp/wgpu_sqtt_main.db "
+SELECT instructions as insts, COUNT(*) as waves,
+       printf('%.1f', SUM(duration_us)) as total_cu_us,
+       printf('%.1f%%', SUM(duration_us)*100.0/
+         (SELECT SUM(duration_us) FROM wave_executions WHERE duration_us>0)) as pct,
+       printf('%.1f', AVG(duration_us)) as avg_us
+FROM wave_executions WHERE duration_us > 0
+GROUP BY instructions ORDER BY SUM(duration_us) DESC LIMIT 10"
+
+# Wave launch pattern for a specific kernel (e.g. 30920-instruction WKV)
+sqlite3 /tmp/wgpu_sqtt_main.db "
+SELECT wave_id, simd, begin_time, end_time,
+       printf('%.1f', (end_time-begin_time)/2900.0) as dur_us
+FROM wave_executions WHERE instructions = 30920
+ORDER BY begin_time LIMIT 20"
+```
+
+#### Extracting Shader Metadata from RGP
+
+The `.rgp` files contain PAL-format ELFs with AMDGPU metadata (VGPRs, SGPRs,
+wavefront size, LDS size) in msgpack-encoded `.note` sections. The
+`rgp2sqlite.py` script extracts these:
+
+```bash
+python3 scripts/rgp2sqlite.py /tmp/wgpu_profiling-*.rgp
+```
+
+#### SQTT Limitations
+
+- SQTT only traces **one CU per shader engine** (the instruction-traced CU).
+  Wave counts and timing are samples, not totals.
+- No dispatch-level correlation — waves are identified by instruction count
+  (a fingerprint), not by shader name or dispatch ID.
+- The `wgpu-prof` timestamp queries give more directly useful per-operation
+  timing but add overhead. SQTT is zero-overhead on non-traced CUs.
