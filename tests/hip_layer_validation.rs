@@ -372,10 +372,10 @@ fn test_hip_layer_by_layer_step0() {
 
     let n_layer = model.info.n_layer;
 
-    // Run forward pass
+    // Run step
     let (_logits, _state) = model
-        .forward(&[&[token]], None)
-        .expect("Forward pass failed");
+        .step(&[&[token]], None)
+        .expect("Step failed");
 
     // Validate all captured values
     let captured = captured.lock().unwrap();
@@ -563,8 +563,8 @@ fn test_probe_coverage() {
 
     let n_layer = model.info.n_layer;
 
-    // Run forward pass
-    let (_logits, _state) = model.forward(&[&[0]], None).expect("Forward pass failed");
+    // Run step
+    let (_logits, _state) = model.step(&[&[0]], None).expect("Step failed");
 
     let captured = captured.lock().unwrap();
 
@@ -688,7 +688,7 @@ fn test_hip_divergence_progression() {
         let fixture =
             TestFixture::load(&fixture_path).expect(&format!("Failed to load {}", fixture_path));
 
-        let (logits, new_state) = model.forward(&[&[token]], state).expect("Forward failed");
+        let (logits, new_state) = model.step(&[&[token]], state).expect("Step failed");
         state = Some(new_state);
 
         let expected = fixture.f32("logits");

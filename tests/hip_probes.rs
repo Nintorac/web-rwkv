@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use web_rwkv::hip::{HipHook, HipProbeBuilder, Rwkv7Hip};
 
-/// Test that probes capture intermediate values during forward pass.
+/// Test that probes capture intermediate values during step.
 #[test]
 fn test_probe_captures_intermediates() {
     let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
@@ -70,8 +70,8 @@ fn test_probe_captures_intermediates() {
 
     let n_layer = model.info.n_layer;
 
-    // Run forward pass
-    let (_logits, _state) = model.forward(&[&[0, 1, 2]], None).expect("Forward failed");
+    // Run step
+    let (_logits, _state) = model.step(&[&[0, 1, 2]], None).expect("Step failed");
 
     // Check captured values
     let captured = captured.lock().unwrap();
@@ -165,8 +165,8 @@ fn test_probe_context() {
     // Test with batch_size=2, seq_len=4
     let tokens = vec![0u32, 1, 2, 3];
     let (_logits, _state) = model
-        .forward(&[&tokens, &tokens], None)
-        .expect("Forward failed");
+        .step(&[&tokens, &tokens], None)
+        .expect("Step failed");
 
     let contexts = contexts.lock().unwrap();
 
@@ -184,13 +184,13 @@ fn test_probe_context() {
     println!("Context test passed - captured {} contexts", contexts.len());
 }
 
-/// Test that probes work with variable-length forward pass.
+/// Test that probes work with variable-length step.
 #[test]
-fn test_probe_with_masked_forward() {
+fn test_probe_with_masked_step() {
     let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
     if !std::path::Path::new(model_path).exists() {
         eprintln!(
-            "Skipping test_probe_with_masked_forward: model not found at {}",
+            "Skipping test_probe_with_masked_step: model not found at {}",
             model_path
         );
         return;
@@ -217,13 +217,13 @@ fn test_probe_with_masked_forward() {
 
     let n_layer = model.info.n_layer;
 
-    // Use forward with variable lengths (new API handles this automatically)
+    // Use step with variable lengths (new API handles this automatically)
     let seq1 = vec![0u32, 1, 2]; // length 3
     let seq2 = vec![0u32, 1, 2, 3, 4]; // length 5
 
     let (_logits, _state) = model
-        .forward(&[&seq1, &seq2], None)
-        .expect("Forward failed");
+        .step(&[&seq1, &seq2], None)
+        .expect("Step failed");
 
     let captured = captured.lock().unwrap();
     let wkv_count = captured.get(&HipHook::PostWkv).copied().unwrap_or(0);
@@ -235,5 +235,5 @@ fn test_probe_with_masked_forward() {
         n_layer, wkv_count
     );
 
-    println!("Masked forward test passed - {} PostWkv calls", wkv_count);
+    println!("Masked step test passed - {} PostWkv calls", wkv_count);
 }

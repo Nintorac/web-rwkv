@@ -20,7 +20,7 @@ fn ground_truth_fixtures_exist() -> bool {
         && Path::new("tests/fixtures/ground_truth/step_0.npz").exists()
 }
 
-/// Test HIP model forward pass against official rwkvfla ground truth.
+/// Test HIP model step against official rwkvfla ground truth.
 ///
 /// This is the primary validation that our HIP implementation matches
 /// the reference implementation. Processes 14 tokens sequentially and
@@ -77,8 +77,8 @@ fn test_hip_against_ground_truth() {
 
         // Run single token through HIP model
         let (logits, new_state) = model
-            .forward(&[&[token]], state)
-            .expect(&format!("Forward pass failed at step {}", step));
+            .step(&[&[token]], state)
+            .expect(&format!("Step failed at step {}", step));
         state = Some(new_state);
 
         // Load expected logits from fixture
@@ -273,8 +273,8 @@ fn test_top1_match_all_steps() {
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
         let (logits, new_state) = model
-            .forward(&[&[token]], state)
-            .expect("Forward pass failed");
+            .step(&[&[token]], state)
+            .expect("Step failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
 
@@ -360,8 +360,8 @@ fn test_top5_overlap_all_steps() {
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
         let (logits, new_state) = model
-            .forward(&[&[token]], state)
-            .expect("Forward pass failed");
+            .step(&[&[token]], state)
+            .expect("Step failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
 
@@ -456,8 +456,8 @@ fn test_top10_overlap_all_steps() {
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
         let (logits, new_state) = model
-            .forward(&[&[token]], state)
-            .expect("Forward pass failed");
+            .step(&[&[token]], state)
+            .expect("Step failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
 
@@ -535,8 +535,8 @@ fn test_spearman_rank_correlation() {
         let fixture = TestFixture::load(&fixture_path).expect("Failed to load fixture");
 
         let (logits, new_state) = model
-            .forward(&[&[token]], state)
-            .expect("Forward pass failed");
+            .step(&[&[token]], state)
+            .expect("Step failed");
         state = Some(new_state);
         let expected_logits = fixture.f32("logits");
 
