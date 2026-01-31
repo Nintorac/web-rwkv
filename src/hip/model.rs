@@ -30,19 +30,13 @@ use super::kernels::{
     softplus_decay_f16,
     squared_relu_f16,
     tanh_f16,
-    wkv7_f16_masked,
-    wkv7_lds,
-    wkv7_tiled,
     wkv7_wave_reduce,
-    wkv7_wave_reduce_t1,
-    wkv7_colmajor_t1,
     wkv7_fused_t1,
-    wkv7_batch_loop_t1,
     wkv_bonus_f16,
 };
 use super::pinned::PinnedBuffer;
 use super::scratch::HipScratch;
-use super::scratch::{HipRuntimeConfig, LoraDims, WkvKernelKind};
+use super::scratch::{HipRuntimeConfig, LoraDims};
 use super::tensor::{TensorHip, TensorShape};
 use super::HipProf;
 
@@ -989,28 +983,6 @@ impl Rwkv7Hip {
         Ok(self)
     }
 
-    #[inline]
-    fn select_wkv_kernel(kind: WkvKernelKind, batch: usize, tokens: usize) -> WkvKernelKind {
-        match kind {
-            WkvKernelKind::Auto => {
-                if tokens == 1 {
-                    // Decode specialization
-                    WkvKernelKind::WaveReduceT1
-                } else if batch >= 32 || tokens <= 2 {
-                    // Prefer high-occupancy kernel when latency matters or occupancy low
-                    WkvKernelKind::WaveReduce
-                } else {
-                    WkvKernelKind::Register
-                }
-            }
-            // T=1 only kernels fall back to wave_reduce for T>1
-            WkvKernelKind::WaveReduceT1 | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 | WkvKernelKind::BatchLoopT1 if tokens != 1 => {
-                WkvKernelKind::WaveReduce
-            }
-            other => other,
-        }
-    }
-
     /// Get the configured chunk size, if scratch buffers are initialized.
     pub fn chunk_size(&self) -> Option<usize> {
         self.scratch
@@ -1348,8 +1320,6 @@ impl Rwkv7Hip {
         let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, b, 1);
         let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, b, 1);
         let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
-        let selected_wkv_kernel = Self::select_wkv_kernel(scratch.config.wkv_kernel, b, t);
-
         // Create resized views of scratch buffers
         let mut x = scratch.x.resized_view_mut(std_shape)?;
         let mut x_ln = scratch.x_ln.resized_view_mut(std_shape)?;
@@ -1652,10 +1622,25 @@ impl Rwkv7Hip {
                 let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
                 let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
-                // Run masked WKV7 (skips state updates for padding positions)
+                // Run WKV7: fused_t1 for decode (T=1), wave_reduce for prefill (T>1)
                 prof.time("wkv", || {
-                    match selected_wkv_kernel {
-                        WkvKernelKind::Register => wkv7_f16_masked(
+                    if t == 1 {
+                        // Fused T=1 decode kernel (in-place state)
+                        wkv7_fused_t1(
+                            &w_decay_wkv,
+                            &r_wkv,
+                            &k_ctrl_wkv,
+                            &v_wkv,
+                            &wkv_a_wkv,
+                            &wkv_b_wkv,
+                            &mut wkv_state_gpu[layer_idx],
+                            &mut wkv_out_wkv,
+                            &lens_gpu,
+                            stream,
+                        )?;
+                    } else {
+                        // Wave-reduce prefill kernel (state_in -> state_out)
+                        wkv7_wave_reduce(
                             &w_decay_wkv,
                             &r_wkv,
                             &k_ctrl_wkv,
@@ -1667,115 +1652,12 @@ impl Rwkv7Hip {
                             &mut new_wkv_state,
                             &lens_gpu,
                             stream,
-                        )?,
-                        WkvKernelKind::WaveReduce => wkv7_wave_reduce(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &mut new_wkv_state,
-                            &lens_gpu,
-                            stream,
-                        )?,
-                        WkvKernelKind::WaveReduceT1 => wkv7_wave_reduce_t1(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &mut new_wkv_state,
-                            &lens_gpu,
-                            stream,
-                        )?,
-                        WkvKernelKind::Tiled => {
-                            // Tiled kernel updates state in-place (state_out not used)
-                            wkv7_tiled(
-                                &w_decay_wkv,
-                                &r_wkv,
-                                &k_ctrl_wkv,
-                                &v_wkv,
-                                &wkv_a_wkv,
-                                &wkv_b_wkv,
-                                &mut wkv_state_gpu[layer_idx],
-                                &mut wkv_out_wkv,
-                                &lens_gpu,
-                                stream,
-                            )?;
-                            // State already updated in-place; do not swap buffers.
-                        }
-                        WkvKernelKind::Lds => wkv7_lds(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &mut new_wkv_state,
-                            &lens_gpu,
-                            stream,
-                        )?,
-                        WkvKernelKind::ColmajorT1 => {
-                            // Row-owned kernel updates state in-place
-                            wkv7_colmajor_t1(
-                                &w_decay_wkv,
-                                &r_wkv,
-                                &k_ctrl_wkv,
-                                &v_wkv,
-                                &wkv_a_wkv,
-                                &wkv_b_wkv,
-                                &mut wkv_state_gpu[layer_idx],
-                                &mut wkv_out_wkv,
-                                &lens_gpu,
-                                stream,
-                            )?;
-                        }
-                        WkvKernelKind::FusedT1 => {
-                            wkv7_fused_t1(
-                                &w_decay_wkv,
-                                &r_wkv,
-                                &k_ctrl_wkv,
-                                &v_wkv,
-                                &wkv_a_wkv,
-                                &wkv_b_wkv,
-                                &mut wkv_state_gpu[layer_idx],
-                                &mut wkv_out_wkv,
-                                &lens_gpu,
-                                stream,
-                            )?;
-                        }
-                        WkvKernelKind::BatchLoopT1 => {
-                            wkv7_batch_loop_t1(
-                                &w_decay_wkv,
-                                &r_wkv,
-                                &k_ctrl_wkv,
-                                &v_wkv,
-                                &wkv_a_wkv,
-                                &wkv_b_wkv,
-                                &mut wkv_state_gpu[layer_idx],
-                                &mut wkv_out_wkv,
-                                &lens_gpu,
-                                stream,
-                            )?;
-                        }
-                        WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
+                        )?;
+                        std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                // In-place kernels (Tiled, ColmajorT1, FusedT1, BatchLoopT1) already updated wkv_state_gpu;
-                // only swap for kernels that write to new_wkv_state.
-                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 | WkvKernelKind::BatchLoopT1) {
-                    std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
-                }
 
                 // Group norm on WKV output
                 prof.time("wkv_norm", || {
@@ -1992,8 +1874,6 @@ impl Rwkv7Hip {
         let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, b, 1);
         let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, b, 1);
         let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
-        let selected_wkv_kernel = Self::select_wkv_kernel(scratch.config.wkv_kernel, b, t);
-
         // Create resized views of scratch buffers
         let mut x = scratch.x.resized_view_mut(std_shape)?;
         let mut x_ln = scratch.x_ln.resized_view_mut(std_shape)?;
@@ -2296,49 +2176,11 @@ impl Rwkv7Hip {
                 let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
                 let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
-                // Run masked WKV7 (skips state updates for padding positions)
+                // Run WKV7: fused_t1 for decode (T=1), wave_reduce for prefill (T>1)
                 prof.time("wkv", || {
-                    match selected_wkv_kernel {
-                        WkvKernelKind::Register => wkv7_f16_masked(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &mut new_wkv_state,
-                            &lens_gpu,
-                            stream,
-                        )?,
-                        WkvKernelKind::WaveReduce => wkv7_wave_reduce(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &mut new_wkv_state,
-                            &lens_gpu,
-                            stream,
-                        )?,
-                        WkvKernelKind::WaveReduceT1 => wkv7_wave_reduce_t1(
-                            &w_decay_wkv,
-                            &r_wkv,
-                            &k_ctrl_wkv,
-                            &v_wkv,
-                            &wkv_a_wkv,
-                            &wkv_b_wkv,
-                            &wkv_state_gpu[layer_idx],
-                            &mut wkv_out_wkv,
-                            &mut new_wkv_state,
-                            &lens_gpu,
-                            stream,
-                        )?,
-                        WkvKernelKind::Tiled => wkv7_tiled(
+                    if t == 1 {
+                        // Fused T=1 decode kernel (in-place state)
+                        wkv7_fused_t1(
                             &w_decay_wkv,
                             &r_wkv,
                             &k_ctrl_wkv,
@@ -2349,8 +2191,10 @@ impl Rwkv7Hip {
                             &mut wkv_out_wkv,
                             &lens_gpu,
                             stream,
-                        )?,
-                        WkvKernelKind::Lds => wkv7_lds(
+                        )?;
+                    } else {
+                        // Wave-reduce prefill kernel (state_in -> state_out)
+                        wkv7_wave_reduce(
                             &w_decay_wkv,
                             &r_wkv,
                             &k_ctrl_wkv,
@@ -2362,57 +2206,12 @@ impl Rwkv7Hip {
                             &mut new_wkv_state,
                             &lens_gpu,
                             stream,
-                        )?,
-                        WkvKernelKind::ColmajorT1 => {
-                            wkv7_colmajor_t1(
-                                &w_decay_wkv,
-                                &r_wkv,
-                                &k_ctrl_wkv,
-                                &v_wkv,
-                                &wkv_a_wkv,
-                                &wkv_b_wkv,
-                                &mut wkv_state_gpu[layer_idx],
-                                &mut wkv_out_wkv,
-                                &lens_gpu,
-                                stream,
-                            )?;
-                        }
-                        WkvKernelKind::FusedT1 => {
-                            wkv7_fused_t1(
-                                &w_decay_wkv,
-                                &r_wkv,
-                                &k_ctrl_wkv,
-                                &v_wkv,
-                                &wkv_a_wkv,
-                                &wkv_b_wkv,
-                                &mut wkv_state_gpu[layer_idx],
-                                &mut wkv_out_wkv,
-                                &lens_gpu,
-                                stream,
-                            )?;
-                        }
-                        WkvKernelKind::BatchLoopT1 => {
-                            wkv7_batch_loop_t1(
-                                &w_decay_wkv,
-                                &r_wkv,
-                                &k_ctrl_wkv,
-                                &v_wkv,
-                                &wkv_a_wkv,
-                                &wkv_b_wkv,
-                                &mut wkv_state_gpu[layer_idx],
-                                &mut wkv_out_wkv,
-                                &lens_gpu,
-                                stream,
-                            )?;
-                        }
-                        WkvKernelKind::Auto => unreachable!("Auto resolved in select_wkv_kernel"),
+                        )?;
+                        std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
                     }
                     prof_sync(stream)?;
                     Ok(())
                 })?;
-                if !matches!(selected_wkv_kernel, WkvKernelKind::Tiled | WkvKernelKind::ColmajorT1 | WkvKernelKind::FusedT1 | WkvKernelKind::BatchLoopT1) {
-                    std::mem::swap(&mut wkv_state_gpu[layer_idx], &mut new_wkv_state);
-                }
 
                 // Group norm on WKV output
                 prof.time("wkv_norm", || {

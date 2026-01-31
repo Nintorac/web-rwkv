@@ -19,52 +19,6 @@ use super::pinned::PinnedBuffer;
 use super::tensor::{TensorHip, TensorShape};
 use half::f16;
 
-/// WKV kernel selection for HIP backend.
-///
-/// The default (`Auto`) keeps existing behavior but allows overriding via
-/// `WEB_RWKV_HIP_WKV_KERNEL`. Options:
-/// - `auto`      : legacy register kernel unless heuristic chooses otherwise
-/// - `register`  : original low-latency register-resident kernel
-/// - `wave`      : high-occupancy wave-cooperative kernel (shared memory)
-/// - `lds`       : LDS + atomics kernel for experimentation
-/// - `wave_t1`   : wave-cooperative kernel specialized for decode (T=1)
-/// - `colmajor_t1`: row-owned kernel — 1 thread/row, in-place state, no reductions (T=1)
-/// - `batch_loop_t1`: embed-parallel, serial batch loop — mirrors WGPU strategy (T=1)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WkvKernelKind {
-    Auto,
-    Register,
-    Tiled,
-    WaveReduceT1,
-    WaveReduce,
-    Lds,
-    ColmajorT1,
-    FusedT1,
-    BatchLoopT1,
-}
-
-impl WkvKernelKind {
-    /// Parse from environment variable `WEB_RWKV_HIP_WKV_KERNEL`.
-    /// Returns Auto when unset or unrecognized.
-    fn from_env() -> Self {
-        match std::env::var("WEB_RWKV_HIP_WKV_KERNEL") {
-            Ok(val) => match val.to_ascii_lowercase().as_str() {
-                "register" | "reg" | "orig" => Self::Register,
-                "tiled" | "global" => Self::Tiled,
-                "wave_t1" | "wave-t1" | "wave32_t1" => Self::WaveReduceT1,
-                "wave" | "wave32" | "wave-reduce" | "wave_reduce" => Self::WaveReduce,
-                "lds" | "shared" => Self::Lds,
-                "colmajor_t1" | "colmajor-t1" | "rowowned" | "row_owned" => Self::ColmajorT1,
-                "fused_t1" | "fused-t1" | "fused" => Self::FusedT1,
-                "batch_loop_t1" | "batch-loop-t1" | "batch_loop" => Self::BatchLoopT1,
-                "auto" | "" => Self::Auto,
-                _ => Self::Auto,
-            },
-            Err(_) => Self::Auto,
-        }
-    }
-}
-
 /// Runtime configuration for HIP inference.
 ///
 /// Controls buffer sizing and batching behavior for the forward pass.
@@ -82,10 +36,6 @@ pub struct HipRuntimeConfig {
     /// Keep recurrent state resident on device and avoid per-call H2D/D2H transfers.
     /// Default: false
     pub resident_state: bool,
-
-    /// Which WKV kernel implementation to use.
-    /// Default: Auto (legacy kernel; override via WEB_RWKV_HIP_WKV_KERNEL).
-    pub wkv_kernel: WkvKernelKind,
 }
 
 impl Default for HipRuntimeConfig {
@@ -94,7 +44,6 @@ impl Default for HipRuntimeConfig {
             max_prefill_chunk: 256,
             batch_size: 1,
             resident_state: false,
-            wkv_kernel: WkvKernelKind::from_env(),
         }
     }
 }
@@ -106,7 +55,6 @@ impl HipRuntimeConfig {
             max_prefill_chunk,
             batch_size,
             resident_state: false,
-            wkv_kernel: WkvKernelKind::from_env(),
         }
     }
 
@@ -116,7 +64,6 @@ impl HipRuntimeConfig {
             max_prefill_chunk: 1,
             batch_size: 1,
             resident_state: false,
-            wkv_kernel: WkvKernelKind::from_env(),
         }
     }
 
@@ -126,14 +73,7 @@ impl HipRuntimeConfig {
             max_prefill_chunk: max_chunk,
             batch_size: 1,
             resident_state: false,
-            wkv_kernel: WkvKernelKind::from_env(),
         }
-    }
-
-    /// Explicitly set the WKV kernel implementation.
-    pub fn with_wkv_kernel(mut self, kernel: WkvKernelKind) -> Self {
-        self.wkv_kernel = kernel;
-        self
     }
 }
 

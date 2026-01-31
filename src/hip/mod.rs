@@ -54,7 +54,7 @@ pub use prof::HipProf;
 pub use tensor::{TensorHip, TensorShape, TensorView};
 
 // Re-export scratch buffer types
-pub use scratch::{HipRuntimeConfig, HipScratch, LoraDims, WkvKernelKind};
+pub use scratch::{HipRuntimeConfig, HipScratch, LoraDims};
 
 // Re-export kernel functions
 pub use kernels::{
@@ -83,10 +83,7 @@ pub use kernels::{
     hip_squared_relu,
     hip_tanh,
     hip_token_shift,
-    hip_wkv7,
-    hip_wkv7_coalesced,
     hip_wkv7_gemv,
-    hip_wkv7_masked,
     hip_wkv_bonus,
     l2_norm_f32,
     layer_norm_f32,
@@ -98,16 +95,10 @@ pub use kernels::{
     squared_relu_f32,
     tanh_f32,
     token_shift_f32,
-    wkv7_f16_masked,
-    wkv7_f32,
-    wkv7_f32_coalesced,
-    wkv7_f32_masked,
     // WKV7 rocBLAS GEMV implementation
     wkv7_gemv_f32,
-    wkv7_lds,
-    wkv7_tiled,
     wkv7_wave_reduce,
-    wkv7_wave_reduce_t1,
+    wkv7_fused_t1,
     wkv_bonus_f32,
 };
 
