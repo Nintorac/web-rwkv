@@ -3,10 +3,10 @@
 use half::f16;
 
 use super::Rwkv7ModelInfo;
-use crate::hip::device::Event;
 use crate::hip::device::Stream;
-use crate::hip::ffi::Result;
+use crate::hip::ffi::{check, hip_memcpy_d2h, hip_memcpy_h2d, HipErrorKind, Result};
 use crate::hip::pinned::PinnedBuffer;
+use crate::hip::tensor::TensorHip;
 
 /// State for HIP RWKV7 batched inference.
 ///
@@ -106,89 +106,260 @@ impl HipState {
         }
         self.v_first = None;
     }
-}
 
-/// Completion handle for an asynchronous step (inference) pass.
-///
-/// This struct is returned by `step()` and allows the caller to:
-/// - Check if the GPU computation is complete without blocking (`is_ready()`)
-/// - Wait for completion and retrieve results (`wait()`)
-///
-/// The async step enables overlapping GPU computation with CPU work:
-///
-/// ```ignore
-/// let completion = model.step(&[&tokens], None)?;
-/// // Do CPU work while GPU computes...
-/// let (logits, state) = completion.wait()?;
-/// ```
-#[allow(dead_code)]
-pub struct ForwardCompletion {
-    /// Event that signals when GPU work is complete
-    pub(super) event: Event,
-    /// Stream the work was submitted on
-    pub(super) stream: Stream,
-    /// Pre-allocated buffer for logits (D->H copy is queued but not complete)
-    /// Uses f32 - GPU does f16->f32 conversion before download
-    pub(super) logits_buffer: PinnedBuffer<f32>,
-    /// Pre-allocated buffers for state (D->H copies are queued but not complete)
-    pub(super) state_buffers: ForwardStateBuffers,
-    /// Model info for reconstructing HipState
-    pub(super) n_layer: usize,
-    pub(super) batch_size: usize,
-    /// Sequence lengths for extracting real tokens from padded output
-    pub(super) lens: Vec<usize>,
-    /// Padded chunk size
-    pub(super) chunk_size: usize,
-    /// Vocabulary size
-    pub(super) n_vocab: usize,
-}
+    // ========== Per-batch GPU state read/write ==========
 
-/// Internal buffers for async state download
-pub(super) struct ForwardStateBuffers {
-    pub(super) att_states: Vec<PinnedBuffer<f32>>,
-    pub(super) att_shift_states: Vec<PinnedBuffer<f16>>,
-    pub(super) ffn_states: Vec<PinnedBuffer<f16>>,
-    pub(super) v_first: Option<PinnedBuffer<f16>>,
-}
-
-impl ForwardCompletion {
-    /// Check if the GPU computation has completed (non-blocking).
+    /// Read WKV state for a single batch item from GPU to pinned buffers.
     ///
-    /// Returns `Ok(true)` if all GPU work and data transfers are done,
-    /// `Ok(false)` if still in progress.
-    pub fn is_ready(&self) -> Result<bool> {
-        self.event.query()
-    }
-
-    /// Wait for completion and return the results.
+    /// Returns one `PinnedBuffer<f32>` per layer, each of size
+    /// `head_size * head_size * n_head` (elements for one batch item).
     ///
-    /// This blocks until all GPU work and data transfers are complete,
-    /// then returns the logits and updated state.
-    pub fn wait(self) -> Result<(Vec<f32>, HipState)> {
-        // Block until all GPU work is done
-        self.event.synchronize()?;
-
-        // Extract only real tokens from padded output
-        // Layout: [n_vocab, chunk_size, batch_size] column-major
-        // For batch b, token t: offset = (b * chunk_size + t) * n_vocab
-        // Data is already f32 (GPU did f16->f32 conversion before download)
-        let padded = self.logits_buffer.as_slice();
-        let mut logits = Vec::new();
-        for (b, &real_len) in self.lens.iter().enumerate() {
-            for t in 0..real_len {
-                let offset = (b * self.chunk_size + t) * self.n_vocab;
-                logits.extend_from_slice(&padded[offset..offset + self.n_vocab]);
-            }
+    /// The GPU state layout is `[head_size, head_size, n_head, batch_size]`
+    /// in column-major order, so elements per batch = `head_size * head_size * n_head`.
+    ///
+    /// # Arguments
+    /// * `gpu_states` - Per-layer GPU WKV state tensors
+    /// * `batch_idx` - Index of the batch item to read
+    /// * `batch_size` - Total batch size
+    /// * `stream` - HIP stream for async copy
+    pub fn read_batch_wkv(
+        gpu_states: &[TensorHip<f32>],
+        batch_idx: usize,
+        batch_size: usize,
+        stream: &Stream,
+    ) -> Result<Vec<PinnedBuffer<f32>>> {
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
         }
 
-        let state = HipState {
-            batch_size: self.batch_size,
-            att_states: self.state_buffers.att_states,
-            att_shift_states: self.state_buffers.att_shift_states,
-            ffn_states: self.state_buffers.ffn_states,
-            v_first: self.state_buffers.v_first,
-        };
+        let mut buffers = Vec::with_capacity(gpu_states.len());
+        for gpu_state in gpu_states {
+            let total_elems = gpu_state.shape().len();
+            let elems_per_batch = total_elems / batch_size;
+            let byte_offset = batch_idx * elems_per_batch * std::mem::size_of::<f32>();
+            let byte_count = elems_per_batch * std::mem::size_of::<f32>();
 
-        Ok((logits, state))
+            let mut buf = PinnedBuffer::<f32>::new(elems_per_batch)?;
+            unsafe {
+                let src = (gpu_state.as_ptr() as *const u8).add(byte_offset);
+                check(hip_memcpy_d2h(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    src as *const std::ffi::c_void,
+                    byte_count,
+                    stream.handle(),
+                ))?;
+            }
+            buffers.push(buf);
+        }
+        Ok(buffers)
+    }
+
+    /// Write WKV state for a single batch item from pinned buffers to GPU.
+    ///
+    /// Each buffer should contain `head_size * head_size * n_head` f32 elements.
+    ///
+    /// # Arguments
+    /// * `gpu_states` - Per-layer GPU WKV state tensors
+    /// * `batch_idx` - Index of the batch item to write
+    /// * `batch_size` - Total batch size
+    /// * `buffers` - Per-layer pinned buffers with the state data
+    /// * `stream` - HIP stream for async copy
+    pub fn write_batch_wkv(
+        gpu_states: &mut [TensorHip<f32>],
+        batch_idx: usize,
+        batch_size: usize,
+        buffers: &[PinnedBuffer<f32>],
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
+        }
+        if buffers.len() != gpu_states.len() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "buffer count {} != gpu_state count {}",
+                    buffers.len(),
+                    gpu_states.len()
+                ),
+            });
+        }
+
+        for (gpu_state, buf) in gpu_states.iter_mut().zip(buffers.iter()) {
+            let total_elems = gpu_state.shape().len();
+            let elems_per_batch = total_elems / batch_size;
+            let byte_offset = batch_idx * elems_per_batch * std::mem::size_of::<f32>();
+            let byte_count = elems_per_batch * std::mem::size_of::<f32>();
+
+            if buf.len() != elems_per_batch {
+                return Err(HipErrorKind {
+                    code: -1,
+                    message: format!(
+                        "buffer len {} != expected elems_per_batch {}",
+                        buf.len(),
+                        elems_per_batch
+                    ),
+                });
+            }
+
+            unsafe {
+                let dst = (gpu_state.as_mut_ptr() as *mut u8).add(byte_offset);
+                check(hip_memcpy_h2d(
+                    dst as *mut std::ffi::c_void,
+                    buf.as_ptr() as *const std::ffi::c_void,
+                    byte_count,
+                    stream.handle(),
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read attention shift state for a single batch item from GPU to pinned buffers.
+    ///
+    /// Returns one `PinnedBuffer<f16>` per layer, each of size `n_embd`.
+    /// The GPU state layout is `[n_embd, batch_size]` in column-major order.
+    ///
+    /// # Arguments
+    /// * `gpu_states` - Per-layer GPU attention shift state tensors
+    /// * `batch_idx` - Index of the batch item to read
+    /// * `batch_size` - Total batch size
+    /// * `stream` - HIP stream for async copy
+    pub fn read_batch_att_shift(
+        gpu_states: &[TensorHip<f16>],
+        batch_idx: usize,
+        batch_size: usize,
+        stream: &Stream,
+    ) -> Result<Vec<PinnedBuffer<f16>>> {
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
+        }
+
+        let mut buffers = Vec::with_capacity(gpu_states.len());
+        for gpu_state in gpu_states {
+            let total_elems = gpu_state.shape().len();
+            let elems_per_batch = total_elems / batch_size;
+            let byte_offset = batch_idx * elems_per_batch * std::mem::size_of::<f16>();
+            let byte_count = elems_per_batch * std::mem::size_of::<f16>();
+
+            let mut buf = PinnedBuffer::<f16>::new(elems_per_batch)?;
+            unsafe {
+                let src = (gpu_state.as_ptr() as *const u8).add(byte_offset);
+                check(hip_memcpy_d2h(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    src as *const std::ffi::c_void,
+                    byte_count,
+                    stream.handle(),
+                ))?;
+            }
+            buffers.push(buf);
+        }
+        Ok(buffers)
+    }
+
+    /// Write attention shift state for a single batch item from pinned buffers to GPU.
+    ///
+    /// Each buffer should contain `n_embd` f16 elements.
+    pub fn write_batch_att_shift(
+        gpu_states: &mut [TensorHip<f16>],
+        batch_idx: usize,
+        batch_size: usize,
+        buffers: &[PinnedBuffer<f16>],
+        stream: &Stream,
+    ) -> Result<()> {
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
+        }
+        if buffers.len() != gpu_states.len() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "buffer count {} != gpu_state count {}",
+                    buffers.len(),
+                    gpu_states.len()
+                ),
+            });
+        }
+
+        for (gpu_state, buf) in gpu_states.iter_mut().zip(buffers.iter()) {
+            let total_elems = gpu_state.shape().len();
+            let elems_per_batch = total_elems / batch_size;
+            let byte_offset = batch_idx * elems_per_batch * std::mem::size_of::<f16>();
+            let byte_count = elems_per_batch * std::mem::size_of::<f16>();
+
+            if buf.len() != elems_per_batch {
+                return Err(HipErrorKind {
+                    code: -1,
+                    message: format!(
+                        "buffer len {} != expected elems_per_batch {}",
+                        buf.len(),
+                        elems_per_batch
+                    ),
+                });
+            }
+
+            unsafe {
+                let dst = (gpu_state.as_mut_ptr() as *mut u8).add(byte_offset);
+                check(hip_memcpy_h2d(
+                    dst as *mut std::ffi::c_void,
+                    buf.as_ptr() as *const std::ffi::c_void,
+                    byte_count,
+                    stream.handle(),
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read FFN state for a single batch item from GPU to pinned buffers.
+    ///
+    /// Returns one `PinnedBuffer<f16>` per layer, each of size `n_embd`.
+    /// The GPU state layout is `[n_embd, batch_size]` in column-major order.
+    pub fn read_batch_ffn(
+        gpu_states: &[TensorHip<f16>],
+        batch_idx: usize,
+        batch_size: usize,
+        stream: &Stream,
+    ) -> Result<Vec<PinnedBuffer<f16>>> {
+        // Same layout as att_shift: [n_embd, batch_size]
+        Self::read_batch_att_shift(gpu_states, batch_idx, batch_size, stream)
+    }
+
+    /// Write FFN state for a single batch item from pinned buffers to GPU.
+    ///
+    /// Each buffer should contain `n_embd` f16 elements.
+    pub fn write_batch_ffn(
+        gpu_states: &mut [TensorHip<f16>],
+        batch_idx: usize,
+        batch_size: usize,
+        buffers: &[PinnedBuffer<f16>],
+        stream: &Stream,
+    ) -> Result<()> {
+        // Same layout as att_shift: [n_embd, batch_size]
+        Self::write_batch_att_shift(gpu_states, batch_idx, batch_size, buffers, stream)
     }
 }

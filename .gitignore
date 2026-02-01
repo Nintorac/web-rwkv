@@ -8,4 +8,7 @@ Cargo.lock
 *.safetensors
 
 __pycache__/
-repo/
+repos/
+benchmarks/results/
+results*
+.rocprofv3/

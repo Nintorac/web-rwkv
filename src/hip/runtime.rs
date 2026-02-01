@@ -3,8 +3,6 @@
 //! This module provides `HipRuntime`, which wraps `Rwkv7Hip` and manages
 //! state with thread-safe access for integration with the web-rwkv runtime interface.
 
-use std::sync::Mutex;
-
 use futures::future::BoxFuture;
 
 use super::scratch::HipRuntimeConfig;
@@ -64,7 +62,6 @@ pub fn softmax_one_cpu(input: TensorCpu<f32>) -> Result<TensorCpu<f32>, TensorEr
 /// runtime interface.
 pub struct HipRuntime {
     model: Rwkv7Hip,
-    state: Mutex<Option<HipState>>,
     num_batch: usize,
     chunk_size: usize,
 }
@@ -84,16 +81,13 @@ impl HipRuntime {
     /// ```
     pub fn with_config(
         model: Rwkv7Hip,
-        mut config: HipRuntimeConfig,
+        config: HipRuntimeConfig,
     ) -> Result<Self, super::HipErrorKind> {
-        config.resident_state = true;
         let num_batch = config.batch_size;
         let chunk_size = config.max_prefill_chunk;
         let model = model.with_config(config)?;
-        let state = HipState::new(&model.info, num_batch)?;
         Ok(Self {
             model,
-            state: Mutex::new(Some(state)),
             num_batch,
             chunk_size,
         })
@@ -132,18 +126,11 @@ impl HipRuntime {
         self.model
             .reset_resident_state()
             .expect("Failed to reset HIP resident state");
-        let mut state_guard = self.state.lock().unwrap();
-        if let Some(state) = state_guard.as_mut() {
-            state.reset();
-        }
     }
 
     /// Get a snapshot of current state (for testing/debugging).
     pub fn get_state_snapshot(&self) -> HipState {
-        let state_guard = self.state.lock().unwrap();
-        state_guard.as_ref().cloned().unwrap_or_else(|| {
-            HipState::new(&self.model.info, self.num_batch).expect("Failed to allocate HIP state")
-        })
+        self.model.read_state(0).expect("Failed to read GPU state")
     }
 
     /// Run inference on a batch of token sequences.
@@ -166,20 +153,7 @@ impl HipRuntime {
             });
         }
 
-        // Take state from mutex, run step, put new state back
-        let old_state = {
-            let mut state_guard = self.state.lock().unwrap();
-            state_guard.take().unwrap_or_else(|| {
-                HipState::new(&self.model.info, self.num_batch)
-                    .expect("Failed to allocate HIP state")
-            })
-        };
-
-        let (logits, new_state) = self.model.step(sequences, Some(old_state))?;
-
-        // Store the updated state
-        let mut state_guard = self.state.lock().unwrap();
-        *state_guard = Some(new_state);
+        let logits = self.model.infer_resident(sequences)?;
 
         // Convert to TensorCpu
         // Output is flattened: [batch_0_tokens..., batch_1_tokens..., ...]
@@ -1099,7 +1073,7 @@ mod tests {
         let state_padded = runtime_padded.get_state_snapshot();
 
         // Compare the state for batch 0 from padded vs unpadded
-        // Note: The padded runtime has batch_size=2, so we need to extract batch 0's state
+        // Both snapshots are batch_size=1 (read_state(0) extracts batch 0)
         let n_layer = state_unpadded.att_states.len();
 
         println!("Comparing states across {} layers...", n_layer);

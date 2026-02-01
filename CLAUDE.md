@@ -245,6 +245,10 @@ uv pip install -r requirements.txt
 python3 scripts/foo.py
 ```
 
+## Platform Assumptions
+
+Never assume what tools, hardware, SDKs, or runtime features are available. Always investigate the actual system capabilities before planning or writing code. Check installed toolchains, device properties, available APIs, and supported features rather than guessing based on prior knowledge.
+
 ## Compact Instructions
 
 When context is compacted, preserve:

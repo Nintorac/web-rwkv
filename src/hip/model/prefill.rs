@@ -39,9 +39,8 @@ pub struct WkvInput<'a> {
 /// Trait abstracting the WKV7 attention kernel.
 ///
 /// Implementations must handle both the output computation and state update.
-/// The caller provides the current per-layer recurrent state and a scratch
-/// state buffer; the implementation may use them in whichever way is natural
-/// (in-place update, separate in/out with swap, etc.).
+/// The caller provides the current per-layer recurrent state which is updated
+/// in-place by all implementations.
 ///
 /// # Adding a new implementation
 ///
@@ -56,17 +55,13 @@ pub trait WkvKernel: Send + Sync {
     /// # Arguments
     /// * `input` -- Pre-shaped WKV input tensors
     /// * `state` -- Per-layer recurrent state `[head_size, head_size, n_head, B]` (f32).
-    ///   Implementations that update state in-place (e.g., fused T=1) mutate this directly.
-    /// * `state_scratch` -- Scratch buffer with the same shape as `state`. Implementations
-    ///   that need separate state_in / state_out (e.g., wave_reduce) write the new state
-    ///   here and then swap with `state`.
+    ///   Updated in-place by all implementations.
     /// * `output` -- Output tensor `[head_size, n_head, T, B]` (f16)
     /// * `stream` -- HIP stream for kernel launches
     fn compute(
         &self,
         input: &WkvInput<'_>,
         state: &mut TensorHip<f32>,
-        state_scratch: &mut TensorHip<f32>,
         output: &mut TensorHip<f16>,
         stream: &Stream,
     ) -> Result<()>;
@@ -84,9 +79,8 @@ pub trait WkvKernel: Send + Sync {
 
 /// Wave-cooperative WKV7 kernel for T>=1 prefill.
 ///
-/// Uses separate state_in / state_out buffers and a wave-shuffle reduction.
-/// After computing, swaps `state` and `state_scratch` so that `state` holds
-/// the updated values.
+/// Uses wave-shuffle reduction with in-place state update. The HIP kernel
+/// loads state into LDS before writing, so aliasing is safe.
 pub struct WaveReduceWkv;
 
 impl WkvKernel for WaveReduceWkv {
@@ -94,7 +88,6 @@ impl WkvKernel for WaveReduceWkv {
         &self,
         input: &WkvInput<'_>,
         state: &mut TensorHip<f32>,
-        state_scratch: &mut TensorHip<f32>,
         output: &mut TensorHip<f16>,
         stream: &Stream,
     ) -> Result<()> {
@@ -105,15 +98,11 @@ impl WkvKernel for WaveReduceWkv {
             input.v,
             input.a,
             input.b,
-            state,          // state_in
+            state,
             output,
-            state_scratch,  // state_out
             input.lengths,
             stream,
-        )?;
-        // Swap so that `state` now holds the newly computed state.
-        std::mem::swap(state, state_scratch);
-        Ok(())
+        )
     }
 
     fn supports_multi_token(&self) -> bool {
@@ -128,7 +117,6 @@ impl WkvKernel for WaveReduceWkv {
 /// Fused WKV7 kernel optimized for T=1 decode.
 ///
 /// Updates state in-place (single mutable tensor, no separate in/out).
-/// The `state_scratch` buffer is unused by this kernel.
 pub struct FusedT1Wkv;
 
 impl WkvKernel for FusedT1Wkv {
@@ -136,7 +124,6 @@ impl WkvKernel for FusedT1Wkv {
         &self,
         input: &WkvInput<'_>,
         state: &mut TensorHip<f32>,
-        _state_scratch: &mut TensorHip<f32>,
         output: &mut TensorHip<f16>,
         stream: &Stream,
     ) -> Result<()> {

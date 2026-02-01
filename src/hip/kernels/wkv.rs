@@ -207,8 +207,9 @@ pub fn hip_wkv_bonus(
 /// shuffle-based reductions instead of atomics. It should have better
 /// occupancy than the original register-based kernel.
 ///
-/// # Arguments
-/// State is copied from state_in to state_out.
+/// State is updated in-place. The HIP kernel loads state into LDS before
+/// writing, so passing the same buffer as both state_in and state_out
+/// to the FFI function is safe.
 pub fn wkv7_wave_reduce(
     w_decay: &TensorHip<f16>,
     q: &TensorHip<f16>,
@@ -216,9 +217,8 @@ pub fn wkv7_wave_reduce(
     v: &TensorHip<f16>,
     a: &TensorHip<f16>,
     b: &TensorHip<f16>,
-    state_in: &TensorHip<f32>,
+    state: &mut TensorHip<f32>,
     output: &mut TensorHip<f16>,
-    state_out: &mut TensorHip<f32>,
     lengths: &TensorHip<i32>,
     stream: &Stream,
 ) -> Result<()> {
@@ -252,14 +252,13 @@ pub fn wkv7_wave_reduce(
     }
 
     let state_shape = TensorShape::new(n, n, h, b_size);
-    if state_in.shape() != state_shape || state_out.shape() != state_shape {
+    if state.shape() != state_shape {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
-                "State shape mismatch: expected {}, got state_in={}, state_out={}",
+                "State shape mismatch: expected {}, got {}",
                 state_shape,
-                state_in.shape(),
-                state_out.shape()
+                state.shape()
             ),
         });
     }
@@ -276,6 +275,8 @@ pub fn wkv7_wave_reduce(
         });
     }
 
+    // Pass state.as_ptr() as state_in and state.as_mut_ptr() as state_out.
+    // The kernel loads state into LDS before writing, so aliasing is safe.
     unsafe {
         check(launch_wkv7_wave_reduce(
             w_decay.as_ptr(),
@@ -284,9 +285,9 @@ pub fn wkv7_wave_reduce(
             v.as_ptr(),
             a.as_ptr(),
             b.as_ptr(),
-            state_in.as_ptr(),
+            state.as_ptr(),
             output.as_mut_ptr(),
-            state_out.as_mut_ptr(),
+            state.as_mut_ptr(),
             lengths.as_ptr(),
             n as c_int,
             h as c_int,

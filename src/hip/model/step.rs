@@ -56,18 +56,17 @@ fn download_f32(tensor: &TensorHip<f32>, stream: &Stream) -> Result<Vec<f32>> {
 }
 
 impl Rwkv7Hip {
-    /// Internal step implementation with async logits copy.
+    /// Core GPU forward pass. State is always GPU-resident in scratch buffers.
     ///
-    /// Instead of synchronously downloading logits, this copies to a provided pinned
-    /// buffer asynchronously. The caller must sync the stream before reading the buffer.
-    pub(super) fn step_inner(
+    /// Runs the full layer loop, writing logits to scratch.logits_staging.
+    /// The caller must sync the stream before reading the staging buffer.
+    /// State persists in scratch between calls.
+    pub(super) fn dispatch(
         &self,
         tokens: &[&[u32]],
-        state: &mut HipState,
         scratch: &mut HipScratch,
         lens: &[usize],
     ) -> Result<()> {
-        let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
         let t = tokens[0].len();
 
@@ -185,50 +184,17 @@ impl Rwkv7Hip {
             }
         }
 
-        let (mut att_shift_gpu, mut ffn_shift_gpu, mut wkv_state_gpu) = if use_resident_state {
-            (
-                std::mem::take(&mut scratch.att_shift_state_gpu),
-                std::mem::take(&mut scratch.ffn_state_gpu),
-                std::mem::take(&mut scratch.wkv_state_gpu),
-            )
-        } else {
-            {
-                // Upload state to GPU using pinned async transfers
-                let mut att_shift_gpu = Vec::with_capacity(n_layer);
-                for s in &state.att_shift_states {
-                    let mut gpu_tensor = TensorHip::<f16>::new(state_shape)?;
-                    unsafe {
-                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
-                    }
-                    att_shift_gpu.push(gpu_tensor);
-                }
-
-                let mut ffn_shift_gpu = Vec::with_capacity(n_layer);
-                for s in &state.ffn_states {
-                    let mut gpu_tensor = TensorHip::<f16>::new(state_shape)?;
-                    unsafe {
-                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
-                    }
-                    ffn_shift_gpu.push(gpu_tensor);
-                }
-
-                let mut wkv_state_gpu = Vec::with_capacity(n_layer);
-                for s in &state.att_states {
-                    let mut gpu_tensor = TensorHip::<f32>::new(wkv_state_shape)?;
-                    unsafe {
-                        s.copy_to_device_async(gpu_tensor.as_mut_ptr(), stream.handle())?;
-                    }
-                    wkv_state_gpu.push(gpu_tensor);
-                }
-                (att_shift_gpu, ffn_shift_gpu, wkv_state_gpu)
-            }
-        };
+        // State is always GPU-resident in scratch buffers
+        let (mut att_shift_gpu, mut ffn_shift_gpu, mut wkv_state_gpu) = (
+            std::mem::take(&mut scratch.att_shift_state_gpu),
+            std::mem::take(&mut scratch.ffn_state_gpu),
+            std::mem::take(&mut scratch.wkv_state_gpu),
+        );
 
         let result = (|| {
             // Temporary buffers
             let mut new_att_shift = scratch.new_att_shift.resized_view_mut(state_shape)?;
             let mut new_ffn_shift = scratch.new_ffn_shift.resized_view_mut(state_shape)?;
-            let mut new_wkv_state = scratch.new_wkv_state.resized_view_mut(wkv_state_shape)?;
             let mut temp1 = scratch.temp1.resized_view_mut(std_shape)?;
             let mut temp2 = scratch.temp2.resized_view_mut(std_shape)?;
 
@@ -357,8 +323,12 @@ impl Rwkv7Hip {
                     )?;
                 }
 
-                // Update shift state - new_att_shift has correct state from masked kernel
-                std::mem::swap(&mut new_att_shift, &mut att_shift_gpu[layer_idx]);
+                // Update shift state - copy from new_att_shift into the layer's state buffer.
+                // We use copy instead of swap because resized_view_mut shares the
+                // underlying device pointer with scratch.new_att_shift. Swapping would
+                // cause att_shift_gpu[layer_idx] to alias scratch.new_att_shift on the
+                // next dispatch() call, corrupting state.
+                copy_tensor_f16(&new_att_shift, &mut att_shift_gpu[layer_idx], stream)?;
 
                 // PostAttTokenShift probe (stacked: xr, xw, xk, xv, xa, xg)
                 #[cfg(feature = "hip-probes")]
@@ -581,7 +551,6 @@ impl Rwkv7Hip {
                     wkv_kernel.compute(
                         &wkv_input,
                         &mut wkv_state_gpu[layer_idx],
-                        &mut new_wkv_state,
                         &mut wkv_out_wkv,
                         stream,
                     )?;
@@ -738,8 +707,8 @@ impl Rwkv7Hip {
                     )?;
                 }
 
-                // Update FFN shift state - new_ffn_shift has correct state from masked kernel
-                std::mem::swap(&mut new_ffn_shift, &mut ffn_shift_gpu[layer_idx]);
+                // Update FFN shift state - copy instead of swap (same aliasing reason as att_shift)
+                copy_tensor_f16(&new_ffn_shift, &mut ffn_shift_gpu[layer_idx], stream)?;
 
                 // PostFfnTokenShift probe
                 #[cfg(feature = "hip-probes")]
@@ -867,67 +836,26 @@ impl Rwkv7Hip {
             Ok(())
         })();
 
-        if use_resident_state {
-            scratch.att_shift_state_gpu = att_shift_gpu;
-            scratch.ffn_state_gpu = ffn_shift_gpu;
-            scratch.wkv_state_gpu = wkv_state_gpu;
-        } else if result.is_ok() {
-            {
-                // Download state back to host using pinned async transfers
-                for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
-                    unsafe {
-                        state.att_shift_states[i]
-                            .copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
-                    }
-                }
-                for (i, gpu_state) in ffn_shift_gpu.iter().enumerate() {
-                    unsafe {
-                        state.ffn_states[i]
-                            .copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
-                    }
-                }
-                for (i, gpu_state) in wkv_state_gpu.iter().enumerate() {
-                    unsafe {
-                        state.att_states[i]
-                            .copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
-                    }
-                }
-            }
-        }
+        // Always put state back to scratch
+        scratch.att_shift_state_gpu = att_shift_gpu;
+        scratch.ffn_state_gpu = ffn_shift_gpu;
+        scratch.wkv_state_gpu = wkv_state_gpu;
 
         result
     }
 
     /// Run one inference step on variable-length input sequences.
     ///
-    /// This method queues all GPU work and data transfers
-    /// without waiting for them to complete. The caller can check completion
-    /// status or wait for results using the returned `ForwardCompletion`.
-    ///
-    /// This enables overlapping GPU computation with CPU work:
-    ///
-    /// ```ignore
-    /// let completion = model.step(&[&tokens], None)?;
-    ///
-    /// // Do CPU work while GPU computes...
-    /// process_other_data();
-    ///
-    /// // Wait for results when needed
-    /// let (logits, state) = completion.wait()?;
-    /// ```
-    ///
-    /// # Note
-    ///
-    /// This uses HIP events for synchronization. On some ROCm versions,
-    /// stream creation may fail; in that case this falls back to the null
-    /// stream which provides less overlap but still works correctly.
+    /// This is the backward-compatible wrapper that manages CPU<->GPU state
+    /// transfers around `dispatch()`. For GPU-resident state without per-call
+    /// H2D/D2H overhead, use `HipRuntime::infer()` instead.
     ///
     /// # Arguments
     /// * `x` - Batch of token sequences
     /// * `state` - Optional initial state (None = fresh zeros)
     ///
     /// # Returns
-    /// A `ForwardCompletion` handle that can be used to check status or wait for results.
+    /// `(logits, new_state)` where logits contains `n_vocab` floats per input token.
     pub fn step(
         &self,
         x: &[&[u32]],
@@ -973,8 +901,6 @@ impl Rwkv7Hip {
             });
         }
 
-        // For async, we only support single-chunk processing for now
-        // Multi-chunk async would require more complex state management
         if max_len > chunk_size {
             return Err(HipErrorKind {
                 code: -1,
@@ -985,22 +911,150 @@ impl Rwkv7Hip {
             });
         }
 
-        // Initialize state
-        let current_state = match state {
-            Some(s) => {
-                if s.batch_size != batch_size {
-                    return Err(HipErrorKind {
-                        code: -1,
-                        message: format!(
-                            "State batch_size mismatch: state has {} but input has {} sequences",
-                            s.batch_size, batch_size
-                        ),
-                    });
-                }
-                s
+        // Validate state batch size if provided
+        if let Some(ref s) = state {
+            if s.batch_size != batch_size {
+                return Err(HipErrorKind {
+                    code: -1,
+                    message: format!(
+                        "State batch_size mismatch: state has {} but input has {} sequences",
+                        s.batch_size, batch_size
+                    ),
+                });
             }
-            None => HipState::new(&self.info, batch_size)?,
-        };
+        }
+
+        // Pad sequences to chunk_size
+        let chunk_tokens: Vec<Vec<u32>> = x
+            .iter()
+            .map(|seq| {
+                let mut padded = seq.to_vec();
+                padded.resize(chunk_size, 0);
+                padded
+            })
+            .collect();
+        let chunk_refs: Vec<&[u32]> = chunk_tokens.iter().map(|v| v.as_slice()).collect();
+
+        let n_vocab = self.info.n_vocab;
+        let n_layer = self.info.n_layer;
+
+        // H2D: upload CPU state to scratch GPU buffers (or reset to zeros)
+        match state {
+            Some(ref s) => {
+                let stream_handle = scratch.blas_ctx.stream().handle();
+                for i in 0..n_layer {
+                    unsafe {
+                        s.att_shift_states[i].copy_to_device_async(
+                            scratch.att_shift_state_gpu[i].as_mut_ptr(),
+                            stream_handle,
+                        )?;
+                        s.ffn_states[i].copy_to_device_async(
+                            scratch.ffn_state_gpu[i].as_mut_ptr(),
+                            stream_handle,
+                        )?;
+                        s.att_states[i].copy_to_device_async(
+                            scratch.wkv_state_gpu[i].as_mut_ptr(),
+                            stream_handle,
+                        )?;
+                    }
+                }
+            }
+            None => {
+                scratch.reset_state_gpu()?;
+            }
+        }
+
+        // Run the forward pass (all GPU-resident, no state param)
+        self.dispatch(&chunk_refs, scratch, &lens)?;
+
+        // D2H: download scratch GPU buffers to a fresh HipState
+        let stream_handle = scratch.blas_ctx.stream().handle();
+        let mut new_state = HipState::new(&self.info, batch_size)?;
+        for i in 0..n_layer {
+            unsafe {
+                new_state.att_shift_states[i].copy_from_device_async(
+                    scratch.att_shift_state_gpu[i].as_ptr(),
+                    stream_handle,
+                )?;
+                new_state.ffn_states[i].copy_from_device_async(
+                    scratch.ffn_state_gpu[i].as_ptr(),
+                    stream_handle,
+                )?;
+                new_state.att_states[i].copy_from_device_async(
+                    scratch.wkv_state_gpu[i].as_ptr(),
+                    stream_handle,
+                )?;
+            }
+        }
+
+        // Sync the stream -- all GPU work and D->H transfers are now complete
+        scratch.blas_ctx.synchronize()?;
+
+        // Extract real tokens from padded staging buffer
+        let padded = scratch.logits_staging.as_slice();
+        let mut logits = Vec::new();
+        for (b, &real_len) in lens.iter().enumerate() {
+            for t in 0..real_len {
+                let offset = (b * chunk_size + t) * n_vocab;
+                logits.extend_from_slice(&padded[offset..offset + n_vocab]);
+            }
+        }
+
+        Ok((logits, new_state))
+    }
+
+    /// Run inference using GPU-resident state. No H2D/D2H state transfers.
+    /// State persists in scratch between calls. Used by `HipRuntime::infer()`.
+    pub(crate) fn infer_resident(&self, x: &[&[u32]]) -> Result<Vec<f32>> {
+        let batch_size = x.len();
+        if batch_size == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "Empty batch".to_string(),
+            });
+        }
+
+        // Get scratch and config
+        let mut scratch_ref = self.scratch.lock().unwrap();
+        let scratch = scratch_ref.as_mut().ok_or_else(|| HipErrorKind {
+            code: -1,
+            message: "Scratch not initialized - call with_config() first".to_string(),
+        })?;
+
+        let chunk_size = scratch.config.max_prefill_chunk;
+        let max_batch = scratch.config.batch_size;
+
+        // Validate batch size
+        if batch_size > max_batch {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "Batch size {} exceeds configured max {}",
+                    batch_size, max_batch
+                ),
+            });
+        }
+
+        // Get real lengths and validate
+        let lens: Vec<usize> = x.iter().map(|s| s.len()).collect();
+        let max_len = *lens.iter().max().unwrap_or(&0);
+
+        if max_len == 0 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: "All sequences are empty".to_string(),
+            });
+        }
+
+        if max_len > chunk_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "infer_resident() requires sequence length <= chunk_size ({} vs {})",
+                    max_len, chunk_size
+                ),
+            });
+        }
 
         // Pad sequences to chunk_size
         let chunk_tokens: Vec<Vec<u32>> = x
@@ -1015,16 +1069,10 @@ impl Rwkv7Hip {
 
         let n_vocab = self.info.n_vocab;
 
-        // Run the step (queues work but doesn't sync)
-        let mut current_state = current_state;
-        self.step_inner(
-            &chunk_refs,
-            &mut current_state,
-            scratch,
-            &lens,
-        )?;
+        // Run the forward pass (state stays GPU-resident, no H2D/D2H)
+        self.dispatch(&chunk_refs, scratch, &lens)?;
 
-        // Sync the stream -- all GPU work and D->H transfers are now complete
+        // Sync the stream
         let stream = scratch.blas_ctx.stream();
         stream.synchronize()?;
 
@@ -1038,7 +1086,7 @@ impl Rwkv7Hip {
             }
         }
 
-        Ok((logits, current_state))
+        Ok(logits)
     }
 }
 

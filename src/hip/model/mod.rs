@@ -7,7 +7,7 @@ pub mod weights;
 
 // Re-export all public types from submodules
 pub use prefill::{FusedT1Wkv, WaveReduceWkv, WkvInput, WkvKernel};
-pub use state::{ForwardCompletion, HipState};
+pub use state::HipState;
 pub use weights::{
     AttentionHip, EmbedHip, FfnHip, HeadHip, LayerHip, LayerNormHip,
 };
@@ -400,6 +400,122 @@ impl Rwkv7Hip {
             message: "Scratch not initialized - call with_config() first".to_string(),
         })?;
         scratch.reset_state_gpu()?;
+        Ok(())
+    }
+
+    /// Read the current GPU-resident state for a single batch item back to CPU.
+    ///
+    /// The returned `HipState` has `batch_size = 1` and contains the state
+    /// for just the requested batch item.
+    ///
+    /// The caller must ensure no inference is in flight on this model when
+    /// calling this method (the scratch mutex is held for the duration).
+    ///
+    /// Similar to WebGPU's `State::back(batch)` API.
+    pub fn read_state(&self, batch_idx: usize) -> Result<HipState> {
+        let mut scratch_ref = self.scratch.lock().unwrap();
+        let scratch = scratch_ref.as_mut().ok_or_else(|| HipErrorKind {
+            code: -1,
+            message: "Scratch not initialized - call with_config() first".to_string(),
+        })?;
+
+        let batch_size = scratch.config.batch_size;
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
+        }
+
+        let stream = scratch.blas_ctx.stream();
+
+        let att_states = HipState::read_batch_wkv(
+            &scratch.wkv_state_gpu,
+            batch_idx,
+            batch_size,
+            stream,
+        )?;
+        let att_shift_states = HipState::read_batch_att_shift(
+            &scratch.att_shift_state_gpu,
+            batch_idx,
+            batch_size,
+            stream,
+        )?;
+        let ffn_states = HipState::read_batch_ffn(
+            &scratch.ffn_state_gpu,
+            batch_idx,
+            batch_size,
+            stream,
+        )?;
+
+        // Synchronize to ensure all D2H copies complete
+        stream.synchronize()?;
+
+        Ok(HipState {
+            batch_size: 1,
+            att_states,
+            att_shift_states,
+            ffn_states,
+            v_first: None,
+        })
+    }
+
+    /// Write a CPU state into the GPU-resident state for a single batch item.
+    ///
+    /// The provided `HipState` should have `batch_size = 1`.
+    ///
+    /// The caller must ensure no inference is in flight on this model when
+    /// calling this method (the scratch mutex is held for the duration).
+    ///
+    /// Similar to WebGPU's `State::write(tensor, batch)` API.
+    pub fn write_state(&self, batch_idx: usize, state: &HipState) -> Result<()> {
+        let mut scratch_ref = self.scratch.lock().unwrap();
+        let scratch = scratch_ref.as_mut().ok_or_else(|| HipErrorKind {
+            code: -1,
+            message: "Scratch not initialized - call with_config() first".to_string(),
+        })?;
+
+        let batch_size = scratch.config.batch_size;
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
+        }
+
+        let stream = scratch.blas_ctx.stream();
+
+        HipState::write_batch_wkv(
+            &mut scratch.wkv_state_gpu,
+            batch_idx,
+            batch_size,
+            &state.att_states,
+            stream,
+        )?;
+        HipState::write_batch_att_shift(
+            &mut scratch.att_shift_state_gpu,
+            batch_idx,
+            batch_size,
+            &state.att_shift_states,
+            stream,
+        )?;
+        HipState::write_batch_ffn(
+            &mut scratch.ffn_state_gpu,
+            batch_idx,
+            batch_size,
+            &state.ffn_states,
+            stream,
+        )?;
+
+        // Synchronize to ensure all H2D copies complete
+        stream.synchronize()?;
+
         Ok(())
     }
 }

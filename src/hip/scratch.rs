@@ -32,10 +32,6 @@ pub struct HipRuntimeConfig {
     /// Batch size (number of sequences processed in parallel).
     /// Default: 1
     pub batch_size: usize,
-
-    /// Keep recurrent state resident on device and avoid per-call H2D/D2H transfers.
-    /// Default: false
-    pub resident_state: bool,
 }
 
 impl Default for HipRuntimeConfig {
@@ -43,7 +39,6 @@ impl Default for HipRuntimeConfig {
         Self {
             max_prefill_chunk: 256,
             batch_size: 1,
-            resident_state: false,
         }
     }
 }
@@ -54,7 +49,6 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk,
             batch_size,
-            resident_state: false,
         }
     }
 
@@ -63,7 +57,6 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk: 1,
             batch_size: 1,
-            resident_state: false,
         }
     }
 
@@ -72,7 +65,6 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk: max_chunk,
             batch_size: 1,
-            resident_state: false,
         }
     }
 }
@@ -245,9 +237,6 @@ pub struct HipScratch {
     /// Temporary shift state output (state shape)
     pub new_ffn_shift: TensorHip<f16>,
 
-    /// Temporary WKV state output (wkv state shape)
-    pub new_wkv_state: TensorHip<f32>,
-
     // ========== Output buffer [n_vocab, T, B] ==========
     /// Final logits output (f16)
     pub logits: TensorHip<f16>,
@@ -379,7 +368,6 @@ impl HipScratch {
             temp2: TensorHip::new(std_shape)?,
             new_att_shift: TensorHip::new(state_shape)?,
             new_ffn_shift: TensorHip::new(state_shape)?,
-            new_wkv_state: TensorHip::new(wkv_state_shape)?,
 
             // Output buffer
             logits: TensorHip::new(out_shape)?,
