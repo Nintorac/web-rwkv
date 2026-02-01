@@ -2,13 +2,16 @@
 //!
 //! Stage 1: [`fla_cumsum`] — cumulative decay scan within each chunk.
 //! Stage 2: [`fla_intra`] — intra-chunk attention matrices.
+//! Stage 3: [`fla_wy_repr`] — WY representation (matrix inversion + w/u computation).
 
 use std::ffi::c_int;
 
 use half::f16;
 
 use crate::hip::device::Stream;
-use crate::hip::ffi::{check, launch_fla_cumsum, launch_fla_intra, HipErrorKind, Result};
+use crate::hip::ffi::{
+    check, launch_fla_cumsum, launch_fla_intra, launch_fla_wy_repr, HipErrorKind, Result,
+};
 use crate::hip::tensor::TensorHip;
 
 /// Launch the FLA cumulative decay scan kernel (Stage 1).
@@ -330,6 +333,171 @@ pub fn fla_intra(
             A_qb.as_mut_ptr(),
             A_ak.as_mut_ptr(),
             A_ab.as_mut_ptr(),
+            chunk_indices.as_ptr(),
+            cu_seqlens.as_ptr(),
+            k_dim as c_int,
+            h as c_int,
+            chunk_size as c_int,
+            total_chunks as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Launch the FLA WY representation kernel (Stage 3).
+///
+/// This kernel has two parts:
+/// - **Part A** (`kernel_fla_wy_inv`) inverts the strict lower-triangular `A_ab` matrix
+///   per chunk via forward substitution, producing `A_ab_inv = (I - A_ab)^{-1}`.
+///
+/// - **Part B** (`kernel_fla_wy_wu`) computes:
+///   - `w = A_ab_inv @ ag` — WY representation of decay-scaled adaptation
+///   - `u = (A_ab_inv @ A_ak) @ v` — WY representation of state contribution
+///
+///   These encode how chunk-internal recurrence affects the state, enabling the
+///   inter-chunk propagation (Stage 4) to incorporate within-chunk dynamics.
+///
+/// # Arguments
+/// * `a_ab` - Intra-chunk attention matrix A@B^T from Stage 2, shape `[C, C, H, total_chunks]` (f32)
+/// * `a_ak` - Intra-chunk attention matrix A@K^T from Stage 2, shape `[C, C, H, total_chunks]` (f32)
+/// * `a_ab_inv` - Output inverse matrix, shape `[C, C, H, total_chunks]` (f32)
+/// * `ag` - Decay-scaled adaptation from Stage 2, shape `[K, H, T, B]` (f32)
+/// * `v` - Value tensor (original), shape `[K, H, T, B]` (f16)
+/// * `w_wy` - Output WY w tensor, shape `[K, H, T, B]` (f32)
+/// * `u_wy` - Output WY u tensor, shape `[K, H, T, B]` (f32)
+/// * `chunk_indices` - Flat `[total_chunks * 2]` mapping: `(seq_id, local_chunk_id)` pairs
+/// * `cu_seqlens` - Cumulative sequence lengths `[N+1]` (i32)
+/// * `chunk_size` - Number of tokens per chunk (C, typically 16)
+/// * `total_chunks` - Total number of chunks across all sequences
+/// * `stream` - HIP stream for async execution
+///
+/// # Memory Layout
+/// - Attention matrices: column-major `[C, C, H, total_chunks]`
+/// - Per-token tensors: column-major `[K, H, T, B]`
+///
+/// # Errors
+/// Returns error on shape mismatches or kernel launch failure.
+#[allow(clippy::too_many_arguments)]
+#[allow(non_snake_case)]
+pub fn fla_wy_repr(
+    A_ab: &TensorHip<f32>,
+    A_ak: &TensorHip<f32>,
+    A_ab_inv: &mut TensorHip<f32>,
+    ag: &TensorHip<f32>,
+    v: &TensorHip<f16>,
+    w_wy: &mut TensorHip<f32>,
+    u_wy: &mut TensorHip<f32>,
+    chunk_indices: &TensorHip<i32>,
+    cu_seqlens: &TensorHip<i32>,
+    chunk_size: usize,
+    total_chunks: usize,
+    stream: &Stream,
+) -> Result<()> {
+    // Extract dimensions from ag shape [K, H, T, B]
+    let k_dim = ag.shape()[0]; // head_size
+    let h = ag.shape()[1]; // n_heads
+
+    // Validate attention matrix sizes: [C, C, H, total_chunks]
+    let expected_mat_len = chunk_size * chunk_size * h * total_chunks;
+    for (name, tensor) in [
+        ("A_ab", A_ab as &TensorHip<f32>),
+        ("A_ak", A_ak as &TensorHip<f32>),
+        ("A_ab_inv", A_ab_inv as &TensorHip<f32>),
+    ] {
+        if tensor.len() < expected_mat_len {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "fla_wy_repr: {} too small: need {} elements (C={}, H={}, chunks={}), got {}",
+                    name,
+                    expected_mat_len,
+                    chunk_size,
+                    h,
+                    total_chunks,
+                    tensor.len()
+                ),
+            });
+        }
+    }
+
+    // Validate ag shape matches expected per-token layout [K, H, T, B]
+    // v (f16) should have the same length as ag (f32)
+    if v.len() != ag.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "fla_wy_repr: v length mismatch: expected {} (same as ag), got {}",
+                ag.len(),
+                v.len()
+            ),
+        });
+    }
+
+    // Validate w_wy and u_wy shapes match ag
+    for (name, tensor) in [
+        ("w_wy", w_wy as &TensorHip<f32>),
+        ("u_wy", u_wy as &TensorHip<f32>),
+    ] {
+        if tensor.shape() != ag.shape() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "fla_wy_repr: {} shape mismatch: expected {}, got {}",
+                    name,
+                    ag.shape(),
+                    tensor.shape()
+                ),
+            });
+        }
+    }
+
+    // Validate chunk_indices length
+    if chunk_indices.len() != total_chunks * 2 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "fla_wy_repr: chunk_indices length mismatch: expected {} (total_chunks={} * 2), got {}",
+                total_chunks * 2,
+                total_chunks,
+                chunk_indices.len()
+            ),
+        });
+    }
+
+    // Validate contiguity
+    if !A_ab.is_contiguous()
+        || !A_ak.is_contiguous()
+        || !A_ab_inv.is_contiguous()
+        || !ag.is_contiguous()
+        || !v.is_contiguous()
+        || !w_wy.is_contiguous()
+        || !u_wy.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "fla_wy_repr: all tensors must be contiguous".to_string(),
+        });
+    }
+    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "fla_wy_repr: chunk_indices and cu_seqlens must be contiguous".to_string(),
+        });
+    }
+
+    if total_chunks == 0 {
+        return Ok(());
+    }
+
+    unsafe {
+        check(launch_fla_wy_repr(
+            A_ab.as_ptr(),
+            A_ak.as_ptr(),
+            A_ab_inv.as_mut_ptr(),
+            ag.as_ptr(),
+            v.as_ptr(),
+            w_wy.as_mut_ptr(),
+            u_wy.as_mut_ptr(),
             chunk_indices.as_ptr(),
             cu_seqlens.as_ptr(),
             k_dim as c_int,

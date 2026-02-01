@@ -702,6 +702,26 @@ extern "C" {
         total_chunks: c_int,
         stream: HipStream,
     ) -> HipError;
+
+    /// Stage 3: WY representation.
+    /// Part A inverts the lower-triangular A_ab matrix per chunk.
+    /// Part B computes w = A_ab_inv @ ag and u = (A_ab_inv @ A_ak) @ v.
+    pub fn launch_fla_wy_repr(
+        a_ab: *const f32,
+        a_ak: *const f32,
+        a_ab_inv: *mut f32,
+        ag: *const f32,
+        v: *const f16,
+        w_wy: *mut f32,
+        u_wy: *mut f32,
+        chunk_indices: *const c_int,
+        cu_seqlens: *const c_int,
+        k: c_int,
+        h: c_int,
+        c: c_int,
+        total_chunks: c_int,
+        stream: HipStream,
+    ) -> HipError;
 }
 
 /// HIP success error code
