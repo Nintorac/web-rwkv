@@ -79,7 +79,7 @@ impl Rwkv7Hip {
         // of the FLA scratch buffers. This must happen before ctx borrows
         // scratch.blas_ctx, since &mut HipScratch conflicts with any
         // outstanding borrows.
-        let fla_kernel = if t >= super::fla::FLA_CHUNK_THRESHOLD {
+        let mut fla_kernel = if t >= super::fla::FLA_CHUNK_THRESHOLD {
             Some(super::fla::FlaChunkedWkv::new(
                 scratch, head_size, n_head, t, b,
             )?)
@@ -211,15 +211,10 @@ impl Rwkv7Hip {
             let mut temp1 = scratch.temp1.resized_view_mut(std_shape)?;
             let mut temp2 = scratch.temp2.resized_view_mut(std_shape)?;
 
-            // Select WKV kernel: 3-tier dispatch
-            //   T=1        → FusedT1Wkv (optimized decode)
-            //   1 < T < 32 → WaveReduceWkv (wave-cooperative reduction)
-            //   T >= 32    → FlaChunkedWkv (5-stage FLA chunked prefill)
-            // fla_kernel was pre-created above (before ctx borrows scratch)
+            // Select WKV kernel for recurrent path (T=1 or 1 < T < FLA_CHUNK_THRESHOLD).
+            // FLA (T >= threshold) is dispatched separately via fla_kernel.compute().
             let wkv_kernel: &dyn WkvKernel = if t == 1 {
                 &FusedT1Wkv
-            } else if let Some(ref fla) = fla_kernel {
-                fla
             } else {
                 &WaveReduceWkv
             };
@@ -527,6 +522,7 @@ impl Rwkv7Hip {
                 }
 
                 // Reshape for WKV
+                let att_w_wkv = att_w.reshape_view(wkv_data_shape)?;
                 let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;
                 let r_wkv = att_r.reshape_view(wkv_data_shape)?;
                 let k_ctrl_wkv = att_k_ctrl.reshape_view(wkv_data_shape)?;
@@ -560,8 +556,22 @@ impl Rwkv7Hip {
                     }
                 }
 
-                // Run WKV7 via trait dispatch: fused_t1 for T=1, wave_reduce for T>1
-                {
+                // Run WKV7: FLA path for T >= threshold, recurrent path otherwise.
+                // FLA receives raw att_w (pre-exponentiation) for better precision;
+                // recurrent kernels receive w_decay = exp(-exp(att_w)) as before.
+                if let Some(ref mut fla) = fla_kernel {
+                    fla.compute(
+                        &att_w_wkv,
+                        &r_wkv,
+                        &k_ctrl_wkv,
+                        &v_wkv,
+                        &wkv_a_wkv,
+                        &wkv_b_wkv,
+                        &mut wkv_state_gpu[layer_idx],
+                        &mut wkv_out_wkv,
+                        stream,
+                    )?;
+                } else {
                     let wkv_input = WkvInput {
                         w_decay: &w_decay_wkv,
                         r: &r_wkv,

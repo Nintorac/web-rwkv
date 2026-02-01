@@ -747,11 +747,12 @@ extern "C" {
         stream: HipStream,
     ) -> HipError;
 
-    /// Utility: Convert f16 w_decay to f32 log-decay gk.
-    /// gk[i] = log(w_decay[i]) where w_decay = exp(-exp(w)).
-    /// Used to bridge the WkvInput w_decay (f16) to FLA's gk (f32).
-    pub fn launch_fla_decay_to_log(
-        w_decay: *const f16,
+    /// Utility: Convert f16 raw log-decay att_w to f32 gk = -exp(att_w).
+    /// att_w holds the raw log-domain decay (-softplus(...) - 0.5) before
+    /// the exp(-exp(w)) conversion. This avoids precision loss from
+    /// the f16 round-trip through exp then log.
+    pub fn launch_fla_neg_exp_f16_to_f32(
+        att_w: *const f16,
         gk: *mut f32,
         n: c_int,
         stream: HipStream,

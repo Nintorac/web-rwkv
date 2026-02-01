@@ -1162,32 +1162,30 @@ hipError_t launch_fla_chunk_o(
 }
 
 // ============================================================================
-// Utility: f16 decay to f32 log-decay conversion (kernel_fla_decay_to_log)
+// Utility: f16 raw log-decay to f32 negative exponential (kernel_fla_neg_exp_f16_to_f32)
 //
-// Converts w_decay (f16, = exp(-exp(w))) to gk (f32, = log(w_decay)).
-// The existing WKV pipeline computes w_decay = exp(-exp(softplus_decay)),
-// but the FLA cumsum kernel needs the log-domain decay gk = log(w_decay).
+// Converts att_w (f16, raw log-domain decay = -softplus(...) - 0.5) to
+// gk (f32) = -exp(att_w).
 //
-// This avoids passing the pre-exponential tensor through the WkvInput interface.
+// This avoids the precision-losing round-trip through f16 exp(-exp(w))
+// then log. The raw att_w is passed directly from the decay computation
+// in step.rs, before the exp(-exp(w)) conversion.
 // ============================================================================
 
 __global__ __launch_bounds__(256, 4)
-void kernel_fla_decay_to_log(
-    const __half* __restrict__ w_decay,   // [N] f16 decay factor in (0, 1]
-    float* __restrict__ gk,               // [N] f32 log-decay output
+void kernel_fla_neg_exp_f16_to_f32(
+    const __half* __restrict__ att_w,     // [N] f16 raw log-domain decay (w = -softplus(...) - 0.5)
+    float* __restrict__ gk,               // [N] f32 output: gk = -exp(w)
     int N
 ) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < N) {
-        const float d = __half2float(w_decay[idx]);
-        // log(d) where d = exp(-exp(w)) is in (0, 1], so log(d) <= 0.
-        // Clamp to avoid log(0) = -inf.
-        gk[idx] = (d > 0.0f) ? logf(d) : -88.0f;
+        gk[idx] = -expf(__half2float(att_w[idx]));
     }
 }
 
-hipError_t launch_fla_decay_to_log(
-    const __half* w_decay,
+hipError_t launch_fla_neg_exp_f16_to_f32(
+    const __half* att_w,
     float* gk,
     int N,
     hipStream_t stream
@@ -1197,8 +1195,8 @@ hipError_t launch_fla_decay_to_log(
     const int block_size = 256;
     const int grid_size = (N + block_size - 1) / block_size;
 
-    hipLaunchKernelGGL(kernel_fla_decay_to_log, dim3(grid_size), dim3(block_size), 0, stream,
-                       w_decay, gk, N);
+    hipLaunchKernelGGL(kernel_fla_neg_exp_f16_to_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       att_w, gk, N);
 
     return hipGetLastError();
 }

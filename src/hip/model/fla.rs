@@ -3,11 +3,11 @@
 //! This module provides:
 //! - Chunk index precomputation ([`prepare_chunk_indices`], [`prepare_chunk_offsets`])
 //!   for mapping flat chunk IDs to `(sequence_id, local_chunk_id)` pairs.
-//! - The [`FlaChunkedWkv`] kernel, which implements the [`WkvKernel`] trait for
-//!   sequences longer than [`FLA_CHUNK_THRESHOLD`].
+//! - The [`FlaChunkedWkv`] struct, which holds pre-sized scratch buffer views
+//!   and exposes a `compute()` method for the 5-stage FLA pipeline.
 //!
 //! The 5-stage FLA pipeline:
-//!   1. Convert w_decay (f16) to gk (f32 log-decay), then cumulative sum
+//!   1. Convert raw att_w (f16) to gk (f32) = -exp(att_w), then cumulative sum
 //!   2. Intra-chunk attention matrices
 //!   3. WY representation (matrix inversion + w/u computation)
 //!   4. Inter-chunk state recurrence
@@ -24,12 +24,10 @@ use half::f16;
 use crate::hip::device::Stream;
 use crate::hip::ffi::Result;
 use crate::hip::kernels::fla::{
-    fla_chunk_h, fla_chunk_o, fla_cumsum, fla_decay_to_log, fla_intra, fla_wy_repr,
+    fla_chunk_h, fla_chunk_o, fla_cumsum, fla_neg_exp_f16_to_f32, fla_intra, fla_wy_repr,
 };
 use crate::hip::scratch::HipScratch;
 use crate::hip::tensor::{TensorHip, TensorShape};
-
-use super::prefill::{WkvInput, WkvKernel};
 
 /// Threshold sequence length for dispatching to FLA chunked prefill.
 /// Sequences with T >= this value use FLA; shorter sequences use WaveReduceWkv.
@@ -39,10 +37,16 @@ pub const FLA_CHUNK_THRESHOLD: usize = 32;
 ///
 /// Holds pre-sized views of the FLA scratch buffers from [`HipScratch`] plus
 /// configuration parameters for the current forward pass. Constructed at the
-/// dispatch point in `step_inner()` when T >= [`FLA_CHUNK_THRESHOLD`].
+/// dispatch point in `dispatch()` when T >= [`FLA_CHUNK_THRESHOLD`].
 ///
 /// The 5-stage pipeline executes entirely on GPU with no allocations:
 /// all intermediate buffers come from the pre-allocated scratch pool.
+///
+/// Unlike the recurrent WKV kernels (which implement the [`super::prefill::WkvKernel`]
+/// trait), FLA uses a direct `compute()` method that takes `&mut self` and the
+/// raw `att_w` tensor (pre-exponentiation). This avoids:
+/// - The precision-losing round-trip through f16 `exp(-exp(w))` then `log`
+/// - The `ptr::read` hack needed to get `&mut` access from `&self`
 #[allow(non_snake_case)]
 pub struct FlaChunkedWkv {
     /// FLA chunk size (C, typically 16)
@@ -145,57 +149,49 @@ impl FlaChunkedWkv {
             fla_v_new: scratch.fla_v_new.resized_view_mut(per_token_shape)?,
         })
     }
-}
 
-impl WkvKernel for FlaChunkedWkv {
+    /// Run the 5-stage FLA chunked pipeline.
+    ///
+    /// Takes raw log-domain decay (`att_w`, f16) directly instead of
+    /// going through `exp(-exp(w))` then `log`, avoiding precision loss.
+    ///
+    /// # Arguments
+    /// * `att_w` - Raw log-domain decay (f16), shape `[K, H, T, B]`.
+    ///   This is the output of `softplus_decay_f16`: `w = -softplus(...) - 0.5`.
+    /// * `r` - Query (receptance), shape `[K, H, T, B]` (f16)
+    /// * `k` - Key (controlled), shape `[K, H, T, B]` (f16)
+    /// * `v` - Value, shape `[K, H, T, B]` (f16)
+    /// * `a` - Negative normalized key for state update (wkv_a), shape `[K, H, T, B]` (f16)
+    /// * `b` - Adaptation-weighted normalized key (wkv_b), shape `[K, H, T, B]` (f16)
+    /// * `state` - Per-layer recurrent state `[K, K, H, B]` (f32), updated in-place
+    /// * `output` - Output tensor `[K, H, T, B]` (f16)
+    /// * `stream` - HIP stream for kernel launches
     #[allow(non_snake_case)]
-    fn compute(
-        &self,
-        input: &WkvInput<'_>,
+    pub fn compute(
+        &mut self,
+        att_w: &TensorHip<f16>,
+        r: &TensorHip<f16>,
+        k: &TensorHip<f16>,
+        v: &TensorHip<f16>,
+        a: &TensorHip<f16>,
+        b: &TensorHip<f16>,
         state: &mut TensorHip<f32>,
         output: &mut TensorHip<f16>,
         stream: &Stream,
     ) -> Result<()> {
         let t = self.seq_len;
-        let b = self.batch_size;
+        let bb = self.batch_size;
         let c = self.chunk_size;
         let head_size = self.head_size;
         let n_head = self.n_head;
-        let n_seq = b; // for equal-length batches, n_seq == batch_size
-
-        // We need mutable access to the scratch buffer views.
-        // Since the views are non-owning copies of pointers, we can safely
-        // create mutable aliases for kernel dispatch. The kernel wrappers
-        // require &mut TensorHip but the underlying GPU memory is the same
-        // as in self. This is safe because:
-        //   1. Each buffer is written only by one kernel stage before being
-        //      read by later stages (no aliasing writes).
-        //   2. GPU execution is serialized on the same stream.
-        //
-        // We use ptr::read to create non-owning copies (owned=false means
-        // Drop is a no-op, so no double-free).
-        let mut fla_gi = unsafe { std::ptr::read(&self.fla_gi) };
-        let mut fla_ge = unsafe { std::ptr::read(&self.fla_ge) };
-        let mut fla_qg = unsafe { std::ptr::read(&self.fla_qg) };
-        let mut fla_kg = unsafe { std::ptr::read(&self.fla_kg) };
-        let mut fla_ag = unsafe { std::ptr::read(&self.fla_ag) };
-        let mut fla_bg = unsafe { std::ptr::read(&self.fla_bg) };
-        let mut fla_A_qk = unsafe { std::ptr::read(&self.fla_A_qk) };
-        let mut fla_A_qb = unsafe { std::ptr::read(&self.fla_A_qb) };
-        let mut fla_A_ab = unsafe { std::ptr::read(&self.fla_A_ab) };
-        let mut fla_A_ak = unsafe { std::ptr::read(&self.fla_A_ak) };
-        let mut fla_A_ab_inv = unsafe { std::ptr::read(&self.fla_A_ab_inv) };
-        let mut fla_w_wy = unsafe { std::ptr::read(&self.fla_w_wy) };
-        let mut fla_u_wy = unsafe { std::ptr::read(&self.fla_u_wy) };
-        let mut fla_h = unsafe { std::ptr::read(&self.fla_h) };
-        let mut fla_v_new = unsafe { std::ptr::read(&self.fla_v_new) };
+        let n_seq = bb; // for equal-length batches, n_seq == batch_size
 
         // ================================================================
         // Step 0: Compute chunk indices on CPU and upload to GPU
         // ================================================================
 
         // Build cu_seqlens for equal-length batches: [0, T, 2T, ..., B*T]
-        let cu_seqlens_host: Vec<u32> = (0..=b).map(|i| (i * t) as u32).collect();
+        let cu_seqlens_host: Vec<u32> = (0..=bb).map(|i| (i * t) as u32).collect();
 
         // Compute chunk indices and offsets on CPU
         let chunk_indices_host = prepare_chunk_indices(&cu_seqlens_host, c);
@@ -222,24 +218,27 @@ impl WkvKernel for FlaChunkedWkv {
         let chunk_offsets_gpu = TensorHip::<i32>::from_slice(&chunk_offsets_flat, co_shape, stream)?;
 
         // cu_seqlens on GPU
-        let cu_shape = TensorShape::new(b + 1, 1, 1, 1);
+        let cu_shape = TensorShape::new(bb + 1, 1, 1, 1);
         let cu_seqlens_flat: Vec<i32> = cu_seqlens_host.iter().map(|&x| x as i32).collect();
         let cu_seqlens_gpu = TensorHip::<i32>::from_slice(&cu_seqlens_flat, cu_shape, stream)?;
 
         // ================================================================
-        // Stage 0.5: Convert w_decay (f16) to gk (f32 log-decay)
+        // Stage 0.5: Convert raw att_w (f16) to gk (f32) = -exp(att_w)
         // ================================================================
-        // The FLA cumsum kernel needs gk = log(w_decay) in f32.
+        // The FLA cumsum kernel needs gk = -exp(w) in f32. We compute this
+        // directly from the raw log-domain decay (att_w), avoiding the
+        // precision-losing round-trip through f16 exp(-exp(w)) then log.
+        //
         // We reuse fla_gi as temporary storage for gk since Stage 1 will
         // overwrite fla_gi anyway. After cumsum, fla_gi holds the inclusive
         // cumsum result.
 
         // Use a temporary view for gk that shares memory with fla_gi
-        let per_token_shape = TensorShape::new(head_size, n_head, t, b);
-        let mut gk = fla_gi.resized_view_mut(per_token_shape)?;
+        let per_token_shape = TensorShape::new(head_size, n_head, t, bb);
+        let mut gk = self.fla_gi.resized_view_mut(per_token_shape)?;
 
-        // w_decay is [K, H, T, B] in f16, gk is [K, H, T, B] in f32
-        fla_decay_to_log(input.w_decay, &mut gk, stream)?;
+        // att_w is [K, H, T, B] in f16, gk is [K, H, T, B] in f32
+        fla_neg_exp_f16_to_f32(att_w, &mut gk, stream)?;
 
         // ================================================================
         // Stage 1: Cumulative decay scan
@@ -252,8 +251,8 @@ impl WkvKernel for FlaChunkedWkv {
         // gi[t], so the read-before-write is safe.
         fla_cumsum(
             &gk,
-            &mut fla_gi,
-            &mut fla_ge,
+            &mut self.fla_gi,
+            &mut self.fla_ge,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
             c,
@@ -270,29 +269,27 @@ impl WkvKernel for FlaChunkedWkv {
         // Input: q(f16), k(f16), a(f16), b(f16), gi(f32), ge(f32)
         // Output: qg, kg, ag, bg (f32 per-token), A_qk, A_qb, A_ak, A_ab (f32 CxC matrices)
         //
-        // Note: The FLA intra kernel reads q, k, a, b from the WkvInput.
         // In the WKV pipeline:
-        //   input.r = receptance (query in RWKV7 = q in FLA)
-        //   input.k = controlled key (k in FLA)
-        //   input.v = value (v in FLA)
-        //   input.a = wkv_a = -kk (a in FLA)
-        //   input.b = wkv_b = kk * a (b in FLA)
-        //   input.w_decay = exp(-exp(w)) (decay factor, already converted to gk above)
+        //   r = receptance (query in RWKV7 = q in FLA)
+        //   k = controlled key (k in FLA)
+        //   v = value (v in FLA)
+        //   a = wkv_a = -kk (a in FLA)
+        //   b = wkv_b = kk * att_a (b in FLA)
         fla_intra(
-            input.r, // q in FLA (receptance)
-            input.k, // k in FLA (controlled key)
-            input.a, // a in FLA (wkv_a = -kk)
-            input.b, // b in FLA (wkv_b = kk * att_a)
-            &fla_gi,
-            &fla_ge,
-            &mut fla_qg,
-            &mut fla_kg,
-            &mut fla_ag,
-            &mut fla_bg,
-            &mut fla_A_qk,
-            &mut fla_A_qb,
-            &mut fla_A_ak,
-            &mut fla_A_ab,
+            r, // q in FLA (receptance)
+            k, // k in FLA (controlled key)
+            a, // a in FLA (wkv_a = -kk)
+            b, // b in FLA (wkv_b = kk * att_a)
+            &self.fla_gi,
+            &self.fla_ge,
+            &mut self.fla_qg,
+            &mut self.fla_kg,
+            &mut self.fla_ag,
+            &mut self.fla_bg,
+            &mut self.fla_A_qk,
+            &mut self.fla_A_qb,
+            &mut self.fla_A_ak,
+            &mut self.fla_A_ab,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
             c,
@@ -306,13 +303,13 @@ impl WkvKernel for FlaChunkedWkv {
         // Input: A_ab(f32), A_ak(f32), ag(f32), v(f16)
         // Output: A_ab_inv(f32), w_wy(f32), u_wy(f32)
         fla_wy_repr(
-            &fla_A_ab,
-            &fla_A_ak,
-            &mut fla_A_ab_inv,
-            &fla_ag,
-            input.v,
-            &mut fla_w_wy,
-            &mut fla_u_wy,
+            &self.fla_A_ab,
+            &self.fla_A_ak,
+            &mut self.fla_A_ab_inv,
+            &self.fla_ag,
+            v,
+            &mut self.fla_w_wy,
+            &mut self.fla_u_wy,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
             c,
@@ -330,15 +327,15 @@ impl WkvKernel for FlaChunkedWkv {
         // The kernel reads state_in at start and writes state_out at end.
         // State is [K, K, H, B] = [head_size, head_size, n_head, batch_size].
         fla_chunk_h(
-            &fla_kg,
-            &fla_bg,
-            input.v,
-            &fla_w_wy,
-            &fla_u_wy,
-            &fla_gi,
+            &self.fla_kg,
+            &self.fla_bg,
+            v,
+            &self.fla_w_wy,
+            &self.fla_u_wy,
+            &self.fla_gi,
             state,
-            &mut fla_h,
-            &mut fla_v_new,
+            &mut self.fla_h,
+            &mut self.fla_v_new,
             &chunk_offsets_gpu,
             &cu_seqlens_gpu,
             c,
@@ -352,12 +349,12 @@ impl WkvKernel for FlaChunkedWkv {
         // Input: qg(f32), v(f16), v_new(f32), A_qk(f32), A_qb(f32), h(f32)
         // Output: o(f16) = qg @ h + A_qk @ v + A_qb @ v_new
         fla_chunk_o(
-            &fla_qg,
-            input.v,
-            &fla_v_new,
-            &fla_A_qk,
-            &fla_A_qb,
-            &fla_h,
+            &self.fla_qg,
+            v,
+            &self.fla_v_new,
+            &self.fla_A_qk,
+            &self.fla_A_qb,
+            &self.fla_h,
             output,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
@@ -367,14 +364,6 @@ impl WkvKernel for FlaChunkedWkv {
         )?;
 
         Ok(())
-    }
-
-    fn supports_multi_token(&self) -> bool {
-        true
-    }
-
-    fn name(&self) -> &str {
-        "fla_chunked"
     }
 }
 

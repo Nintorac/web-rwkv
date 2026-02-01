@@ -12,8 +12,8 @@ use half::f16;
 
 use crate::hip::device::Stream;
 use crate::hip::ffi::{
-    check, launch_fla_chunk_h, launch_fla_chunk_o, launch_fla_cumsum, launch_fla_decay_to_log,
-    launch_fla_intra, launch_fla_wy_repr, HipErrorKind, Result,
+    check, launch_fla_chunk_h, launch_fla_chunk_o, launch_fla_cumsum,
+    launch_fla_neg_exp_f16_to_f32, launch_fla_intra, launch_fla_wy_repr, HipErrorKind, Result,
 };
 use crate::hip::tensor::TensorHip;
 
@@ -904,50 +904,50 @@ pub fn fla_chunk_o(
     }
 }
 
-/// Convert f16 w_decay to f32 log-decay gk (utility for bridging WkvInput to FLA).
+/// Convert f16 raw log-decay att_w to f32 gk = -exp(att_w).
 ///
-/// Computes `gk[i] = log(w_decay[i])` where `w_decay = exp(-exp(w))` is the f16
-/// decay factor from the existing WKV pipeline. The FLA cumsum kernel needs the
-/// log-domain decay `gk = log(w_decay)` as f32.
+/// Computes `gk[i] = -expf(att_w[i])` where `att_w` holds the raw log-domain
+/// decay (`-softplus(...) - 0.5`) before the `exp(-exp(w))` conversion.
+/// This avoids the precision-losing round-trip through f16 exp then log.
 ///
 /// # Arguments
-/// * `w_decay` - Input f16 decay factor tensor, any contiguous shape
-/// * `gk` - Output f32 log-decay tensor, same number of elements
+/// * `att_w` - Input f16 raw log-domain decay tensor, any contiguous shape
+/// * `gk` - Output f32 tensor, same number of elements
 /// * `stream` - HIP stream for async execution
 ///
 /// # Errors
 /// Returns error on length mismatch, non-contiguity, or kernel launch failure.
-pub fn fla_decay_to_log(
-    w_decay: &TensorHip<f16>,
+pub fn fla_neg_exp_f16_to_f32(
+    att_w: &TensorHip<f16>,
     gk: &mut TensorHip<f32>,
     stream: &Stream,
 ) -> Result<()> {
-    if w_decay.len() != gk.len() {
+    if att_w.len() != gk.len() {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
-                "fla_decay_to_log: length mismatch: w_decay={}, gk={}",
-                w_decay.len(),
+                "fla_neg_exp_f16_to_f32: length mismatch: att_w={}, gk={}",
+                att_w.len(),
                 gk.len()
             ),
         });
     }
 
-    if !w_decay.is_contiguous() || !gk.is_contiguous() {
+    if !att_w.is_contiguous() || !gk.is_contiguous() {
         return Err(HipErrorKind {
             code: -1,
-            message: "fla_decay_to_log: both tensors must be contiguous".to_string(),
+            message: "fla_neg_exp_f16_to_f32: both tensors must be contiguous".to_string(),
         });
     }
 
-    let n = w_decay.len();
+    let n = att_w.len();
     if n == 0 {
         return Ok(());
     }
 
     unsafe {
-        check(launch_fla_decay_to_log(
-            w_decay.as_ptr(),
+        check(launch_fla_neg_exp_f16_to_f32(
+            att_w.as_ptr(),
             gk.as_mut_ptr(),
             n as c_int,
             stream.handle(),
