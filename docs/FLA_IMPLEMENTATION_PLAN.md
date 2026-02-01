@@ -237,30 +237,52 @@ O[c, i] = O_local[c, i] + O_from_state[c, i]
 
 ---
 
-## New Files to Create
+## File Structure
 
-1. **`/workspace/web-rwkv/src/hip/kernels/wkv7_chunk.hip`**
-   - All chunked kernel implementations
+Follows the existing HIP backend pattern: `.hip`/`.rs` kernel pairs, model-level logic in `model/`, scratch buffers in `scratch.rs`.
 
-2. **Additions to `/workspace/web-rwkv/src/hip/mod.rs`**
-   - Rust FFI wrappers for chunked kernels
-   - Auto-dispatch based on sequence length
+### New Files
+
+| File | Contents |
+|------|----------|
+| `src/hip/kernels/fla.hip` | All 5 FLA stage kernels: `kernel_fla_cumsum`, `kernel_fla_intra`, `kernel_fla_wy_repr`, `kernel_fla_chunk_h`, `kernel_fla_chunk_o` |
+| `src/hip/kernels/fla.rs` | Rust FFI wrappers for each FLA kernel (shape validation, stream launch) |
+| `src/hip/model/fla.rs` | `FlaChunkedWkv` struct (implements `WkvKernel` trait), chunk index precomputation (`prepare_chunk_indices`, `prepare_chunk_offsets`), intermediate buffer pool management, 5-stage pipeline orchestration |
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/hip/kernels/mod.rs` | Add `pub mod fla;` |
+| `src/hip/model/mod.rs` | Add `pub mod fla;` |
+| `src/hip/model/step.rs` | 3-tier dispatch: T=1 → FusedT1, 1<T<threshold → WaveReduce, T≥threshold → FlaChunkedWkv |
+| `src/hip/scratch.rs` | Add FLA intermediate buffer allocations to `HipScratch` (fixed-size at init) |
+| `build.rs` | Add `fla.hip` to hipcc compilation |
 
 ---
 
 ## Memory Layout
 
-**Existing** (column-major, N-fastest):
-- Inputs: `[N, H, T, B]`
-- State: `[N, N, H, B]`
+**Existing** (column-major, shape[0]-fastest):
+- Inputs: `[K, H, T, B]` (K=head_size)
+- State: `[K, K, H, B]`
 
-**New buffers** (per forward pass):
-- Chunk cumulative decay: `[N, H, num_chunks, B]`
-- Chunk local states: `[N, N, H, num_chunks, B]`
-- Chunk local outputs: `[N, H, C, num_chunks, B]`
+**New FLA intermediate buffers** (per forward pass, shared across layers):
 
-**Memory budget** (768-dim model, C=64, T=4096, B=4, H=12):
-- Additional working memory: ~96 MB
+| Buffer | Shape | Purpose |
+|--------|-------|---------|
+| `gi`, `ge` | `[K, H, T, 1]` each | Cumulative decays (Stage 1) |
+| `A_qk`, `A_qb`, `A_ab`, `A_ak` | `[C, C, H, total_chunks]` each | Intra-chunk attention matrices (Stage 2) |
+| `A_ab_inv` | `[C, C, H, total_chunks]` | Lower-triangular inverse (Stage 3) |
+| `qg`, `kg`, `ag`, `bg` | `[K, H, T, 1]` each | Decay-scaled inputs (Stage 2) |
+| `w_wy`, `u_wy` | `[K, H, T, 1]`, `[V, H, T, 1]` | WY representation outputs (Stage 3) |
+| `h` | `[K, V, H, total_chunks]` | Per-chunk states (Stage 4) |
+| `v_new` | `[V, H, T, 1]` | Corrected values (Stage 4) |
+
+**Sizing:** Fixed at model load using `max_total_chunks = B * ceil_div(max_T, C)`. For equal-length batches, `total_chunks = B * ceil_div(T, C)` which is bounded by this max. For varlen, packed sequences are strictly denser, so the bound holds. No hipMalloc during inference.
+
+**Memory budget** (768-dim model, C=16, T=4096, B=4, H=12):
+- Additional working memory: ~48 MB
 
 ---
 
@@ -382,3 +404,183 @@ pub fn wkv7_dispatch_f32(...) -> Result<()> {
 2. Compare against Python reference: `scripts/generate_test_fixtures.py`
 3. Benchmark: `cargo bench --features hip`
 4. Profile: `rocprof --hip-trace ./target/release/examples/hip_gen`
+
+---
+
+## Gap Analysis (Addendum)
+
+*Analysis based on review of the [fla-org reference implementation](https://github.com/fla-org/flash-linear-attention) (cloned at `repos/flash-linear-attention/`) and the existing web-rwkv API surface.*
+
+### Motivating Constraint: API Compatibility with WebGPU Backend
+
+The FLA chunked kernel must integrate without changing the caller-facing API. Both the WebGPU and HIP backends expose the same `Runtime<Rnn>` trait with `RnnInput`/`RnnOutput`. The HIP backend additionally has:
+
+- `WkvKernel` trait (`src/hip/model/prefill.rs`) with `compute()` and `supports_multi_token()`
+- Pluggable kernel selection: `FusedT1Wkv` (T=1 streaming) vs `WaveReduceWkv` (T>1 prefill)
+- State managed as GPU-resident buffers with explicit `read`/`write` per batch slot
+
+FLA must plug in as a new `WkvKernel` implementation (e.g., `FlaChunkedWkv`) that is auto-dispatched when T exceeds a threshold. The external `infer()` / `infer_one()` API, `RnnInput`/`RnnOutput` shapes, and state semantics must remain unchanged.
+
+---
+
+### Gap 1: Variable-Length Sequences — Architectural, Not Phase 4
+
+The plan defers variable-length batch support to Phase 4. This is a fundamental design decision that affects every kernel signature and buffer layout.
+
+**What FLA actually does:** Packed/varlen (no padding). All sequences concatenated along the time axis. A `cu_seqlens: LongTensor[N+1]` tracks boundaries.
+
+- Example: 3 sequences of lengths 100, 130, 50 → `cu_seqlens = [0, 100, 230, 280]`
+- B=1; the "batch" is implicit in the packing
+
+**Current HIP backend:** Requires all batches to have the same length. The WebGPU backend handles variable-length via chunking at `RnnInput` level (min 32-token chunks, aligned).
+
+**Recommendation:** Design kernel signatures to accept `cu_seqlens` from day one, even if the initial implementation only supports equal-length batches (where `cu_seqlens` is trivially `[0, T, 2T, ..., B*T]`). Retrofitting varlen onto fixed-T kernels is painful.
+
+---
+
+### Gap 2: Missing Chunk Index Precomputation
+
+The plan describes grids as `dim3(num_chunks, H, B)` but doesn't address how kernels know which sequence a chunk belongs to when sequences have different lengths.
+
+**What FLA does:** A `prepare_chunk_indices()` function (in `fla/ops/utils/index.py`) precomputes a flat `[total_chunks, 2]` tensor mapping each chunk to `(sequence_id, chunk_id_within_sequence)`:
+
+```
+cu_seqlens = [0, 100, 230, 280], chunk_size = 64
+chunks_per_seq = ceil_div([100, 130, 50], 64) = [2, 3, 1]
+chunk_indices = [(0,0), (0,1), (1,0), (1,1), (1,2), (2,0)]
+```
+
+A companion `prepare_chunk_offsets()` gives cumulative chunk counts per sequence: `[0, 2, 5, 6]` — used for indexing into intermediate state storage.
+
+**For HIP:** This precomputation happens on the CPU (in Rust), uploaded as a small device buffer. The grid becomes `dim3(total_chunks, H, 1)` instead of `dim3(num_chunks, H, B)`.
+
+---
+
+### Gap 3: Partial Chunk Masking
+
+When a sequence length isn't divisible by chunk size (common case), the last chunk is partial. The plan doesn't discuss this.
+
+**FLA uses three mechanisms:**
+1. **Block pointer `boundary_check`** — zeros out-of-bounds elements on tile loads
+2. **Explicit scalar masks:** `mask=(offset < T)` for gate/decay loads
+3. **Combined causal + boundary mask** for intra-chunk attention: `m_A = (causal) & (valid_query & valid_key)`
+
+**For HIP (no Triton boundary_check):**
+- Every load in every kernel needs a bounds check: `val = (idx < T) ? buf[idx] : 0.0f`
+- The intra-chunk attention matrix needs a mask combining causality with boundary validity
+- Last-element decay uses clamped index: `last_idx = min((i_t + 1) * BT, T) - 1`
+
+This is correctness-critical — not an optimization.
+
+---
+
+### Gap 4: Missing WY Representation Stage
+
+The plan has 4 kernels (scan, gemm_local, propagate, output). FLA actually has **5 stages**:
+
+| Stage | FLA Function | Plan Kernel | Notes |
+|-------|-------------|-------------|-------|
+| 1. Cumulative decay | `chunk_rwkv6_fwd_cumsum` | `kernel_wkv7_chunk_scan` | Covered |
+| 2. Intra-chunk attention matrices | `chunk_dplr_fwd_intra` | `kernel_wkv7_chunk_gemm_local` | Partially covered |
+| **3. WY representation** | **`prepare_wy_repr_fwd`** | **Missing** | **Gap** |
+| 4. Inter-chunk state recurrence | `chunk_dplr_fwd_h` | `kernel_wkv7_chunk_propagate` | Covered |
+| 5. Output combination | `chunk_dplr_fwd_o` | `kernel_wkv7_chunk_output` | Covered |
+
+**The WY representation step:**
+- Computes `A_ab_inv` — inverse of the lower-triangular `A @ B^T` matrix within each chunk
+- Uses block-wise inversion: `[A11, 0; A21, A22]^{-1} = [A11^{-1}, 0; -A22^{-1}*A21*A11^{-1}, A22^{-1}]`
+- Produces `w = A_ab_inv @ a` and `u = A_ab_inv @ A_ak @ v`
+- These compress chunk-internal recurrence into a low-rank form for the state propagation stage
+
+This is a non-trivial kernel. It requires triangular matrix inversion within each chunk and cannot be skipped.
+
+---
+
+### Gap 5: Default Chunk Size
+
+The plan proposes chunk size 64–128. FLA's RWKV7 defaults to **16**.
+
+At chunk_size=16, the intra-chunk attention matrix is 16×16 (fits in registers, manageable FP32 error). At 64, it's 64×64 — significantly more memory and precision pressure.
+
+**Recommendation:** Start with chunk_size=16 to match the reference. Validate correctness and precision. Then experiment with larger sizes.
+
+---
+
+### Gap 6: Step Function Changes for Prefill
+
+The current HIP step function (`step_inner` in `src/hip/model/step.rs`) processes one layer at a time, calling the WKV kernel per layer. For FLA, the step function flow needs to accommodate:
+
+1. **Buffer allocation for intermediate tensors** — the 5-stage pipeline produces several intermediates per layer:
+   - `gi`, `ge` (cumulative decays) — `[T, H, K]` each
+   - `A_ab`, `A_qk`, `A_qb`, `A_ak` (attention matrices) — `[num_chunks, H, C, C]` each
+   - `A_ab_inv` (inverse) — `[num_chunks, H, C, C]`
+   - `w_wy`, `u_wy` (WY outputs) — `[T, H, K]` and `[T, H, V]`
+   - `h` (per-chunk states) — `[num_chunks, H, K, V]`
+
+   These should be allocated once per forward pass (or pooled), not per-layer.
+
+2. **Kernel dispatch sequence per layer:**
+   ```
+   For each layer:
+     1. Token shift + layer norm (existing)
+     2. Compute r, w, k, v, a, b (existing matmuls)
+     3. FLA 5-stage pipeline:
+        a. Cumulative decay scan
+        b. Intra-chunk attention matrices
+        c. WY representation
+        d. Inter-chunk state propagation (reads/writes state)
+        e. Output combination
+     4. Output projection + feed-forward (existing)
+   ```
+
+3. **State read/write semantics:** The FLA pipeline reads `initial_state` at stage 4 start and writes `final_state` at stage 4 end, identically to the recurrent kernel's state update. The `WkvKernel::compute()` signature already takes `state: &mut TensorHip<f32>` — the FLA implementation reads it as `initial_state`, writes it as `final_state`.
+
+4. **Dispatch threshold:** Add to `step_inner` or the `WkvKernel` selector:
+   ```rust
+   let wkv_kernel: &dyn WkvKernel = if num_tokens >= CHUNK_THRESHOLD {
+       &FlaChunkedWkv { chunk_size: 16 }
+   } else if num_tokens == 1 {
+       &FusedT1Wkv
+   } else {
+       &WaveReduceWkv
+   };
+   ```
+
+---
+
+### Gap 7: Intermediate Buffer Management
+
+The plan's memory budget section estimates ~96 MB but doesn't address *lifecycle*. The FLA pipeline needs several intermediate buffers that are:
+
+- **Per-forward-pass** (shared across layers): The attention matrices, WY outputs, and per-chunk states have the same shape regardless of layer, so they can be allocated once and reused.
+- **Sized by total_chunks** (not `num_chunks * B`): For varlen, `total_chunks = sum(ceil_div(seq_len_i, C))` across all sequences in the batch.
+
+The existing HIP backend uses a buffer pool (`checkout_buffer` pattern in WebGPU, scratch allocations in HIP). FLA intermediates should follow the same pattern.
+
+---
+
+### Gap 8: Host-Side Precomputation
+
+Before launching FLA kernels, the host (Rust) must compute:
+- `chunk_indices: [total_chunks, 2]` — maps flat chunk ID to (seq_id, local_chunk_id)
+- `chunk_offsets: [N+1]` — cumulative chunk counts per sequence
+- `cu_seqlens: [N+1]` — already available from input batching
+
+These are small tensors computed on CPU and uploaded once per forward pass. The plan doesn't include this step in the kernel launch sequence.
+
+---
+
+### Reference Implementation
+
+The FLA reference is cloned at `repos/flash-linear-attention/`. Key files:
+
+| File | Contents |
+|------|----------|
+| `fla/ops/rwkv7/chunk.py` | Entry point, delegates to DPLR |
+| `fla/ops/generalized_delta_rule/dplr/chunk.py` | Forward pass orchestration (5 stages) |
+| `fla/ops/generalized_delta_rule/dplr/chunk_A_fwd.py` | Stage 2: intra-chunk attention matrices |
+| `fla/ops/generalized_delta_rule/dplr/wy_fast_fwd.py` | Stage 3: WY representation |
+| `fla/ops/generalized_delta_rule/dplr/chunk_h_fwd.py` | Stage 4: inter-chunk state recurrence |
+| `fla/ops/generalized_delta_rule/dplr/chunk_o_fwd.py` | Stage 5: output combination |
+| `fla/ops/utils/index.py` | `prepare_chunk_indices`, `prepare_chunk_offsets` |
+| `fla/ops/rwkv6/chunk.py` | Stage 1: `chunk_rwkv6_fwd_cumsum` (shared with RWKV6) |
