@@ -265,6 +265,22 @@ pub struct HipScratch {
     /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
     pub fla_ge: TensorHip<f32>,
 
+    /// Decay-scaled query (Stage 2): `qg[t] = q[t] * exp(gi[t])`.
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_qg: TensorHip<f32>,
+
+    /// Decay-scaled key (Stage 2): `kg[t] = k[t] * exp(-gi[t] + g_last)`.
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_kg: TensorHip<f32>,
+
+    /// Decay-scaled a (Stage 2): `ag[t] = a[t] * exp(ge[t])`.
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_ag: TensorHip<f32>,
+
+    /// Decay-scaled b (Stage 2): `bg[t] = b[t] * exp(-gi[t] + g_last)`.
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_bg: TensorHip<f32>,
+
     /// Intra-chunk attention matrix: Q @ K^T (Stage 2).
     /// Shape: `[C, C, n_head, max_total_chunks]`
     pub fla_A_qk: TensorHip<f32>,
@@ -449,6 +465,10 @@ impl HipScratch {
             // FLA chunked prefill buffers (all f32)
             fla_gi: TensorHip::new(fla_per_token_shape)?,
             fla_ge: TensorHip::new(fla_per_token_shape)?,
+            fla_qg: TensorHip::new(fla_per_token_shape)?,
+            fla_kg: TensorHip::new(fla_per_token_shape)?,
+            fla_ag: TensorHip::new(fla_per_token_shape)?,
+            fla_bg: TensorHip::new(fla_per_token_shape)?,
             fla_A_qk: TensorHip::new(fla_chunk_mat_shape)?,
             fla_A_qb: TensorHip::new(fla_chunk_mat_shape)?,
             fla_A_ab: TensorHip::new(fla_chunk_mat_shape)?,
@@ -514,9 +534,9 @@ impl HipScratch {
         let n_head = self.fla_gi.shape().dim(1);
         let head_size = if n_head > 0 { c / n_head } else { 0 };
         let max_total_chunks = b * ((t + fla_c - 1) / fla_c);
-        // 5 per-token buffers: fla_gi, fla_ge, fla_w_wy, fla_u_wy, fla_v_new
+        // 9 per-token buffers: fla_gi, fla_ge, fla_qg, fla_kg, fla_ag, fla_bg, fla_w_wy, fla_u_wy, fla_v_new
         // Each is [head_size, n_head, T, B] = head_size * n_head * T * B elements
-        let fla_per_token_elements = 5 * head_size * n_head * t * b;
+        let fla_per_token_elements = 9 * head_size * n_head * t * b;
         // 5 chunk-matrix buffers: fla_A_qk, fla_A_qb, fla_A_ab, fla_A_ak, fla_A_ab_inv
         // Each is [C, C, n_head, max_total_chunks]
         let fla_chunk_mat_elements = 5 * fla_c * fla_c * n_head * max_total_chunks;

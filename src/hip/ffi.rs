@@ -675,6 +675,33 @@ extern "C" {
         total_chunks: c_int,
         stream: HipStream,
     ) -> HipError;
+
+    /// Stage 2: Intra-chunk attention matrices.
+    /// Part A computes decay-scaled vectors qg, kg, ag, bg.
+    /// Part B computes 4 CxC attention matrices A_qk, A_qb, A_ak, A_ab.
+    pub fn launch_fla_intra(
+        q: *const f16,
+        k: *const f16,
+        a: *const f16,
+        b: *const f16,
+        gi: *const f32,
+        ge: *const f32,
+        qg: *mut f32,
+        kg: *mut f32,
+        ag: *mut f32,
+        bg: *mut f32,
+        a_qk: *mut f32,
+        a_qb: *mut f32,
+        a_ak: *mut f32,
+        a_ab: *mut f32,
+        chunk_indices: *const c_int,
+        cu_seqlens: *const c_int,
+        k_dim: c_int,
+        h: c_int,
+        c: c_int,
+        total_chunks: c_int,
+        stream: HipStream,
+    ) -> HipError;
 }
 
 /// HIP success error code
