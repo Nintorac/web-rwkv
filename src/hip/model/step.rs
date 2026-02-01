@@ -198,8 +198,17 @@ impl Rwkv7Hip {
             let mut temp1 = scratch.temp1.resized_view_mut(std_shape)?;
             let mut temp2 = scratch.temp2.resized_view_mut(std_shape)?;
 
-            // Select WKV kernel: fused_t1 for decode (T=1), wave_reduce for prefill (T>1)
-            let wkv_kernel: &dyn WkvKernel = if t == 1 { &FusedT1Wkv } else { &WaveReduceWkv };
+            // Select WKV kernel: 3-tier dispatch
+            //   T=1        → FusedT1Wkv (optimized decode)
+            //   1 < T < 32 → WaveReduceWkv (wave-cooperative reduction)
+            //   T >= 32    → FlaChunkedWkv (FLA chunked prefill, skeleton delegates to WaveReduce)
+            let wkv_kernel: &dyn WkvKernel = if t == 1 {
+                &FusedT1Wkv
+            } else if t >= super::fla::FLA_CHUNK_THRESHOLD {
+                &super::fla::FlaChunkedWkv
+            } else {
+                &WaveReduceWkv
+            };
 
             // PostEmbed probe: embedding output before any layer processing
             #[cfg(feature = "hip-probes")]

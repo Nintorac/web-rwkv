@@ -19,6 +19,9 @@ use super::pinned::PinnedBuffer;
 use super::tensor::{TensorHip, TensorShape};
 use half::f16;
 
+/// Default FLA chunk size (matches fla-org reference default for RWKV7).
+pub const FLA_CHUNK_SIZE: usize = 16;
+
 /// Runtime configuration for HIP inference.
 ///
 /// Controls buffer sizing and batching behavior for the forward pass.
@@ -32,6 +35,13 @@ pub struct HipRuntimeConfig {
     /// Batch size (number of sequences processed in parallel).
     /// Default: 1
     pub batch_size: usize,
+
+    /// FLA chunk size for chunked prefill. Default: 16.
+    ///
+    /// The FLA pipeline divides sequences into chunks of this size for
+    /// parallel intra-chunk computation. Must be > 0. Smaller values
+    /// reduce numerical error; larger values may improve throughput.
+    pub fla_chunk_size: usize,
 }
 
 impl Default for HipRuntimeConfig {
@@ -39,6 +49,7 @@ impl Default for HipRuntimeConfig {
         Self {
             max_prefill_chunk: 256,
             batch_size: 1,
+            fla_chunk_size: FLA_CHUNK_SIZE,
         }
     }
 }
@@ -49,6 +60,7 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk,
             batch_size,
+            fla_chunk_size: FLA_CHUNK_SIZE,
         }
     }
 
@@ -57,6 +69,7 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk: 1,
             batch_size: 1,
+            fla_chunk_size: FLA_CHUNK_SIZE,
         }
     }
 
@@ -65,6 +78,7 @@ impl HipRuntimeConfig {
         Self {
             max_prefill_chunk: max_chunk,
             batch_size: 1,
+            fla_chunk_size: FLA_CHUNK_SIZE,
         }
     }
 }
@@ -107,6 +121,7 @@ pub struct LoraDims {
 /// let (logits, state) = model.step(&[&tokens], None)?;
 /// ```
 #[derive(Debug)]
+#[allow(non_snake_case)] // FLA buffer names (fla_A_qk, etc.) match paper notation
 pub struct HipScratch {
     /// Configuration used to allocate these buffers
     pub config: HipRuntimeConfig,
@@ -237,6 +252,55 @@ pub struct HipScratch {
     /// Temporary shift state output (state shape)
     pub new_ffn_shift: TensorHip<f16>,
 
+    // ========== FLA chunked prefill buffers ==========
+    // Pre-allocated for the 5-stage FLA pipeline. Shared across layers.
+    // Sized for worst-case: max_total_chunks = batch_size * ceil_div(max_prefill_chunk, fla_chunk_size)
+    // All buffers are f32 for FP32 precision (matching the plan's "FP32 state" requirement).
+
+    /// Cumulative intra-chunk decay (Stage 1).
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_gi: TensorHip<f32>,
+
+    /// Total chunk decay (Stage 1).
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_ge: TensorHip<f32>,
+
+    /// Intra-chunk attention matrix: Q @ K^T (Stage 2).
+    /// Shape: `[C, C, n_head, max_total_chunks]`
+    pub fla_A_qk: TensorHip<f32>,
+
+    /// Query-bias attention matrix: Q @ B^T (Stage 2).
+    /// Shape: `[C, C, n_head, max_total_chunks]`
+    pub fla_A_qb: TensorHip<f32>,
+
+    /// Adapt-bias attention matrix: A @ B^T (Stage 2).
+    /// Shape: `[C, C, n_head, max_total_chunks]`
+    pub fla_A_ab: TensorHip<f32>,
+
+    /// Adapt-key attention matrix: A @ K^T (Stage 2).
+    /// Shape: `[C, C, n_head, max_total_chunks]`
+    pub fla_A_ak: TensorHip<f32>,
+
+    /// Inverse lower-triangular of A_ab (Stage 3).
+    /// Shape: `[C, C, n_head, max_total_chunks]`
+    pub fla_A_ab_inv: TensorHip<f32>,
+
+    /// WY representation w output (Stage 3).
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_w_wy: TensorHip<f32>,
+
+    /// WY representation u output (Stage 3).
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_u_wy: TensorHip<f32>,
+
+    /// Per-chunk recurrent states (Stage 4).
+    /// Shape: `[head_size, head_size, n_head, max_total_chunks]`
+    pub fla_h: TensorHip<f32>,
+
+    /// Corrected values after WY transform (Stage 4).
+    /// Shape: `[head_size, n_head, max_prefill_chunk, batch_size]`
+    pub fla_v_new: TensorHip<f32>,
+
     // ========== Output buffer [n_vocab, T, B] ==========
     /// Final logits output (f16)
     pub logits: TensorHip<f16>,
@@ -297,6 +361,19 @@ impl HipScratch {
         let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
         let state_shape = TensorShape::new(c, b, 1, 1);
         let wkv_state_shape = TensorShape::new(info.head_size, info.head_size, info.n_head, b);
+
+        // FLA shapes
+        let fla_c = config.fla_chunk_size;
+        let max_total_chunks = b * ((t + fla_c - 1) / fla_c); // ceil_div(t, fla_c) * b
+        let head_size = info.head_size;
+        let n_head = info.n_head;
+        // Per-token buffers: [head_size, n_head, max_prefill_chunk, batch_size]
+        let fla_per_token_shape = TensorShape::new(head_size, n_head, t, b);
+        // Per-chunk attention matrices: [C, C, n_head, max_total_chunks]
+        let fla_chunk_mat_shape = TensorShape::new(fla_c, fla_c, n_head, max_total_chunks);
+        // Per-chunk state buffers: [head_size, head_size, n_head, max_total_chunks]
+        let fla_chunk_state_shape =
+            TensorShape::new(head_size, head_size, n_head, max_total_chunks);
 
         let mut att_shift_state_gpu = Vec::with_capacity(info.n_layer);
         let mut ffn_state_gpu = Vec::with_capacity(info.n_layer);
@@ -369,6 +446,19 @@ impl HipScratch {
             new_att_shift: TensorHip::new(state_shape)?,
             new_ffn_shift: TensorHip::new(state_shape)?,
 
+            // FLA chunked prefill buffers (all f32)
+            fla_gi: TensorHip::new(fla_per_token_shape)?,
+            fla_ge: TensorHip::new(fla_per_token_shape)?,
+            fla_A_qk: TensorHip::new(fla_chunk_mat_shape)?,
+            fla_A_qb: TensorHip::new(fla_chunk_mat_shape)?,
+            fla_A_ab: TensorHip::new(fla_chunk_mat_shape)?,
+            fla_A_ak: TensorHip::new(fla_chunk_mat_shape)?,
+            fla_A_ab_inv: TensorHip::new(fla_chunk_mat_shape)?,
+            fla_w_wy: TensorHip::new(fla_per_token_shape)?,
+            fla_u_wy: TensorHip::new(fla_per_token_shape)?,
+            fla_h: TensorHip::new(fla_chunk_state_shape)?,
+            fla_v_new: TensorHip::new(fla_per_token_shape)?,
+
             // Output buffer
             logits: TensorHip::new(out_shape)?,
             logits_f32: TensorHip::new(out_shape)?,
@@ -418,8 +508,26 @@ impl HipScratch {
 
         let lora_size = (ld.w_dim + ld.a_dim + ld.g_dim + ld.v_dim.unwrap_or(0)) * t * b;
 
+        // FLA buffer sizes (all f32)
+        // Reconstruct dimensions from stored shapes
+        let fla_c = self.config.fla_chunk_size;
+        let n_head = self.fla_gi.shape().dim(1);
+        let head_size = if n_head > 0 { c / n_head } else { 0 };
+        let max_total_chunks = b * ((t + fla_c - 1) / fla_c);
+        // 5 per-token buffers: fla_gi, fla_ge, fla_w_wy, fla_u_wy, fla_v_new
+        // Each is [head_size, n_head, T, B] = head_size * n_head * T * B elements
+        let fla_per_token_elements = 5 * head_size * n_head * t * b;
+        // 5 chunk-matrix buffers: fla_A_qk, fla_A_qb, fla_A_ab, fla_A_ak, fla_A_ab_inv
+        // Each is [C, C, n_head, max_total_chunks]
+        let fla_chunk_mat_elements = 5 * fla_c * fla_c * n_head * max_total_chunks;
+        // 1 chunk-state buffer: fla_h
+        // Shape: [head_size, head_size, n_head, max_total_chunks]
+        let fla_chunk_state_elements = head_size * head_size * n_head * max_total_chunks;
+        let fla_f32_elements =
+            fla_per_token_elements + fla_chunk_mat_elements + fla_chunk_state_elements;
+
         let f16_elements = std_count * std_size + ffn_count * ffn_size + lora_size + out_size;
-        let f32_elements = out_size; // logits_f32 buffer
+        let f32_elements = out_size + fla_f32_elements; // logits_f32 + FLA buffers
         let u32_elements = token_size;
         f16_elements * std::mem::size_of::<f16>()
             + f32_elements * std::mem::size_of::<f32>()
