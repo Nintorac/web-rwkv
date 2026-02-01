@@ -1585,4 +1585,860 @@ mod tests {
 
         println!("HipState v_first persistence test PASSED");
     }
+
+    // === End-to-end FLA prefill tests (bd-2sh.8.10) ===
+    //
+    // These tests verify that the FLA chunked prefill path produces results
+    // matching the recurrent (WaveReduceWkv) path, and that state transfers
+    // correctly from FLA prefill to recurrent decode.
+    //
+    // Key design: dispatch() pads sequences to max_prefill_chunk, so the
+    // dispatch comparison `t >= FLA_CHUNK_THRESHOLD` compares against the
+    // padded chunk size, not the real sequence length.
+    //
+    // - max_prefill_chunk >= 32 => FLA path (FlaChunkedWkv)
+    // - max_prefill_chunk = 1  => T=1 path (FusedT1Wkv)
+    // - 1 < max_prefill_chunk < 32 => recurrent path (WaveReduceWkv)
+
+    /// Helper: compute top-k token indices from a logits slice.
+    fn top_k_indices(logits: &[f32], vocab: usize, token_idx: usize, k: usize) -> Vec<usize> {
+        let start = token_idx * vocab;
+        let end = start + vocab;
+        let mut indexed: Vec<(usize, f32)> =
+            logits[start..end].iter().copied().enumerate().collect();
+        indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        indexed.into_iter().take(k).map(|(i, _)| i).collect()
+    }
+
+    /// Helper: compute cosine similarity between two logit slices for one token.
+    fn cosine_similarity(a: &[f32], b: &[f32], vocab: usize, token_idx: usize) -> f64 {
+        let start = token_idx * vocab;
+        let end = start + vocab;
+        let a_slice = &a[start..end];
+        let b_slice = &b[start..end];
+
+        let mut dot = 0.0f64;
+        let mut a_norm = 0.0f64;
+        let mut b_norm = 0.0f64;
+        for (&av, &bv) in a_slice.iter().zip(b_slice.iter()) {
+            dot += (av as f64) * (bv as f64);
+            a_norm += (av as f64).powi(2);
+            b_norm += (bv as f64).powi(2);
+        }
+        dot / (a_norm.sqrt() * b_norm.sqrt())
+    }
+
+    /// End-to-end FLA vs recurrent correctness test.
+    ///
+    /// Runs the same tokens through both paths and compares the last-token
+    /// logits. The FLA path uses max_prefill_chunk=256 (T=256 >= 32 triggers
+    /// FLA dispatch). The recurrent path uses max_prefill_chunk=16 (T=16 < 32
+    /// uses WaveReduceWkv).
+    ///
+    /// Since the two paths use mathematically equivalent but numerically
+    /// different algorithms (chunked parallel vs sequential recurrent),
+    /// we expect approximate agreement, not exact match.
+    #[test]
+    fn test_fla_vs_recurrent_logits() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        // Input: 10 real tokens (well below both chunk sizes)
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let n_real = tokens.len();
+
+        // FLA path: max_prefill_chunk=256 => dispatch sees T=256 >= 32 => FLA
+        let model_fla = Rwkv7Hip::load(model_path).expect("load");
+        let config_fla = HipRuntimeConfig::new(256, 1);
+        let model_fla = model_fla.with_config(config_fla).expect("config");
+        let (logits_fla, state_fla) = model_fla
+            .step(&[&tokens], None)
+            .expect("FLA step failed");
+
+        // Recurrent path: max_prefill_chunk=16 => dispatch sees T=16 < 32 => WaveReduceWkv
+        let model_rec = Rwkv7Hip::load(model_path).expect("load");
+        let config_rec = HipRuntimeConfig::new(16, 1);
+        let model_rec = model_rec.with_config(config_rec).expect("config");
+        let (logits_rec, state_rec) = model_rec
+            .step(&[&tokens], None)
+            .expect("Recurrent step failed");
+
+        let vocab = model_fla.info.n_vocab;
+
+        // Both should return the same number of logits
+        assert_eq!(
+            logits_fla.len(),
+            n_real * vocab,
+            "FLA logits count mismatch"
+        );
+        assert_eq!(
+            logits_rec.len(),
+            n_real * vocab,
+            "Recurrent logits count mismatch"
+        );
+
+        // Verify FLA logits are finite
+        assert!(
+            logits_fla.iter().all(|x| x.is_finite()),
+            "FLA logits contain NaN or Inf"
+        );
+
+        // Compare last-token logits (the most important for generation)
+        let last_tok = n_real - 1;
+
+        // Cosine similarity between FLA and recurrent for last token
+        let cos_sim = cosine_similarity(&logits_fla, &logits_rec, vocab, last_tok);
+
+        // Top-k overlap
+        let fla_top10 = top_k_indices(&logits_fla, vocab, last_tok, 10);
+        let rec_top10 = top_k_indices(&logits_rec, vocab, last_tok, 10);
+        let top10_overlap = fla_top10
+            .iter()
+            .filter(|i| rec_top10.contains(i))
+            .count();
+
+        let fla_top1 = fla_top10[0];
+        let rec_top1 = rec_top10[0];
+
+        // Max absolute difference across all logits
+        let mut max_diff = 0.0f32;
+        let mut mean_diff = 0.0f64;
+        for (f, r) in logits_fla.iter().zip(logits_rec.iter()) {
+            let d = (f - r).abs();
+            max_diff = max_diff.max(d);
+            mean_diff += d as f64;
+        }
+        mean_diff /= logits_fla.len() as f64;
+
+        // WKV state comparison: max absolute diff across all layers
+        let n_layer = state_fla.att_states.len();
+        let mut max_state_diff = 0.0f32;
+        for layer in 0..n_layer {
+            let fla_state = state_fla.att_states[layer].as_slice();
+            let rec_state = state_rec.att_states[layer].as_slice();
+            for (f, r) in fla_state.iter().zip(rec_state.iter()) {
+                let d = (f - r).abs();
+                max_state_diff = max_state_diff.max(d);
+            }
+        }
+
+        println!("=== FLA vs Recurrent Comparison (bd-2sh.8.10) ===");
+        println!("  Tokens: {} real, FLA chunk=256, Recurrent chunk=16", n_real);
+        println!("  Last-token cosine similarity: {:.6}", cos_sim);
+        println!(
+            "  Last-token top-1: FLA={}, Recurrent={} ({})",
+            fla_top1,
+            rec_top1,
+            if fla_top1 == rec_top1 { "MATCH" } else { "DIFFER" }
+        );
+        println!("  Last-token top-10 overlap: {}/10", top10_overlap);
+        println!("  All-token max logit diff: {:.6e}", max_diff);
+        println!("  All-token mean logit diff: {:.6e}", mean_diff);
+        println!("  WKV state max diff (across layers): {:.6e}", max_state_diff);
+
+        // Assertions: FLA should produce coherent output even if not exactly matching.
+        // The tolerance is lenient because FLA uses a fundamentally different computation
+        // path (chunked parallel) vs the sequential recurrent kernel.
+        // Key acceptance criteria from the ticket:
+        // - "Model output matches recurrent-only inference within tolerance"
+        // - "No regression in decode quality"
+        assert!(
+            cos_sim > 0.90,
+            "Cosine similarity {:.6} too low (expected > 0.90) -- FLA output is incoherent",
+            cos_sim
+        );
+        assert!(
+            top10_overlap >= 3,
+            "Top-10 overlap {}/10 too low (expected >= 3)",
+            top10_overlap
+        );
+        assert!(
+            logits_fla.iter().all(|x| x.is_finite()),
+            "FLA logits must be finite"
+        );
+
+        println!("test_fla_vs_recurrent_logits PASSED");
+    }
+
+    /// FLA prefill -> recurrent decode state continuity test.
+    ///
+    /// 1. Prefill N tokens with FLA (chunk_size=256, T=256 >= 32 => FLA)
+    /// 2. Decode 1 more token with recurrent (step with T=1 => FusedT1Wkv)
+    /// 3. Compare the decode output against doing all N+1 tokens recurrently
+    ///
+    /// This tests that the WKV state produced by FLA is compatible with
+    /// subsequent recurrent decode, which is the core prefill->decode transition.
+    #[test]
+    fn test_fla_prefill_to_recurrent_decode() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        // 8 tokens for prefill, 1 token for decode
+        let prefill_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let decode_token: u32 = 9;
+
+        // === Path A: FLA prefill (256 chunk) -> recurrent decode (1 token) ===
+        let model_a = Rwkv7Hip::load(model_path).expect("load");
+        let config_a = HipRuntimeConfig::new(256, 1);
+        let model_a = model_a.with_config(config_a).expect("config");
+
+        // Prefill with FLA
+        let (_logits_prefill_a, state_a) = model_a
+            .step(&[&prefill_tokens], None)
+            .expect("FLA prefill failed");
+
+        // Decode with recurrent (T=1, FusedT1Wkv)
+        let (logits_decode_a, _) = model_a
+            .step(&[&[decode_token]], Some(state_a))
+            .expect("Decode after FLA failed");
+
+        // === Path B: All recurrent (16 chunk, token by token for last) ===
+        let model_b = Rwkv7Hip::load(model_path).expect("load");
+        let config_b = HipRuntimeConfig::new(16, 1);
+        let model_b = model_b.with_config(config_b).expect("config");
+
+        // Prefill recurrently
+        let (_logits_prefill_b, state_b) = model_b
+            .step(&[&prefill_tokens], None)
+            .expect("Recurrent prefill failed");
+
+        // Decode recurrently
+        let (logits_decode_b, _) = model_b
+            .step(&[&[decode_token]], Some(state_b))
+            .expect("Recurrent decode failed");
+
+        let vocab = model_a.info.n_vocab;
+        assert_eq!(logits_decode_a.len(), vocab, "Decode A logits size");
+        assert_eq!(logits_decode_b.len(), vocab, "Decode B logits size");
+
+        // Compare decode outputs
+        let cos_sim = {
+            let mut dot = 0.0f64;
+            let mut a_norm = 0.0f64;
+            let mut b_norm = 0.0f64;
+            for (&a, &b) in logits_decode_a.iter().zip(logits_decode_b.iter()) {
+                dot += (a as f64) * (b as f64);
+                a_norm += (a as f64).powi(2);
+                b_norm += (b as f64).powi(2);
+            }
+            dot / (a_norm.sqrt() * b_norm.sqrt())
+        };
+
+        let fla_top10 = top_k_indices(&logits_decode_a, vocab, 0, 10);
+        let rec_top10 = top_k_indices(&logits_decode_b, vocab, 0, 10);
+        let top10_overlap = fla_top10
+            .iter()
+            .filter(|i| rec_top10.contains(i))
+            .count();
+
+        let fla_top1 = fla_top10[0];
+        let rec_top1 = rec_top10[0];
+
+        let mut max_diff = 0.0f32;
+        for (&a, &b) in logits_decode_a.iter().zip(logits_decode_b.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+
+        println!("=== FLA Prefill -> Recurrent Decode (bd-2sh.8.10) ===");
+        println!("  Prefill: {} tokens (FLA), Decode: 1 token (recurrent)", prefill_tokens.len());
+        println!("  Decode cosine similarity: {:.6}", cos_sim);
+        println!(
+            "  Decode top-1: FLA+decode={}, Recurrent+decode={} ({})",
+            fla_top1,
+            rec_top1,
+            if fla_top1 == rec_top1 { "MATCH" } else { "DIFFER" }
+        );
+        println!("  Decode top-10 overlap: {}/10", top10_overlap);
+        println!("  Decode max logit diff: {:.6e}", max_diff);
+
+        // State continuity assertion: the decode output after FLA prefill should
+        // be highly similar to the decode output after recurrent prefill.
+        // Cosine similarity is the primary metric -- it measures whether the
+        // logit distributions point in the same direction. Top-k overlap is
+        // secondary since closely-ranked tokens may swap order with small
+        // numerical differences between FLA and recurrent state.
+        assert!(
+            cos_sim > 0.90,
+            "State continuity broken: cosine similarity {:.6} < 0.90",
+            cos_sim
+        );
+        assert!(
+            top10_overlap >= 1,
+            "State continuity: top-10 overlap {}/10 = 0 (no agreement at all)",
+            top10_overlap
+        );
+        assert!(
+            logits_decode_a.iter().all(|x| x.is_finite()),
+            "Decode logits after FLA must be finite"
+        );
+
+        println!("test_fla_prefill_to_recurrent_decode PASSED");
+    }
+
+    /// Verify FLA is transparent to HipRuntime.infer_one() / infer_resident() API.
+    ///
+    /// Uses the high-level HipRuntime interface (the same one hip_gen uses)
+    /// to run a prefill + decode sequence with FLA enabled by default.
+    /// This verifies the acceptance criterion:
+    /// "hip_gen example works with FLA enabled"
+    #[test]
+    fn test_fla_transparent_via_hip_runtime() {
+        use std::path::Path;
+        use crate::hip::HipRuntime;
+        use crate::tensor::TensorShape as TensorShapeTrait;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let model = Rwkv7Hip::load(model_path).expect("load");
+        // Default HipRuntime: chunk_size=256 >= 32, so FLA is active for prefill
+        let runtime = HipRuntime::new(model, 1);
+        let vocab = runtime.info().n_vocab;
+
+        // Prefill: 20 tokens (dispatches to FLA since chunk_size=256)
+        let prompt: Vec<u32> = (1..=20).collect();
+        let logits = runtime.infer_one(&prompt).expect("FLA prefill via HipRuntime failed");
+
+        // Basic sanity: output shape
+        let shape = logits.shape();
+        assert_eq!(shape[0], vocab, "vocab dim");
+        assert_eq!(shape[1], prompt.len(), "token dim");
+        assert!(
+            logits.data().iter().all(|x| x.is_finite()),
+            "Prefill logits must be finite"
+        );
+
+        // Get last-token logits and sample argmax
+        let last_start = (prompt.len() - 1) * vocab;
+        let last_logits = &logits.data()[last_start..last_start + vocab];
+        let first_token = last_logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i as u32)
+            .unwrap();
+
+        // Decode: 10 tokens one at a time (dispatches to FusedT1Wkv since T=1)
+        let mut generated = vec![first_token];
+        for _ in 0..9 {
+            let tok = *generated.last().unwrap();
+            let logits = runtime.infer_one(&[tok]).expect("Decode step failed");
+            assert!(
+                logits.data().iter().all(|x| x.is_finite()),
+                "Decode logits must be finite"
+            );
+            let next = logits
+                .data()
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            generated.push(next);
+        }
+
+        println!("=== FLA Transparent via HipRuntime (bd-2sh.8.10) ===");
+        println!("  Prefill: {} tokens (FLA path)", prompt.len());
+        println!("  Decoded: {} tokens (recurrent path)", generated.len());
+        println!("  Generated tokens: {:?}", generated);
+
+        // The key assertion is that we got through without errors.
+        // All logits finite, shapes correct, state transfer worked.
+        assert_eq!(generated.len(), 10, "Should have generated 10 tokens");
+
+        println!("test_fla_transparent_via_hip_runtime PASSED");
+    }
+
+    /// Verify the 3-tier dispatch is correct by checking which path fires
+    /// for different max_prefill_chunk values.
+    ///
+    /// This test uses the step() API at the boundary conditions:
+    /// - chunk_size=1 -> T=1 -> FusedT1Wkv
+    /// - chunk_size=16 -> T=16 < 32 -> WaveReduceWkv
+    /// - chunk_size=32 -> T=32 >= 32 -> FlaChunkedWkv
+    /// - chunk_size=256 -> T=256 >= 32 -> FlaChunkedWkv
+    ///
+    /// All paths should produce finite, sane logits for the same input.
+    #[test]
+    fn test_three_tier_dispatch() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let tokens: Vec<u32> = vec![1, 2, 3];
+
+        // Tier 1: FusedT1Wkv (one token at a time)
+        let model_t1 = Rwkv7Hip::load(model_path).expect("load");
+        let model_t1 = model_t1.with_config(HipRuntimeConfig::new(1, 1)).expect("config");
+        let mut t1_logits = Vec::new();
+        let mut state: Option<HipState> = None;
+        for &tok in &tokens {
+            let (logits, new_state) = model_t1
+                .step(&[&[tok]], state)
+                .expect("T=1 step failed");
+            t1_logits.extend(logits);
+            state = Some(new_state);
+        }
+
+        // Tier 2: WaveReduceWkv (T=16, below FLA threshold)
+        let model_wr = Rwkv7Hip::load(model_path).expect("load");
+        let model_wr = model_wr.with_config(HipRuntimeConfig::new(16, 1)).expect("config");
+        let (wr_logits, _) = model_wr
+            .step(&[&tokens], None)
+            .expect("WaveReduce step failed");
+
+        // Tier 3: FlaChunkedWkv at threshold (T=32)
+        let model_fla32 = Rwkv7Hip::load(model_path).expect("load");
+        let model_fla32 = model_fla32.with_config(HipRuntimeConfig::new(32, 1)).expect("config");
+        let (fla32_logits, _) = model_fla32
+            .step(&[&tokens], None)
+            .expect("FLA@32 step failed");
+
+        // Tier 3: FlaChunkedWkv large (T=256)
+        let model_fla256 = Rwkv7Hip::load(model_path).expect("load");
+        let model_fla256 = model_fla256.with_config(HipRuntimeConfig::new(256, 1)).expect("config");
+        let (fla256_logits, _) = model_fla256
+            .step(&[&tokens], None)
+            .expect("FLA@256 step failed");
+
+        let vocab = model_t1.info.n_vocab;
+        let n_real = tokens.len();
+
+        // All paths should produce correct number of logits
+        assert_eq!(t1_logits.len(), n_real * vocab, "T1 logits size");
+        assert_eq!(wr_logits.len(), n_real * vocab, "WR logits size");
+        assert_eq!(fla32_logits.len(), n_real * vocab, "FLA32 logits size");
+        assert_eq!(fla256_logits.len(), n_real * vocab, "FLA256 logits size");
+
+        // All paths should produce finite logits
+        assert!(t1_logits.iter().all(|x| x.is_finite()), "T1 logits finite");
+        assert!(wr_logits.iter().all(|x| x.is_finite()), "WR logits finite");
+        assert!(fla32_logits.iter().all(|x| x.is_finite()), "FLA32 logits finite");
+        assert!(fla256_logits.iter().all(|x| x.is_finite()), "FLA256 logits finite");
+
+        // WaveReduce (T>1 recurrent) should match T=1 streaming closely
+        // (these are the same recurrent algorithm, just chunked vs streaming)
+        let cos_t1_wr = cosine_similarity(&t1_logits, &wr_logits, vocab, n_real - 1);
+
+        // FLA paths should agree with each other
+        let cos_fla32_fla256 = cosine_similarity(&fla32_logits, &fla256_logits, vocab, n_real - 1);
+
+        // FLA should be at least roughly similar to recurrent
+        let cos_wr_fla256 = cosine_similarity(&wr_logits, &fla256_logits, vocab, n_real - 1);
+
+        println!("=== 3-Tier Dispatch Test (bd-2sh.8.10) ===");
+        println!("  T=1 vs WaveReduce cosine: {:.6}", cos_t1_wr);
+        println!("  FLA@32 vs FLA@256 cosine: {:.6}", cos_fla32_fla256);
+        println!("  WaveReduce vs FLA@256 cosine: {:.6}", cos_wr_fla256);
+
+        // T=1 streaming vs WaveReduce should be very close (same algorithm)
+        assert!(
+            cos_t1_wr > 0.95,
+            "T=1 vs WaveReduce cosine {:.6} too low",
+            cos_t1_wr
+        );
+
+        // FLA@32 and FLA@256 should be very close (same FLA algorithm, just
+        // different padding -- the real tokens are the same)
+        assert!(
+            cos_fla32_fla256 > 0.95,
+            "FLA@32 vs FLA@256 cosine {:.6} too low",
+            cos_fla32_fla256
+        );
+
+        // FLA vs recurrent should be at least roughly similar
+        assert!(
+            cos_wr_fla256 > 0.90,
+            "WaveReduce vs FLA cosine {:.6} too low",
+            cos_wr_fla256
+        );
+
+        println!("test_three_tier_dispatch PASSED");
+    }
+
+    /// Detailed ranking analysis comparing FLA vs recurrent logit distributions.
+    ///
+    /// For each of the 10 input tokens AND the last token specifically, computes:
+    /// - Top-k overlap for k=1,5,10,50,100,500,1000
+    /// - Spearman rank correlation across full vocabulary
+    /// - Kendall tau on top-1000 subset (full vocab would be O(n^2))
+    /// - Max absolute logit difference
+    /// - Mean absolute logit difference
+    /// - L2 distance between logit vectors
+    /// - Cosine similarity
+    /// - KL divergence after softmax
+    /// - Side-by-side top-10 tokens from each path
+    #[test]
+    fn test_fla_ranking_analysis() {
+        use std::path::Path;
+
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        // Input: 10 real tokens
+        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let n_real = tokens.len();
+
+        // FLA path: max_prefill_chunk=256 => FLA dispatch
+        let model_fla = Rwkv7Hip::load(model_path).expect("load");
+        let config_fla = HipRuntimeConfig::new(256, 1);
+        let model_fla = model_fla.with_config(config_fla).expect("config");
+        let (logits_fla, _) = model_fla
+            .step(&[&tokens], None)
+            .expect("FLA step failed");
+
+        // Recurrent path: max_prefill_chunk=16 => WaveReduceWkv
+        let model_rec = Rwkv7Hip::load(model_path).expect("load");
+        let config_rec = HipRuntimeConfig::new(16, 1);
+        let model_rec = model_rec.with_config(config_rec).expect("config");
+        let (logits_rec, _) = model_rec
+            .step(&[&tokens], None)
+            .expect("Recurrent step failed");
+
+        let vocab = model_fla.info.n_vocab;
+
+        assert_eq!(logits_fla.len(), n_real * vocab);
+        assert_eq!(logits_rec.len(), n_real * vocab);
+
+        // ---- Helper closures ----
+
+        // Extract logit slice for a given token index (inline as a fn to avoid lifetime issues)
+        fn logit_slice_of(logits: &[f32], vocab: usize, token_idx: usize) -> &[f32] {
+            let start = token_idx * vocab;
+            &logits[start..start + vocab]
+        }
+
+        // Top-k indices (sorted by descending logit value)
+        let top_k = |slice: &[f32], k: usize| -> Vec<usize> {
+            let mut indexed: Vec<(usize, f32)> =
+                slice.iter().copied().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            indexed.into_iter().take(k).map(|(i, _)| i).collect()
+        };
+
+        // Top-k overlap count
+        let top_k_overlap = |a: &[f32], b: &[f32], k: usize| -> usize {
+            let a_top = top_k(a, k);
+            let b_top = top_k(b, k);
+            a_top.iter().filter(|i| b_top.contains(i)).count()
+        };
+
+        // Compute ranks for a slice (rank 0 = highest logit)
+        let compute_ranks = |slice: &[f32]| -> Vec<f64> {
+            let mut indexed: Vec<(usize, f32)> =
+                slice.iter().copied().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut ranks = vec![0.0f64; slice.len()];
+            for (rank, (idx, _)) in indexed.iter().enumerate() {
+                ranks[*idx] = rank as f64;
+            }
+            ranks
+        };
+
+        // Pearson correlation between two f64 slices
+        let pearson = |a: &[f64], b: &[f64]| -> f64 {
+            let n = a.len() as f64;
+            let mean_a: f64 = a.iter().sum::<f64>() / n;
+            let mean_b: f64 = b.iter().sum::<f64>() / n;
+            let mut cov = 0.0f64;
+            let mut var_a = 0.0f64;
+            let mut var_b = 0.0f64;
+            for (&ai, &bi) in a.iter().zip(b.iter()) {
+                let da = ai - mean_a;
+                let db = bi - mean_b;
+                cov += da * db;
+                var_a += da * da;
+                var_b += db * db;
+            }
+            if var_a == 0.0 || var_b == 0.0 {
+                return 0.0;
+            }
+            cov / (var_a.sqrt() * var_b.sqrt())
+        };
+
+        // Spearman rank correlation: rank both, then Pearson of ranks
+        let spearman = |a: &[f32], b: &[f32]| -> f64 {
+            let ranks_a = compute_ranks(a);
+            let ranks_b = compute_ranks(b);
+            pearson(&ranks_a, &ranks_b)
+        };
+
+        // Kendall tau on a subset (top-k indices from the union of both paths)
+        // Uses the O(n^2) naive algorithm, so we restrict to a subset.
+        let kendall_tau_subset = |a: &[f32], b: &[f32], k: usize| -> f64 {
+            // Get the union of top-k indices from both
+            let a_top = top_k(a, k);
+            let b_top = top_k(b, k);
+            let mut union_indices: Vec<usize> = a_top.clone();
+            for &idx in &b_top {
+                if !union_indices.contains(&idx) {
+                    union_indices.push(idx);
+                }
+            }
+            let n = union_indices.len();
+            if n < 2 {
+                return 1.0;
+            }
+
+            // Extract (a_val, b_val) pairs for union indices
+            let pairs: Vec<(f32, f32)> = union_indices
+                .iter()
+                .map(|&i| (a[i], b[i]))
+                .collect();
+
+            let mut concordant: i64 = 0;
+            let mut discordant: i64 = 0;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let a_diff = pairs[i].0 - pairs[j].0;
+                    let b_diff = pairs[i].1 - pairs[j].1;
+                    let product = (a_diff as f64) * (b_diff as f64);
+                    if product > 0.0 {
+                        concordant += 1;
+                    } else if product < 0.0 {
+                        discordant += 1;
+                    }
+                    // ties are ignored (neither concordant nor discordant)
+                }
+            }
+
+            let total = concordant + discordant;
+            if total == 0 {
+                return 1.0;
+            }
+            (concordant - discordant) as f64 / total as f64
+        };
+
+        // Cosine similarity between two slices
+        let cosine_sim = |a: &[f32], b: &[f32]| -> f64 {
+            let mut dot = 0.0f64;
+            let mut a_norm = 0.0f64;
+            let mut b_norm = 0.0f64;
+            for (&av, &bv) in a.iter().zip(b.iter()) {
+                dot += (av as f64) * (bv as f64);
+                a_norm += (av as f64).powi(2);
+                b_norm += (bv as f64).powi(2);
+            }
+            dot / (a_norm.sqrt() * b_norm.sqrt())
+        };
+
+        // Max absolute difference
+        let max_abs_diff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+
+        // Mean absolute difference
+        let mean_abs_diff = |a: &[f32], b: &[f32]| -> f64 {
+            let sum: f64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs() as f64)
+                .sum();
+            sum / a.len() as f64
+        };
+
+        // L2 distance
+        let l2_distance = |a: &[f32], b: &[f32]| -> f64 {
+            let sum: f64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(x, y)| ((x - y) as f64).powi(2))
+                .sum();
+            sum.sqrt()
+        };
+
+        // Stable softmax: subtract max before exponentiating
+        let softmax = |slice: &[f32]| -> Vec<f64> {
+            let max_val = slice
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f64> = slice
+                .iter()
+                .map(|&x| ((x - max_val) as f64).exp())
+                .collect();
+            let sum: f64 = exps.iter().sum();
+            exps.iter().map(|&e| e / sum).collect()
+        };
+
+        // KL divergence: sum(p * log(p/q)) with epsilon for numerical stability
+        let kl_divergence = |a: &[f32], b: &[f32]| -> f64 {
+            let p = softmax(a);
+            let q = softmax(b);
+            let eps = 1e-10f64;
+            let mut kl = 0.0f64;
+            for (&pi, &qi) in p.iter().zip(q.iter()) {
+                if pi > eps {
+                    kl += pi * (pi / (qi + eps)).ln();
+                }
+            }
+            kl
+        };
+
+        // ---- Detailed analysis for one token position ----
+        let analyze_token = |token_idx: usize, label: &str| {
+            let fla_slice = logit_slice_of(&logits_fla, vocab, token_idx);
+            let rec_slice = logit_slice_of(&logits_rec, vocab, token_idx);
+
+            println!("\n--- {} (token position {}) ---", label, token_idx);
+
+            // Top-k overlap
+            let k_values = [1, 5, 10, 50, 100, 500, 1000];
+            println!("  Top-k overlap:");
+            for &k in &k_values {
+                let overlap = top_k_overlap(fla_slice, rec_slice, k);
+                println!(
+                    "    k={:>4}: {}/{} ({:.1}%)",
+                    k,
+                    overlap,
+                    k,
+                    100.0 * overlap as f64 / k as f64
+                );
+            }
+
+            // Spearman rank correlation
+            let rho = spearman(fla_slice, rec_slice);
+            println!("  Spearman rank correlation: {:.6}", rho);
+
+            // Kendall tau on top-1000 subset
+            let tau = kendall_tau_subset(fla_slice, rec_slice, 1000);
+            println!("  Kendall tau (top-1000 subset): {:.6}", tau);
+
+            // Max absolute difference
+            let max_d = max_abs_diff(fla_slice, rec_slice);
+            println!("  Max absolute logit diff: {:.6e}", max_d);
+
+            // Mean absolute difference
+            let mean_d = mean_abs_diff(fla_slice, rec_slice);
+            println!("  Mean absolute logit diff: {:.6e}", mean_d);
+
+            // L2 distance
+            let l2 = l2_distance(fla_slice, rec_slice);
+            println!("  L2 distance: {:.6e}", l2);
+
+            // Cosine similarity
+            let cos = cosine_sim(fla_slice, rec_slice);
+            println!("  Cosine similarity: {:.6}", cos);
+
+            // KL divergence (FLA || Recurrent) and (Recurrent || FLA)
+            let kl_fla_rec = kl_divergence(fla_slice, rec_slice);
+            let kl_rec_fla = kl_divergence(rec_slice, fla_slice);
+            println!("  KL(FLA || Recurrent): {:.6e}", kl_fla_rec);
+            println!("  KL(Recurrent || FLA): {:.6e}", kl_rec_fla);
+
+            // Side-by-side top-10
+            let fla_top10 = top_k(fla_slice, 10);
+            let rec_top10 = top_k(rec_slice, 10);
+            println!("  Top-10 side-by-side:");
+            println!(
+                "    {:>4}  {:>12} {:>12}  |  {:>12} {:>12}",
+                "Rank", "FLA_id", "FLA_logit", "Rec_id", "Rec_logit"
+            );
+            for rank in 0..10 {
+                let fi = fla_top10[rank];
+                let ri = rec_top10[rank];
+                println!(
+                    "    {:>4}  {:>12} {:>12.4}  |  {:>12} {:>12.4}",
+                    rank + 1,
+                    fi,
+                    fla_slice[fi],
+                    ri,
+                    rec_slice[ri]
+                );
+            }
+        };
+
+        // ---- Run analysis ----
+        println!("================================================================");
+        println!("=== FLA vs Recurrent Ranking Analysis ===");
+        println!("================================================================");
+        println!("  Tokens: {} real, FLA chunk=256, Recurrent chunk=16", n_real);
+        println!("  Vocab size: {}", vocab);
+
+        // Detailed analysis for the LAST token
+        analyze_token(n_real - 1, "LAST TOKEN (primary)");
+
+        // Summary table header for all tokens
+        println!("\n================================================================");
+        println!("=== Per-Token Summary Table ===");
+        println!("================================================================");
+        println!(
+            "{:>5} {:>8} {:>8} {:>9} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "Pos", "Top1=?", "Top5", "Top10", "Top100",
+            "Spearman", "Kendall", "CosSim", "MaxDiff", "KL(F||R)"
+        );
+
+        // Analyze each of the 10 tokens
+        for ti in 0..n_real {
+            let fla_slice = logit_slice_of(&logits_fla, vocab, ti);
+            let rec_slice = logit_slice_of(&logits_rec, vocab, ti);
+
+            let top1_match = if top_k(fla_slice, 1)[0] == top_k(rec_slice, 1)[0] {
+                "YES"
+            } else {
+                "NO"
+            };
+            let top5_ov = top_k_overlap(fla_slice, rec_slice, 5);
+            let top10_ov = top_k_overlap(fla_slice, rec_slice, 10);
+            let top100_ov = top_k_overlap(fla_slice, rec_slice, 100);
+            let rho = spearman(fla_slice, rec_slice);
+            let tau = kendall_tau_subset(fla_slice, rec_slice, 1000);
+            let cos = cosine_sim(fla_slice, rec_slice);
+            let max_d = max_abs_diff(fla_slice, rec_slice);
+            let kl = kl_divergence(fla_slice, rec_slice);
+
+            println!(
+                "{:>5} {:>8} {:>5}/{:<2} {:>6}/{:<3} {:>7}/{:<3} {:>10.6} {:>10.6} {:>10.6} {:>10.4e} {:>10.4e}",
+                ti,
+                top1_match,
+                top5_ov, 5,
+                top10_ov, 10,
+                top100_ov, 100,
+                rho,
+                tau,
+                cos,
+                max_d,
+                kl
+            );
+        }
+
+        // Also print detailed analysis for each token
+        for ti in 0..n_real {
+            analyze_token(ti, &format!("Token {}", ti));
+        }
+
+        println!("\n================================================================");
+        println!("=== Analysis Complete ===");
+        println!("================================================================");
+
+        // No assertions -- this test is purely for diagnostic output
+        println!("test_fla_ranking_analysis PASSED (diagnostic only, no assertions)");
+    }
 }

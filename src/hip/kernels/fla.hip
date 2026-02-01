@@ -224,14 +224,18 @@ void kernel_fla_intra_gate(
 // ============================================================================
 // Stage 2, Part B: Intra-chunk attention matrices (kernel_fla_intra_attn)
 //
-// Computes 4 CxC attention matrices per chunk via dot products of gated vectors:
-//   A_qk[i,j] = sum_k(qg[i,k] * kg[j,k])  for j <= i  (lower triangular)
-//   A_qb[i,j] = sum_k(qg[i,k] * bg[j,k])  for j <= i
-//   A_ak[i,j] = sum_k(ag[i,k] * kg[j,k])  for j < i   (strict lower triangular)
-//   A_ab[i,j] = sum_k(ag[i,k] * bg[j,k])  for j < i
+// Computes 4 CxC attention matrices per chunk using raw inputs with inline
+// decay factors (NOT the pre-gated vectors which include g_last offset):
+//   A_qk[i,j] = sum_k(q[i,k] * k[j,k] * exp(gi[i,k] - gi[j,k]))  for j <= i
+//   A_qb[i,j] = sum_k(q[i,k] * b[j,k] * exp(gi[i,k] - gi[j,k]))  for j <= i
+//   A_ak[i,j] = sum_k(a[i,k] * k[j,k] * exp(ge[i,k] - gi[j,k]))  for j < i
+//   A_ab[i,j] = sum_k(a[i,k] * b[j,k] * exp(ge[i,k] - gi[j,k]))  for j < i
 //
-// Inputs qg, kg, ag, bg are f32 [K, H, T, B] (from Part A).
+// Inputs q, k, a, b are f16 [K, H, T, B].
+// Inputs gi, ge are f32 [K, H, T, B] (from Stage 1).
 // Outputs are f32 [C, C, H, total_chunks] (column-major: i fastest).
+//
+// Reference: repos/flash-linear-attention/fla/ops/generalized_delta_rule/dplr/chunk_A_fwd.py:109-133
 //
 // Grid:  dim3(total_chunks, H, 1)
 // Block: dim3(C) where C=16 (one thread per row i of the attention matrices)
@@ -239,10 +243,12 @@ void kernel_fla_intra_gate(
 
 __global__ __launch_bounds__(16, 16)
 void kernel_fla_intra_attn(
-    const float* __restrict__ qg,              // [K, H, T_packed, 1]
-    const float* __restrict__ kg,              // [K, H, T_packed, 1]
-    const float* __restrict__ ag,              // [K, H, T_packed, 1]
-    const float* __restrict__ bg,              // [K, H, T_packed, 1]
+    const __half* __restrict__ q,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ k,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ a,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ b,              // [K, H, T_packed, 1] f16
+    const float*  __restrict__ gi,             // [K, H, T_packed, 1] inclusive cumsum
+    const float*  __restrict__ ge,             // [K, H, T_packed, 1] exclusive cumsum
     float* __restrict__ A_qk,                  // [C, C, H, total_chunks]
     float* __restrict__ A_qb,                  // [C, C, H, total_chunks]
     float* __restrict__ A_ak,                  // [C, C, H, total_chunks]
@@ -295,8 +301,7 @@ void kernel_fla_intra_attn(
         return;
     }
 
-    // Preload row i vectors: qg[i,:] and ag[i,:] across all K elements
-    // i_abs is valid, so we can safely load
+    // Base offset for row i
     const int row_i_base = base_h + i_abs * token_stride;
 
     // Loop over columns j
@@ -326,7 +331,7 @@ void kernel_fla_intra_attn(
             continue;
         }
 
-        // Compute dot products across K dimension
+        // Compute dot products across K dimension using raw inputs with inline decay
         const int row_j_base = base_h + j_abs * token_stride;
 
         float dot_qk = 0.0f;
@@ -336,15 +341,21 @@ void kernel_fla_intra_attn(
 
         #pragma unroll 16
         for (int kk = 0; kk < K_dim; kk++) {
-            const float qg_ik = qg[row_i_base + kk];
-            const float ag_ik = ag[row_i_base + kk];
-            const float kg_jk = kg[row_j_base + kk];
-            const float bg_jk = bg[row_j_base + kk];
+            const float q_ik = __half2float(q[row_i_base + kk]);
+            const float k_jk = __half2float(k[row_j_base + kk]);
+            const float a_ik = __half2float(a[row_i_base + kk]);
+            const float b_jk = __half2float(b[row_j_base + kk]);
+            const float gi_ik = gi[row_i_base + kk];
+            const float gi_jk = gi[row_j_base + kk];
+            const float ge_ik = ge[row_i_base + kk];
 
-            dot_qk += qg_ik * kg_jk;
-            dot_qb += qg_ik * bg_jk;
-            dot_ak += ag_ik * kg_jk;
-            dot_ab += ag_ik * bg_jk;
+            const float decay_qk = expf(gi_ik - gi_jk);
+            const float decay_ak = expf(ge_ik - gi_jk);
+
+            dot_qk += q_ik * k_jk * decay_qk;
+            dot_qb += q_ik * b_jk * decay_qk;
+            dot_ak += a_ik * k_jk * decay_ak;
+            dot_ab += a_ik * b_jk * decay_ak;
         }
 
         // Store with causal masking applied
@@ -407,13 +418,13 @@ hipError_t launch_fla_intra(
         if (err != hipSuccess) return err;
     }
 
-    // Part B: Compute CxC attention matrices
+    // Part B: Compute CxC attention matrices using raw inputs with inline decay
     {
         dim3 grid(total_chunks, H, 1);
         dim3 block(C);
 
         hipLaunchKernelGGL(kernel_fla_intra_attn, grid, block, 0, stream,
-                           qg, kg, ag, bg,
+                           q, k, a, b, gi, ge,
                            A_qk, A_qb, A_ak, A_ab,
                            chunk_indices, cu_seqlens,
                            K, H, C);
@@ -1086,15 +1097,24 @@ void kernel_fla_chunk_o(
         // qg @ h produces a [K]-element vector per token position.
         // For output element kk (the V dimension), we compute:
         //   sum over k_inner: qg[i, k_inner] * h[k_inner, kk, head, chunk]
-        float state_dot = 0.0f;
+        //
+        // Use pairwise summation for better numerical precision (K_dim=64 elements).
+        float pairs[64];
         #pragma unroll 16
         for (int k_inner = 0; k_inner < K_dim; k_inner++) {
-            // qg[k_inner, h, i_abs+bos] = qg[k_inner + tok_offset_base]
             const float qg_val = qg[k_inner + tok_offset];
-            // h[k_inner, kk, h, chunk] = h[k_inner + kk*K + h_base]
             const float h_val = h[k_inner + kk * K_dim + h_base];
-            state_dot += qg_val * h_val;
+            pairs[k_inner] = qg_val * h_val;
         }
+        // Pairwise reduce: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+        #pragma unroll
+        for (int stride = 32; stride >= 1; stride >>= 1) {
+            #pragma unroll
+            for (int idx = 0; idx < stride; idx++) {
+                pairs[idx] += pairs[idx + stride];
+            }
+        }
+        float state_dot = pairs[0];
 
         // Term 2: sum_j(A_qk[i,j] * v[j, kk]) for j in valid positions
         float local_attn = 0.0f;

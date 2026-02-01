@@ -668,6 +668,48 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // FLA dispatch threshold
+    // ------------------------------------------------------------------
+
+    /// Verify FLA_CHUNK_THRESHOLD is consistent with fla_chunk_size.
+    /// FLA needs at least one full chunk (C=16 by default) to be useful,
+    /// so the threshold should be >= chunk_size. Currently threshold = 32
+    /// which means at least 2 full chunks are required.
+    #[test]
+    fn test_fla_threshold_consistent_with_chunk_size() {
+        use crate::hip::scratch::FLA_CHUNK_SIZE;
+
+        assert!(
+            FLA_CHUNK_THRESHOLD >= FLA_CHUNK_SIZE,
+            "FLA_CHUNK_THRESHOLD ({}) must be >= FLA_CHUNK_SIZE ({}) \
+             so at least one full chunk is guaranteed",
+            FLA_CHUNK_THRESHOLD,
+            FLA_CHUNK_SIZE,
+        );
+    }
+
+    /// Verify the dispatch boundary values.
+    /// T < 32 should NOT use FLA, T >= 32 should use FLA.
+    #[test]
+    fn test_fla_dispatch_boundary() {
+        // Below threshold: no FLA
+        assert!(
+            31 < FLA_CHUNK_THRESHOLD,
+            "T=31 should be below threshold"
+        );
+        // At threshold: yes FLA
+        assert!(
+            32 >= FLA_CHUNK_THRESHOLD,
+            "T=32 should be at or above threshold"
+        );
+        // Well above threshold: yes FLA
+        assert!(
+            256 >= FLA_CHUNK_THRESHOLD,
+            "T=256 should be at or above threshold"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Consistency: offsets agree with indices
     // ------------------------------------------------------------------
 
