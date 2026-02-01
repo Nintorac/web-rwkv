@@ -105,5 +105,3 @@ backtrace = []
 hip = []
 ## Enable HIP intermediate value probing for validation against ground truth fixtures.
 hip-probes = ["hip"]
-## Enable wgpu profiling via GPU timestamp queries.
-wgpu-prof = []

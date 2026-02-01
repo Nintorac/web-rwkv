@@ -81,8 +81,6 @@ impl crate::context::Context {
             pipeline: &'a CachedPipeline,
             bindings: &'a [Arc<BindGroup>],
             dispatch: &'a [u32; 3],
-            #[cfg(feature = "wgpu-prof")]
-            label: Option<&'static str>,
         }
 
         fn dispatch<'b, 'a: 'b>(
@@ -91,8 +89,6 @@ impl crate::context::Context {
                 pipeline,
                 bindings,
                 dispatch,
-                #[cfg(feature = "wgpu-prof")]
-                    label: _,
             }: Atom<'a>,
         ) {
             pass.set_pipeline(&pipeline.pipeline);
@@ -102,39 +98,6 @@ impl crate::context::Context {
             pass.dispatch_workgroups(dispatch[0], dispatch[1], dispatch[2]);
         }
 
-        #[cfg(feature = "wgpu-prof")]
-        fn flatten<'b, 'a: 'b>(
-            commands: &'b mut Vec<Vec<Atom<'a>>>,
-            passes: &'b mut Vec<Atom<'a>>,
-            op: &'a TensorOp,
-            current_label: Option<&'static str>,
-        ) {
-            match op {
-                TensorOp::Atom {
-                    pipeline,
-                    bindings,
-                    dispatch,
-                } => passes.push(Atom {
-                    pipeline,
-                    bindings,
-                    dispatch,
-                    label: current_label,
-                }),
-                TensorOp::Labeled { label, inner } => {
-                    flatten(commands, passes, inner, Some(label));
-                }
-                TensorOp::List(ops) => ops
-                    .iter()
-                    .for_each(|op| flatten(commands, passes, op, current_label)),
-                TensorOp::Sep => {
-                    let mut temp = vec![];
-                    std::mem::swap(&mut temp, passes);
-                    commands.push(temp);
-                }
-            }
-        }
-
-        #[cfg(not(feature = "wgpu-prof"))]
         fn flatten<'b, 'a: 'b>(
             commands: &'b mut Vec<Vec<Atom<'a>>>,
             passes: &'b mut Vec<Atom<'a>>,
@@ -161,9 +124,6 @@ impl crate::context::Context {
 
         let mut commands = vec![];
         let mut passes = vec![];
-        #[cfg(feature = "wgpu-prof")]
-        flatten(&mut commands, &mut passes, op, None);
-        #[cfg(not(feature = "wgpu-prof"))]
         flatten(&mut commands, &mut passes, op);
         commands.push(passes);
 
@@ -177,122 +137,6 @@ impl crate::context::Context {
                     dispatch(&mut pass, atom);
                 }
                 drop(pass);
-                encoder.finish()
-            })
-            .collect()
-    }
-
-    /// Encode operations with profiling support.
-    /// Timestamps are written around labeled operations.
-    #[cfg(feature = "wgpu-prof")]
-    pub fn encode_profiled(
-        &self,
-        op: &TensorOp,
-        prof: &mut super::prof::WgpuProf,
-    ) -> Vec<CommandBuffer> {
-        use wgpu::ComputePassTimestampWrites;
-
-        struct Atom<'a> {
-            pipeline: &'a CachedPipeline,
-            bindings: &'a [Arc<BindGroup>],
-            dispatch: &'a [u32; 3],
-            label: Option<&'static str>,
-        }
-
-        fn flatten<'b, 'a: 'b>(
-            commands: &'b mut Vec<Vec<Atom<'a>>>,
-            passes: &'b mut Vec<Atom<'a>>,
-            op: &'a TensorOp,
-            current_label: Option<&'static str>,
-        ) {
-            match op {
-                TensorOp::Atom {
-                    pipeline,
-                    bindings,
-                    dispatch,
-                } => passes.push(Atom {
-                    pipeline,
-                    bindings,
-                    dispatch,
-                    label: current_label,
-                }),
-                TensorOp::Labeled { label, inner } => {
-                    flatten(commands, passes, inner, Some(label));
-                }
-                TensorOp::List(ops) => ops
-                    .iter()
-                    .for_each(|op| flatten(commands, passes, op, current_label)),
-                TensorOp::Sep => {
-                    let mut temp = vec![];
-                    std::mem::swap(&mut temp, passes);
-                    commands.push(temp);
-                }
-            }
-        }
-
-        let mut commands = vec![];
-        let mut passes = vec![];
-        flatten(&mut commands, &mut passes, op, None);
-        commands.push(passes);
-
-        commands
-            .into_iter()
-            .filter(|atoms| !atoms.is_empty())
-            .map(|atoms| {
-                let mut encoder = self.device.create_command_encoder(&Default::default());
-
-                // Group consecutive atoms by label for efficient timestamp writes
-                let mut i = 0;
-                while i < atoms.len() {
-                    let current_label = atoms[i].label;
-
-                    // Find the end of this label group
-                    let mut j = i + 1;
-                    while j < atoms.len() && atoms[j].label == current_label {
-                        j += 1;
-                    }
-
-                    // Record start timestamp for labeled groups
-                    let start_idx = if let Some(label) = current_label {
-                        prof.start(label)
-                    } else {
-                        None
-                    };
-
-                    // Create compute pass with timestamp writes if labeled
-                    let timestamp_writes = if let Some(start) = start_idx {
-                        let end = prof.end();
-                        Some(ComputePassTimestampWrites {
-                            query_set: prof.query_set(),
-                            beginning_of_pass_write_index: Some(start),
-                            end_of_pass_write_index: end,
-                        })
-                    } else {
-                        None
-                    };
-
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: current_label,
-                        timestamp_writes,
-                    });
-
-                    // Dispatch all atoms in this group
-                    for atom in &atoms[i..j] {
-                        pass.set_pipeline(&atom.pipeline.pipeline);
-                        for (index, bind) in atom.bindings.iter().enumerate() {
-                            pass.set_bind_group(index as u32, &**bind, &[]);
-                        }
-                        pass.dispatch_workgroups(
-                            atom.dispatch[0],
-                            atom.dispatch[1],
-                            atom.dispatch[2],
-                        );
-                    }
-
-                    drop(pass);
-                    i = j;
-                }
-
                 encoder.finish()
             })
             .collect()
@@ -439,13 +283,6 @@ pub enum TensorOp {
         bindings: Vec<Arc<BindGroup>>,
         dispatch: [u32; 3],
     },
-    /// A labeled operation for profiling. When profiling is enabled,
-    /// timestamps are recorded before and after this operation.
-    #[cfg(feature = "wgpu-prof")]
-    Labeled {
-        label: &'static str,
-        inner: Box<TensorOp>,
-    },
     List(Vec<TensorOp>),
     Sep,
 }
@@ -457,24 +294,6 @@ impl TensorOp {
     #[inline]
     pub fn empty() -> Self {
         Self::List(vec![])
-    }
-
-    /// Wrap an operation with a label for profiling.
-    /// When `wgpu-prof` feature is enabled, timestamps are recorded around this operation.
-    #[inline]
-    #[cfg(feature = "wgpu-prof")]
-    pub fn labeled(label: &'static str, op: Self) -> Self {
-        Self::Labeled {
-            label,
-            inner: Box::new(op),
-        }
-    }
-
-    /// No-op when profiling is disabled - just returns the operation unchanged.
-    #[inline]
-    #[cfg(not(feature = "wgpu-prof"))]
-    pub fn labeled(_label: &'static str, op: Self) -> Self {
-        op
     }
 
     /// Softmax operator applied on `x`.
@@ -3078,7 +2897,7 @@ mod tests {
 
             for (index, (a, b)) in itertools::zip_eq(output_host, ans).enumerate() {
                 assert!(
-                    is_approx_eps(a, b, 1.0),
+                    is_approx_eps(a, b, 0.01),
                     "Failed at index {index}, computed: {a} vs. answer: {b}"
                 );
             }
