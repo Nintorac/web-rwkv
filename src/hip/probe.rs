@@ -89,6 +89,8 @@ pub struct ProbeContext {
     pub batch_size: usize,
     /// Sequence length (tokens per batch)
     pub seq_len: usize,
+    /// Padded chunk size (GPU tensor T dimension)
+    pub chunk_size: usize,
     /// Model configuration
     pub n_embd: usize,
     pub n_head: usize,
@@ -113,6 +115,45 @@ impl ProbeContext {
     }
 }
 
+/// Trim downloaded GPU data to match the declared shape.
+///
+/// GPU tensors are allocated for the full padded chunk_size, but probes declare
+/// shapes with actual_t. This function extracts just the real data, handling
+/// the column-major stride correctly for batch>1.
+///
+/// The T dimension is always at index 1 in our shapes. For shapes without a T
+/// dimension (like WKV state), no trimming is needed (data already matches shape).
+pub fn trim_padded_data(data: &[f32], chunk_size: usize, shape: &[usize]) -> Vec<f32> {
+    let expected: usize = shape.iter().product();
+
+    // No trimming needed if data already matches, or shape has < 2 dims
+    if data.len() <= expected || shape.len() < 2 {
+        return data[..expected.min(data.len())].to_vec();
+    }
+
+    let actual_t = shape[1];
+
+    // If T equals chunk_size, no padding to trim
+    if actual_t == chunk_size {
+        return data[..expected.min(data.len())].to_vec();
+    }
+
+    let inner = shape[0]; // contiguous elements per token
+    let outer_count: usize = shape[2..].iter().product(); // batch * any extra dims
+    let phys_block = inner * chunk_size; // physical stride per outer block
+    let real_block = inner * actual_t; // real data per outer block
+
+    let mut result = Vec::with_capacity(expected);
+    for i in 0..outer_count {
+        let src_start = i * phys_block;
+        let src_end = src_start + real_block;
+        if src_end <= data.len() {
+            result.extend_from_slice(&data[src_start..src_end]);
+        }
+    }
+    result
+}
+
 /// Probe callback function type.
 ///
 /// Receives:
@@ -135,8 +176,15 @@ macro_rules! hip_probe {
     ($model:expr, $ctx:expr, $hook:expr, $data:expr, [$($shape:expr),* $(,)?]) => {
         if let Some(ref probes) = $model.probes {
             if let Some(f) = probes.get(&$hook) {
-                $ctx.set_shape(&[$($shape),*]);
-                f($data, &$ctx);
+                let shape = [$($shape),*];
+                $ctx.set_shape(&shape);
+                let expected_len: usize = shape.iter().product();
+                if $data.len() == expected_len {
+                    f($data, &$ctx);
+                } else {
+                    let trimmed = $crate::hip::probe::trim_padded_data($data, $ctx.chunk_size, &shape);
+                    f(&trimmed, &$ctx);
+                }
             }
         }
     };
@@ -177,5 +225,95 @@ impl HipProbeBuilder {
 
     pub fn build(self) -> HipProbeMap {
         self.probes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trim_no_padding() {
+        // Data already matches shape -- no trimming
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let result = trim_padded_data(&data, 1, &[3, 1, 2]);
+        assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_trim_single_batch() {
+        // shape=[2, 1, 1], chunk_size=4, data has 2*4*1=8 elements
+        // Should extract first 2 elements (inner=2, actual_t=1)
+        let data = vec![1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let result = trim_padded_data(&data, 4, &[2, 1, 1]);
+        assert_eq!(result, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_trim_multi_batch() {
+        // shape=[2, 1, 2], chunk_size=4, data has 2*4*2=16 elements
+        // Batch 0: [1,2, pad,pad,pad,pad,pad,pad]
+        // Batch 1: [3,4, pad,pad,pad,pad,pad,pad]
+        let mut data = vec![0.0; 16];
+        data[0] = 1.0;
+        data[1] = 2.0;
+        data[8] = 3.0;
+        data[9] = 4.0;
+        let result = trim_padded_data(&data, 4, &[2, 1, 2]);
+        assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_trim_multi_batch_multi_token() {
+        // shape=[2, 2, 2], chunk_size=4, data has 2*4*2=16 elements
+        // inner=2, actual_t=2, outer_count=2
+        // Batch 0: [1,2,3,4, pad,pad,pad,pad]
+        // Batch 1: [5,6,7,8, pad,pad,pad,pad]
+        let mut data = vec![0.0; 16];
+        // batch 0: tokens at offsets 0..4
+        data[0] = 1.0;
+        data[1] = 2.0;
+        data[2] = 3.0;
+        data[3] = 4.0;
+        // batch 1: tokens at offsets 8..12
+        data[8] = 5.0;
+        data[9] = 6.0;
+        data[10] = 7.0;
+        data[11] = 8.0;
+        let result = trim_padded_data(&data, 4, &[2, 2, 2]);
+        assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_trim_stacked_tensor() {
+        // shape=[2, 1, 1, 3], chunk_size=4
+        // 3 stacked tensors, each [2, 1, 1]
+        // Total physical: 2*4*1*3 = 24
+        // outer_count = 1 * 3 = 3
+        let mut data = vec![0.0; 24];
+        data[0] = 1.0;
+        data[1] = 2.0;
+        data[8] = 3.0;
+        data[9] = 4.0;
+        data[16] = 5.0;
+        data[17] = 6.0;
+        let result = trim_padded_data(&data, 4, &[2, 1, 1, 3]);
+        assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_trim_no_t_dimension() {
+        // WKV state: shape=[2, 2, 3, 1], data matches exactly
+        let data: Vec<f32> = (1..=12).map(|x| x as f32).collect();
+        let result = trim_padded_data(&data, 4, &[2, 2, 3, 1]);
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_trim_chunk_equals_actual() {
+        // shape=[2, 4, 1], chunk_size=4 -- actual_t == chunk_size, no trimming
+        let data: Vec<f32> = (1..=8).map(|x| x as f32).collect();
+        let result = trim_padded_data(&data, 4, &[2, 4, 1]);
+        assert_eq!(result, data);
     }
 }

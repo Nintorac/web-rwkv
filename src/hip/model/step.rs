@@ -37,7 +37,23 @@ use crate::hip::HipProf;
 use crate::hip_probe;
 
 #[cfg(feature = "hip-probes")]
-use crate::hip::probe::{self, HipProbeMap, HipProbeMapRef};
+use crate::hip::probe;
+
+/// Download a GPU f16 tensor to a CPU f32 Vec.
+/// Only used when probes are enabled; the cost is acceptable for validation.
+#[cfg(feature = "hip-probes")]
+#[inline]
+fn download_f16_as_f32(tensor: &TensorHip<f16>, stream: &Stream) -> Result<Vec<f32>> {
+    let f16_data = tensor.to_vec(stream)?;
+    Ok(f16_data.iter().map(|v| v.to_f32()).collect())
+}
+
+/// Download a GPU f32 tensor to a CPU f32 Vec.
+#[cfg(feature = "hip-probes")]
+#[inline]
+fn download_f32(tensor: &TensorHip<f32>, stream: &Stream) -> Result<Vec<f32>> {
+    tensor.to_vec(stream)
+}
 
 /// Sync stream only when hip-prof feature is enabled.
 /// This gives accurate per-operation GPU timings at the cost of serialization.
@@ -80,6 +96,23 @@ impl Rwkv7Hip {
         let n_hidden = self.info.n_hidden;
         let n_vocab = self.info.n_vocab;
         let lora_dims = &scratch.lora_dims;
+
+        // Initialize probe context (compiles out without feature)
+        #[cfg(feature = "hip-probes")]
+        let mut probe_ctx = probe::ProbeContext {
+            layer: None,
+            batch_size: b,
+            seq_len: *lens.iter().max().unwrap_or(&t),
+            chunk_size: t,
+            n_embd,
+            n_head,
+            head_size,
+            n_layer,
+            shape_storage: [0; probe::MAX_SHAPE_DIMS],
+            shape_len: 0,
+        };
+        #[cfg(feature = "hip-probes")]
+        let actual_t = probe_ctx.seq_len;
 
         // Convert lens to i32 tensor for masked kernel
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
@@ -221,8 +254,22 @@ impl Rwkv7Hip {
             // Select WKV kernel: fused_t1 for decode (T=1), wave_reduce for prefill (T>1)
             let wkv_kernel: &dyn WkvKernel = if t == 1 { &FusedT1Wkv } else { &WaveReduceWkv };
 
+            // PostEmbed probe: embedding output before any layer processing
+            #[cfg(feature = "hip-probes")]
+            {
+                if let Some(ref probes) = self.probes {
+                    if probes.contains_key(&probe::HipHook::PostEmbed) {
+                        let data = download_f16_as_f32(&x, stream)?;
+                        hip_probe!(self, probe_ctx, probe::HipHook::PostEmbed, &data, [n_embd, actual_t, b]);
+                    }
+                }
+            }
+
             // Process each layer
             for layer_idx in 0..n_layer {
+                #[cfg(feature = "hip-probes")]
+                { probe_ctx.layer = Some(layer_idx); }
+
                 let layer = &self.layers[layer_idx];
 
                 // Apply ln0 for layer 0
@@ -239,6 +286,17 @@ impl Rwkv7Hip {
                         copy_tensor_f16(&x_ln, &mut x, stream)?;
                         Ok(())
                     })?;
+
+                    // PostEmbedLayerNorm probe
+                    #[cfg(feature = "hip-probes")]
+                    {
+                        if let Some(ref probes) = self.probes {
+                            if probes.contains_key(&probe::HipHook::PostEmbedLayerNorm) {
+                                let data = download_f16_as_f32(&x, stream)?;
+                                hip_probe!(self, probe_ctx, probe::HipHook::PostEmbedLayerNorm, &data, [n_embd, actual_t, b]);
+                            }
+                        }
+                    }
                 }
 
                 // ==== Time-Mix (Attention) ====
@@ -254,6 +312,17 @@ impl Rwkv7Hip {
                     prof_sync(stream)?;
                     Ok(())
                 })?;
+
+                // PostAttLayerNorm probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttLayerNorm) {
+                            let data = download_f16_as_f32(&x_ln, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttLayerNorm, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
 
                 // Token shifts for attention - use masked kernel for x_r to get correct state
                 // The masked kernel extracts state at lengths[b]-1 instead of T-1
@@ -315,6 +384,27 @@ impl Rwkv7Hip {
                 // Update shift state - new_att_shift has correct state from masked kernel
                 std::mem::swap(&mut new_att_shift, &mut att_shift_gpu[layer_idx]);
 
+                // PostAttTokenShift probe (stacked: xr, xw, xk, xv, xa, xg)
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttTokenShift) {
+                            let xr_data = download_f16_as_f32(&att_xr, stream)?;
+                            let xw_data = download_f16_as_f32(&att_xw, stream)?;
+                            let xk_data = download_f16_as_f32(&att_xk, stream)?;
+                            let xv_data = download_f16_as_f32(&att_xv, stream)?;
+                            let xa_data = download_f16_as_f32(&att_xa, stream)?;
+                            let xg_data = download_f16_as_f32(&att_xg, stream)?;
+                            let stacked: Vec<f32> = [&xr_data, &xw_data, &xk_data, &xv_data, &xa_data, &xg_data]
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .collect();
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttTokenShift, &stacked, [n_embd, actual_t, b, 6]);
+                        }
+                    }
+                }
+
                 // Linear projections: r, k, v
                 prof.time("att_proj", || {
                     ctx.hgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
@@ -323,6 +413,24 @@ impl Rwkv7Hip {
                     prof_sync(stream)?;
                     Ok(())
                 })?;
+
+                // PostAttLinear probe (stacked: r, k, v)
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttLinear) {
+                            let r_data = download_f16_as_f32(&att_r, stream)?;
+                            let k_data = download_f16_as_f32(&att_k, stream)?;
+                            let v_data = download_f16_as_f32(&att_v, stream)?;
+                            let stacked: Vec<f32> = [&r_data, &k_data, &v_data]
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .collect();
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttLinear, &stacked, [n_embd, actual_t, b, 3]);
+                        }
+                    }
+                }
 
                 // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
                 prof.time("att_decay", || {
@@ -335,6 +443,17 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostAttDecay probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttDecay) {
+                            let data = download_f16_as_f32(&att_w, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttDecay, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
                 prof.time("att_adapt", || {
                     ctx.hgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
@@ -345,6 +464,17 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostAttAdapt probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttAdapt) {
+                            let data = download_f16_as_f32(&att_a, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttAdapt, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Gate: g = sigmoid(xg @ g1) @ g2
                 prof.time("att_gate", || {
                     ctx.hgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
@@ -353,6 +483,17 @@ impl Rwkv7Hip {
                     prof_sync(stream)?;
                     Ok(())
                 })?;
+
+                // PostAttGate probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttGate) {
+                            let data = download_f16_as_f32(&att_g, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGate, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
 
                 // Value residual (layers > 0)
                 if layer_idx > 0 {
@@ -369,6 +510,16 @@ impl Rwkv7Hip {
                             Ok(())
                         })?;
                     }
+                    // PostAttValueResidual probe (only layers > 0)
+                    #[cfg(feature = "hip-probes")]
+                    {
+                        if let Some(ref probes) = self.probes {
+                            if probes.contains_key(&probe::HipHook::PostAttValueResidual) {
+                                let data = download_f16_as_f32(&att_v, stream)?;
+                                hip_probe!(self, probe_ctx, probe::HipHook::PostAttValueResidual, &data, [n_embd, actual_t, b]);
+                            }
+                        }
+                    }
                 } else {
                     copy_tensor_f16(&att_v, &mut v_first, stream)?;
                 }
@@ -380,11 +531,33 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostAttL2Norm probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttL2Norm) {
+                            let data = download_f16_as_f32(&att_kk, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttL2Norm, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Control K
                 prof.time("att_ctrl_k", || {
                     control_k_f16(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
                     Ok(())
                 })?;
+
+                // PostAttControlK probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttControlK) {
+                            let data = download_f16_as_f32(&att_k_ctrl, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttControlK, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
 
                 // WKV inputs
                 prof.time("att_wkv_in", || {
@@ -404,6 +577,31 @@ impl Rwkv7Hip {
                 let wkv_a_wkv = wkv_a.reshape_view(wkv_data_shape)?;
                 let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
                 let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
+
+                // PreWkv probe (stacked: w_decay, r, k_ctrl, v, wkv_a, wkv_b) + PreWkvState
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PreWkv) {
+                            let wd = download_f16_as_f32(&w_decay, stream)?;
+                            let r_d = download_f16_as_f32(&att_r, stream)?;
+                            let kc = download_f16_as_f32(&att_k_ctrl, stream)?;
+                            let v_d = download_f16_as_f32(&att_v, stream)?;
+                            let wa = download_f16_as_f32(&wkv_a, stream)?;
+                            let wb = download_f16_as_f32(&wkv_b, stream)?;
+                            let stacked: Vec<f32> = [&wd, &r_d, &kc, &v_d, &wa, &wb]
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .collect();
+                            hip_probe!(self, probe_ctx, probe::HipHook::PreWkv, &stacked, [n_embd, actual_t, b, 6]);
+                        }
+                        if probes.contains_key(&probe::HipHook::PreWkvState) {
+                            let data = download_f32(&wkv_state_gpu[layer_idx], stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PreWkvState, &data, [head_size, head_size, n_head, b]);
+                        }
+                    }
+                }
 
                 // Run WKV7 via trait dispatch: fused_t1 for T=1, wave_reduce for T>1
                 prof.time("wkv", || {
@@ -427,6 +625,21 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostWkv + PostWkvState probes
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostWkv) {
+                            let data = download_f16_as_f32(&wkv_out, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostWkv, &data, [n_embd, actual_t, b]);
+                        }
+                        if probes.contains_key(&probe::HipHook::PostWkvState) {
+                            let data = download_f32(&wkv_state_gpu[layer_idx], stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostWkvState, &data, [head_size, head_size, n_head, b]);
+                        }
+                    }
+                }
+
                 // Group norm on WKV output
                 prof.time("wkv_norm", || {
                     group_norm_f16(
@@ -440,6 +653,17 @@ impl Rwkv7Hip {
                     )?;
                     Ok(())
                 })?;
+
+                // PostAttGroupNorm probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttGroupNorm) {
+                            let data = download_f16_as_f32(&wkv_normed, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGroupNorm, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
 
                 // WKV bonus
                 let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
@@ -457,12 +681,34 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostWkvBonus probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostWkvBonus) {
+                            let data = download_f16_as_f32(&wkv_bonus, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostWkvBonus, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Combine and gate
                 prof.time("att_gate_out", || {
                     add_f16(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
                     mul_f16(&temp1, &att_g, &mut temp2, stream)?;
                     Ok(())
                 })?;
+
+                // PostAttGated probe (gated output is in temp2)
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttGated) {
+                            let data = download_f16_as_f32(&temp2, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttGated, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
 
                 // Output projection
                 prof.time("att_out", || {
@@ -471,12 +717,34 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostAttOut probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAttOut) {
+                            let data = download_f16_as_f32(&att_out, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttOut, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Residual
                 prof.time("att_resid", || {
                     add_f16(&x, &att_out, &mut temp1, stream)?;
                     copy_tensor_f16(&temp1, &mut x, stream)?;
                     Ok(())
                 })?;
+
+                // PostAtt probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostAtt) {
+                            let data = download_f16_as_f32(&x, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAtt, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
 
                 // ==== Channel-Mix (FFN) ====
                 prof.time("ffn_ln", || {
@@ -490,6 +758,17 @@ impl Rwkv7Hip {
                     )?;
                     Ok(())
                 })?;
+
+                // PostFfnLayerNorm probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostFfnLayerNorm) {
+                            let data = download_f16_as_f32(&x_ln, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnLayerNorm, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
 
                 // Token shift for FFN - use masked kernel for correct state extraction
                 prof.time("ffn_shift", || {
@@ -509,6 +788,17 @@ impl Rwkv7Hip {
                 // Update FFN shift state - new_ffn_shift has correct state from masked kernel
                 std::mem::swap(&mut new_ffn_shift, &mut ffn_shift_gpu[layer_idx]);
 
+                // PostFfnTokenShift probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostFfnTokenShift) {
+                            let data = download_f16_as_f32(&ffn_xk, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnTokenShift, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Key projection
                 prof.time("ffn_k", || {
                     ctx.hgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
@@ -516,11 +806,33 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostFfnLinear probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostFfnLinear) {
+                            let data = download_f16_as_f32(&ffn_k, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnLinear, &data, [n_hidden, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Squared ReLU
                 prof.time("ffn_relu2", || {
                     squared_relu_f16(&ffn_k, &mut ffn_k_sq, stream)?;
                     Ok(())
                 })?;
+
+                // PostFfnActivate probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostFfnActivate) {
+                            let data = download_f16_as_f32(&ffn_k_sq, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnActivate, &data, [n_hidden, actual_t, b]);
+                        }
+                    }
+                }
 
                 // Value projection
                 prof.time("ffn_v", || {
@@ -529,13 +841,39 @@ impl Rwkv7Hip {
                     Ok(())
                 })?;
 
+                // PostFfnOut probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostFfnOut) {
+                            let data = download_f16_as_f32(&ffn_out, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostFfnOut, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
+
                 // Residual
                 prof.time("ffn_resid", || {
                     add_f16(&x, &ffn_out, &mut temp1, stream)?;
                     copy_tensor_f16(&temp1, &mut x, stream)?;
                     Ok(())
                 })?;
+
+                // PostFfn probe
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref probes) = self.probes {
+                        if probes.contains_key(&probe::HipHook::PostFfn) {
+                            let data = download_f16_as_f32(&x, stream)?;
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostFfn, &data, [n_embd, actual_t, b]);
+                        }
+                    }
+                }
             }
+
+            // Reset layer context for head probes
+            #[cfg(feature = "hip-probes")]
+            { probe_ctx.layer = None; }
 
             prof.time("head", || {
                 // ==== Output Head ====
@@ -552,6 +890,28 @@ impl Rwkv7Hip {
                 prof_sync(stream)?;
                 Ok(())
             })?;
+
+            // PostHeadLayerNorm probe (x_ln holds head layer norm output)
+            #[cfg(feature = "hip-probes")]
+            {
+                if let Some(ref probes) = self.probes {
+                    if probes.contains_key(&probe::HipHook::PostHeadLayerNorm) {
+                        let data = download_f16_as_f32(&x_ln, stream)?;
+                        hip_probe!(self, probe_ctx, probe::HipHook::PostHeadLayerNorm, &data, [n_embd, actual_t, b]);
+                    }
+                }
+            }
+
+            // PostHead probe (logits are in f16, convert to f32 for probe)
+            #[cfg(feature = "hip-probes")]
+            {
+                if let Some(ref probes) = self.probes {
+                    if probes.contains_key(&probe::HipHook::PostHead) {
+                        let data = download_f16_as_f32(&logits, stream)?;
+                        hip_probe!(self, probe_ctx, probe::HipHook::PostHead, &data, [n_vocab, actual_t, b]);
+                    }
+                }
+            }
 
             prof.time("logits_download", || {
                 // Convert f16 logits to f32 on GPU, then download asynchronously
