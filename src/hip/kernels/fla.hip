@@ -743,4 +743,233 @@ hipError_t launch_fla_wy_repr(
     }
 }
 
+// ============================================================================
+// Stage 4: Inter-chunk state recurrence (kernel_fla_chunk_h)
+//
+// The sequential bottleneck: propagates state across chunks within each
+// sequence.  One thread-block processes ALL chunks for a single
+// (head, sequence) pair.
+//
+// Grid:  dim3(N_seq * H, 1, 1)   — one block per (sequence, head).
+// Block: dim3(K=64)               — one thread per V-column of the state.
+//
+// Thread v (0..K-1) owns one column of the [K, V]==[K, K] state matrix
+// in registers (h_col[K]).  Shared memory is used for per-position data
+// that all threads need: w_row, kg_col, bg_col, g_last.
+//
+// Per chunk i_t (sequential over chunks for this sequence):
+//   1. Store current state to fla_h:
+//      fla_h[k, v, h, chunk_offset + i_t] = h_col[k]
+//   2. For each sub-chunk position i (0..C-1) inside the chunk:
+//      a. Compute b_v2[v] = sum_k( w_wy[i,k] * h_col[k] ) + u_wy[i,v]
+//      b. Store v_new[i,v] = b_v2[v]
+//      c. Accumulate hc_col[k] += kg[k,i] * v_orig[i,v]
+//                                + bg[k,i] * b_v2[v]
+//   3. Decay and update:
+//      g_last = gi at last valid position in chunk
+//      h_col[k] = h_col[k] * exp(g_last[k]) + hc_col[k]
+//
+// After all chunks: write final state to state_out.
+//
+// Buffer layouts (column-major, K fastest):
+//   state:      [K, K, H, B]            — h_col[k] = state[k + v*K + h*K*K + seq*H*K*K]
+//   fla_h:      [K, K, H, total_chunks] — same indexing with chunk_id instead of seq
+//   per-token:  [K, H, T, B]            — element(k, h, t) = k + h*K + t*H*K
+//
+// Reference: repos/flash-linear-attention/fla/ops/generalized_delta_rule/dplr/chunk_h_fwd.py
+// ============================================================================
+
+__global__ __launch_bounds__(64, 2)
+void kernel_fla_chunk_h(
+    const float*  __restrict__ kg,             // [K, H, T, B] decay-scaled key (f32)
+    const float*  __restrict__ bg,             // [K, H, T, B] decay-scaled b   (f32)
+    const __half* __restrict__ v_in,           // [K, H, T, B] original value   (f16)
+    const float*  __restrict__ w_wy,           // [K, H, T, B] WY w output      (f32)
+    const float*  __restrict__ u_wy,           // [K, H, T, B] WY u output      (f32)
+    const float*  __restrict__ gi,             // [K, H, T, B] inclusive cumsum  (f32)
+    float*        __restrict__ state,          // [K, K, H, B] state in/out
+    float*        __restrict__ h_out,          // [K, K, H, total_chunks] per-chunk states
+    float*        __restrict__ v_new,          // [K, H, T, B] corrected values output
+    const int*    __restrict__ chunk_offsets,  // [N+1] cumulative chunk counts
+    const int*    __restrict__ cu_seqlens,     // [N+1] sequence boundaries
+    int K_dim,                                 // head_size (64)
+    int H,                                     // n_heads
+    int C                                      // chunk_size (16)
+) {
+    // Decode block index -> (sequence, head)
+    const int block_id = blockIdx.x;           // 0 .. N_seq*H - 1
+    const int i_h      = block_id % H;         // head
+    const int i_n      = block_id / H;         // sequence
+
+    const int v_col    = threadIdx.x;           // column index (0..K-1)
+
+    // Sequence boundaries
+    const int bos = cu_seqlens[i_n];
+    const int eos = cu_seqlens[i_n + 1];
+    const int T   = eos - bos;                  // sequence length
+    if (T <= 0) return;
+
+    // Chunk range for this sequence
+    const int boh      = chunk_offsets[i_n];    // first chunk id
+    const int n_chunks = chunk_offsets[i_n + 1] - boh;
+
+    // Token stride in [K, H, T, B] layout: advance one token
+    const int token_stride = H * K_dim;
+
+    // State base offset: state[k, v, h, seq] = k + v*K + h*K*K + seq*H*K*K
+    const int state_base = i_h * K_dim * K_dim + i_n * H * K_dim * K_dim;
+
+    // ---- Load initial state column into registers ----
+    float h_col[64];
+    #pragma unroll
+    for (int k = 0; k < 64; k++) {
+        h_col[k] = state[k + v_col * K_dim + state_base];
+    }
+
+    // Shared memory for data broadcast to all threads:
+    //   smem[0..63]  — w_row / kg_col / bg_col / g_last (reused per position)
+    __shared__ float smem[64];
+
+    // ---- Sequential loop over chunks ----
+    for (int i_t = 0; i_t < n_chunks; i_t++) {
+        const int chunk_id    = boh + i_t;
+        const int chunk_start = i_t * C;
+
+        // Step 1: Store current state column to fla_h
+        // fla_h layout: [K, K, H, total_chunks]
+        // element (k, v, h, chunk_id) = k + v*K + h*K*K + chunk_id*H*K*K
+        const int h_out_base = i_h * K_dim * K_dim + chunk_id * H * K_dim * K_dim;
+        #pragma unroll
+        for (int k = 0; k < 64; k++) {
+            h_out[k + v_col * K_dim + h_out_base] = h_col[k];
+        }
+
+        // Zero the chunk contribution accumulator
+        float hc_col[64];
+        #pragma unroll
+        for (int k = 0; k < 64; k++) {
+            hc_col[k] = 0.0f;
+        }
+
+        // Step 2 & 3: Process each position in the chunk
+        const int valid_len = min(C, T - chunk_start);
+        for (int i_pos = 0; i_pos < valid_len; i_pos++) {
+            const int t_abs = chunk_start + i_pos;    // position within sequence
+            const int tok_offset = (bos + t_abs) * token_stride + i_h * K_dim;
+
+            // ---- Compute b_v2[v_col] = sum_k( w_wy[pos,k] * h_col[k] ) + u_wy[pos,v_col] ----
+            // Load w_row[k] into shared memory (one element per thread)
+            // w_wy per-token layout: w_wy[k, h, t, b] = w_wy[k + h*K + t*H*K]
+            if (v_col < K_dim) {
+                smem[v_col] = w_wy[v_col + tok_offset];
+            }
+            __syncthreads();
+
+            float dot = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 64; k++) {
+                dot += smem[k] * h_col[k];
+            }
+
+            // u_wy has the same per-token layout, using v_col as the K-element index
+            // (since K == V == 64, the layout is identical for the v dimension)
+            float b_v2 = dot + u_wy[v_col + tok_offset];
+
+            // Store v_new
+            v_new[v_col + tok_offset] = b_v2;
+            __syncthreads();
+
+            // ---- Accumulate hc_col ----
+            // Load kg[:, pos] into shared memory
+            if (v_col < K_dim) {
+                smem[v_col] = kg[v_col + tok_offset];
+            }
+            __syncthreads();
+
+            // v_in is f16 per-token: v_in[v_col + tok_offset]
+            float v_val = __half2float(v_in[v_col + tok_offset]);
+
+            // hc_col[k] += kg[k, pos] * v_val
+            #pragma unroll
+            for (int k = 0; k < 64; k++) {
+                hc_col[k] += smem[k] * v_val;
+            }
+            __syncthreads();
+
+            // Load bg[:, pos] into shared memory
+            if (v_col < K_dim) {
+                smem[v_col] = bg[v_col + tok_offset];
+            }
+            __syncthreads();
+
+            // hc_col[k] += bg[k, pos] * b_v2
+            #pragma unroll
+            for (int k = 0; k < 64; k++) {
+                hc_col[k] += smem[k] * b_v2;
+            }
+            __syncthreads();
+        }
+
+        // Step 4: Decay and update
+        // g_last = gi at last valid position in chunk
+        const int last_idx = min((i_t + 1) * C, T) - 1;
+        const int last_tok_offset = (bos + last_idx) * token_stride + i_h * K_dim;
+        if (v_col < K_dim) {
+            smem[v_col] = gi[v_col + last_tok_offset];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < 64; k++) {
+            h_col[k] = h_col[k] * expf(smem[k]) + hc_col[k];
+        }
+        __syncthreads();
+    }
+
+    // ---- Write final state ----
+    // state[k, v, h, seq] = k + v*K + h*K*K + seq*H*K*K
+    #pragma unroll
+    for (int k = 0; k < 64; k++) {
+        state[k + v_col * K_dim + state_base] = h_col[k];
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for Stage 4 (inter-chunk state recurrence)
+// ============================================================================
+
+hipError_t launch_fla_chunk_h(
+    const float*  kg,
+    const float*  bg,
+    const __half* v,
+    const float*  w_wy,
+    const float*  u_wy,
+    const float*  gi,
+    float*        state,
+    float*        h_out,
+    float*        v_new,
+    const int*    chunk_offsets,
+    const int*    cu_seqlens,
+    int K,
+    int H,
+    int C,
+    int N_seq,
+    hipStream_t   stream
+) {
+    if (K <= 0 || H <= 0 || C <= 0 || N_seq <= 0) {
+        return hipSuccess;
+    }
+
+    dim3 grid(N_seq * H, 1, 1);
+    dim3 block(K);
+
+    hipLaunchKernelGGL(kernel_fla_chunk_h, grid, block, 0, stream,
+                       kg, bg, v, w_wy, u_wy, gi,
+                       state, h_out, v_new,
+                       chunk_offsets, cu_seqlens,
+                       K, H, C);
+
+    return hipGetLastError();
+}
+
 } // extern "C"

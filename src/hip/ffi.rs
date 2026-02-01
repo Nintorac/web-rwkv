@@ -722,6 +722,30 @@ extern "C" {
         total_chunks: c_int,
         stream: HipStream,
     ) -> HipError;
+
+    /// Stage 4: Inter-chunk state recurrence.
+    /// Propagates state across chunks within each sequence. One block per
+    /// (head, sequence) pair processes all chunks sequentially. Reads
+    /// initial state, writes final state, stores intermediate per-chunk
+    /// states to h_out, and computes corrected values v_new.
+    pub fn launch_fla_chunk_h(
+        kg: *const f32,
+        bg: *const f32,
+        v: *const f16,
+        w_wy: *const f32,
+        u_wy: *const f32,
+        gi: *const f32,
+        state: *mut f32,
+        h_out: *mut f32,
+        v_new: *mut f32,
+        chunk_offsets: *const c_int,
+        cu_seqlens: *const c_int,
+        k: c_int,
+        h: c_int,
+        c: c_int,
+        n_seq: c_int,
+        stream: HipStream,
+    ) -> HipError;
 }
 
 /// HIP success error code

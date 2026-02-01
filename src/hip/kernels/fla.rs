@@ -3,6 +3,7 @@
 //! Stage 1: [`fla_cumsum`] — cumulative decay scan within each chunk.
 //! Stage 2: [`fla_intra`] — intra-chunk attention matrices.
 //! Stage 3: [`fla_wy_repr`] — WY representation (matrix inversion + w/u computation).
+//! Stage 4: [`fla_chunk_h`] — inter-chunk state recurrence.
 
 use std::ffi::c_int;
 
@@ -10,7 +11,8 @@ use half::f16;
 
 use crate::hip::device::Stream;
 use crate::hip::ffi::{
-    check, launch_fla_cumsum, launch_fla_intra, launch_fla_wy_repr, HipErrorKind, Result,
+    check, launch_fla_chunk_h, launch_fla_cumsum, launch_fla_intra, launch_fla_wy_repr,
+    HipErrorKind, Result,
 };
 use crate::hip::tensor::TensorHip;
 
@@ -504,6 +506,200 @@ pub fn fla_wy_repr(
             h as c_int,
             chunk_size as c_int,
             total_chunks as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Launch the FLA inter-chunk state recurrence kernel (Stage 4).
+///
+/// This is the sequential bottleneck: it propagates state across chunks
+/// within each sequence. One thread-block processes ALL chunks for a
+/// single (head, sequence) pair.
+///
+/// Per chunk, the recurrence is:
+/// ```text
+/// // Store current state to per-chunk buffer
+/// fla_h[chunk] = h
+///
+/// // For each position in chunk:
+/// b_v2 = w_wy @ h + u_wy        // corrected values [C, V]
+/// hc  += kg^T @ v + bg^T @ b_v2  // chunk contribution [K, V]
+/// v_new = b_v2                    // store for output stage
+///
+/// // Decay and update
+/// g_last = gi[last_position_in_chunk]
+/// h = h * exp(g_last) + hc
+/// ```
+///
+/// # Arguments
+/// * `kg` - Decay-scaled key from Stage 2, shape `[K, H, T, B]` (f32)
+/// * `bg` - Decay-scaled b from Stage 2, shape `[K, H, T, B]` (f32)
+/// * `v` - Original value tensor, shape `[K, H, T, B]` (f16)
+/// * `w_wy` - WY w output from Stage 3, shape `[K, H, T, B]` (f32)
+/// * `u_wy` - WY u output from Stage 3, shape `[K, H, T, B]` (f32)
+/// * `gi` - Inclusive cumsum from Stage 1, shape `[K, H, T, B]` (f32)
+/// * `state` - State tensor (in/out), shape `[K, K, H, B]` (f32)
+/// * `h_out` - Per-chunk intermediate states, shape `[K, K, H, total_chunks]` (f32)
+/// * `v_new` - Corrected values output, shape `[K, H, T, B]` (f32)
+/// * `chunk_offsets` - Cumulative chunk counts per sequence `[N+1]` (i32)
+/// * `cu_seqlens` - Cumulative sequence lengths `[N+1]` (i32)
+/// * `chunk_size` - Number of tokens per chunk (C, typically 16)
+/// * `n_seq` - Number of sequences in the batch
+/// * `stream` - HIP stream for async execution
+///
+/// # Memory Layout
+/// - State: column-major `[K, K, H, B]` (K fastest)
+/// - Per-chunk states: column-major `[K, K, H, total_chunks]`
+/// - Per-token tensors: column-major `[K, H, T, B]`
+///
+/// # Errors
+/// Returns error on shape mismatches or kernel launch failure.
+#[allow(clippy::too_many_arguments)]
+pub fn fla_chunk_h(
+    kg: &TensorHip<f32>,
+    bg: &TensorHip<f32>,
+    v: &TensorHip<f16>,
+    w_wy: &TensorHip<f32>,
+    u_wy: &TensorHip<f32>,
+    gi: &TensorHip<f32>,
+    state: &mut TensorHip<f32>,
+    h_out: &mut TensorHip<f32>,
+    v_new: &mut TensorHip<f32>,
+    chunk_offsets: &TensorHip<i32>,
+    cu_seqlens: &TensorHip<i32>,
+    chunk_size: usize,
+    n_seq: usize,
+    stream: &Stream,
+) -> Result<()> {
+    // Extract dimensions from kg shape [K, H, T, B]
+    let k_dim = kg.shape()[0]; // head_size
+    let h = kg.shape()[1]; // n_heads
+
+    // Validate per-token f32 tensor shapes match kg
+    for (name, tensor) in [
+        ("bg", bg as &TensorHip<f32>),
+        ("w_wy", w_wy as &TensorHip<f32>),
+        ("u_wy", u_wy as &TensorHip<f32>),
+        ("gi", gi as &TensorHip<f32>),
+        ("v_new", v_new as &TensorHip<f32>),
+    ] {
+        if tensor.shape() != kg.shape() {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "fla_chunk_h: {} shape mismatch: expected {}, got {}",
+                    name,
+                    kg.shape(),
+                    tensor.shape()
+                ),
+            });
+        }
+    }
+
+    // Validate v (f16) has the same length as kg (f32)
+    if v.len() != kg.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "fla_chunk_h: v length mismatch: expected {} (same as kg), got {}",
+                kg.len(),
+                v.len()
+            ),
+        });
+    }
+
+    // Validate state shape: [K, K, H, B]
+    // B = n_seq for varlen (packed) sequences
+    let expected_state_len = k_dim * k_dim * h * n_seq;
+    if state.len() < expected_state_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "fla_chunk_h: state too small: need {} elements (K={}, H={}, N={}), got {}",
+                expected_state_len,
+                k_dim,
+                h,
+                n_seq,
+                state.len()
+            ),
+        });
+    }
+
+    // Validate chunk_offsets: should have n_seq + 1 elements
+    if chunk_offsets.len() != n_seq + 1 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "fla_chunk_h: chunk_offsets length mismatch: expected {} (n_seq={} + 1), got {}",
+                n_seq + 1,
+                n_seq,
+                chunk_offsets.len()
+            ),
+        });
+    }
+
+    // Validate cu_seqlens: should have n_seq + 1 elements
+    if cu_seqlens.len() != n_seq + 1 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "fla_chunk_h: cu_seqlens length mismatch: expected {} (n_seq={} + 1), got {}",
+                n_seq + 1,
+                n_seq,
+                cu_seqlens.len()
+            ),
+        });
+    }
+
+    // Validate contiguity
+    if !kg.is_contiguous()
+        || !bg.is_contiguous()
+        || !v.is_contiguous()
+        || !w_wy.is_contiguous()
+        || !u_wy.is_contiguous()
+        || !gi.is_contiguous()
+        || !v_new.is_contiguous()
+    {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "fla_chunk_h: all per-token tensors must be contiguous".to_string(),
+        });
+    }
+    if !state.is_contiguous() || !h_out.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "fla_chunk_h: state and h_out must be contiguous".to_string(),
+        });
+    }
+    if !chunk_offsets.is_contiguous() || !cu_seqlens.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "fla_chunk_h: chunk_offsets and cu_seqlens must be contiguous".to_string(),
+        });
+    }
+
+    if n_seq == 0 {
+        return Ok(());
+    }
+
+    unsafe {
+        check(launch_fla_chunk_h(
+            kg.as_ptr(),
+            bg.as_ptr(),
+            v.as_ptr(),
+            w_wy.as_ptr(),
+            u_wy.as_ptr(),
+            gi.as_ptr(),
+            state.as_mut_ptr(),
+            h_out.as_mut_ptr(),
+            v_new.as_mut_ptr(),
+            chunk_offsets.as_ptr(),
+            cu_seqlens.as_ptr(),
+            k_dim as c_int,
+            h as c_int,
+            chunk_size as c_int,
+            n_seq as c_int,
             stream.handle(),
         ))
     }
