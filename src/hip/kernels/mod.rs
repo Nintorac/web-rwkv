@@ -1,11 +1,13 @@
 //! HIP kernel wrapper functions.
 
 mod elementwise;
+pub mod fla;
 mod norm;
 mod rwkv_ops;
 mod wkv;
 
 pub use elementwise::*;
+pub use fla::*;
 pub use norm::*;
 pub use rwkv_ops::*;
 pub use wkv::*;

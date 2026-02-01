@@ -659,6 +659,22 @@ extern "C" {
         stream: HipStream,
     ) -> HipblasStatus;
     pub fn hipblaslt_to_hip_error(status: HipblasStatus) -> HipError;
+
+    // FLA (Flash Linear Attention) kernels
+    /// Stage 1: Cumulative decay scan within each chunk.
+    /// Computes inclusive (gi) and exclusive (ge) cumulative sums of log-decay gk.
+    pub fn launch_fla_cumsum(
+        gk: *const f32,
+        gi: *mut f32,
+        ge: *mut f32,
+        chunk_indices: *const c_int,
+        cu_seqlens: *const c_int,
+        k: c_int,
+        h: c_int,
+        c: c_int,
+        total_chunks: c_int,
+        stream: HipStream,
+    ) -> HipError;
 }
 
 /// HIP success error code
