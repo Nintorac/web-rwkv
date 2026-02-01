@@ -747,6 +747,16 @@ extern "C" {
         stream: HipStream,
     ) -> HipError;
 
+    /// Utility: Convert f16 w_decay to f32 log-decay gk.
+    /// gk[i] = log(w_decay[i]) where w_decay = exp(-exp(w)).
+    /// Used to bridge the WkvInput w_decay (f16) to FLA's gk (f32).
+    pub fn launch_fla_decay_to_log(
+        w_decay: *const f16,
+        gk: *mut f32,
+        n: c_int,
+        stream: HipStream,
+    ) -> HipError;
+
     /// Stage 5: Output combination.
     /// Combines intra-chunk attention with inter-chunk state contributions:
     ///   o = qg @ h + A_qk @ v + A_qb @ v_new

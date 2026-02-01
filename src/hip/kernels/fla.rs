@@ -12,8 +12,8 @@ use half::f16;
 
 use crate::hip::device::Stream;
 use crate::hip::ffi::{
-    check, launch_fla_chunk_h, launch_fla_chunk_o, launch_fla_cumsum, launch_fla_intra,
-    launch_fla_wy_repr, HipErrorKind, Result,
+    check, launch_fla_chunk_h, launch_fla_chunk_o, launch_fla_cumsum, launch_fla_decay_to_log,
+    launch_fla_intra, launch_fla_wy_repr, HipErrorKind, Result,
 };
 use crate::hip::tensor::TensorHip;
 
@@ -899,6 +899,57 @@ pub fn fla_chunk_o(
             h_dim as c_int,
             chunk_size as c_int,
             total_chunks as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+/// Convert f16 w_decay to f32 log-decay gk (utility for bridging WkvInput to FLA).
+///
+/// Computes `gk[i] = log(w_decay[i])` where `w_decay = exp(-exp(w))` is the f16
+/// decay factor from the existing WKV pipeline. The FLA cumsum kernel needs the
+/// log-domain decay `gk = log(w_decay)` as f32.
+///
+/// # Arguments
+/// * `w_decay` - Input f16 decay factor tensor, any contiguous shape
+/// * `gk` - Output f32 log-decay tensor, same number of elements
+/// * `stream` - HIP stream for async execution
+///
+/// # Errors
+/// Returns error on length mismatch, non-contiguity, or kernel launch failure.
+pub fn fla_decay_to_log(
+    w_decay: &TensorHip<f16>,
+    gk: &mut TensorHip<f32>,
+    stream: &Stream,
+) -> Result<()> {
+    if w_decay.len() != gk.len() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "fla_decay_to_log: length mismatch: w_decay={}, gk={}",
+                w_decay.len(),
+                gk.len()
+            ),
+        });
+    }
+
+    if !w_decay.is_contiguous() || !gk.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "fla_decay_to_log: both tensors must be contiguous".to_string(),
+        });
+    }
+
+    let n = w_decay.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    unsafe {
+        check(launch_fla_decay_to_log(
+            w_decay.as_ptr(),
+            gk.as_mut_ptr(),
+            n as c_int,
             stream.handle(),
         ))
     }

@@ -70,12 +70,25 @@ impl Rwkv7Hip {
         let b = tokens.len();
         let t = tokens[0].len();
 
-        let ctx = &scratch.blas_ctx;
-        let stream = ctx.stream();
-
         let n_embd = self.info.n_embd;
         let n_head = self.info.n_head;
         let head_size = self.info.head_size;
+
+        // Pre-create FLA kernel views before ctx borrows scratch.
+        // FlaChunkedWkv::new takes &mut scratch to create non-owning views
+        // of the FLA scratch buffers. This must happen before ctx borrows
+        // scratch.blas_ctx, since &mut HipScratch conflicts with any
+        // outstanding borrows.
+        let fla_kernel = if t >= super::fla::FLA_CHUNK_THRESHOLD {
+            Some(super::fla::FlaChunkedWkv::new(
+                scratch, head_size, n_head, t, b,
+            )?)
+        } else {
+            None
+        };
+
+        let ctx = &scratch.blas_ctx;
+        let stream = ctx.stream();
         let n_layer = self.info.n_layer;
         let n_hidden = self.info.n_hidden;
         let n_vocab = self.info.n_vocab;
@@ -201,11 +214,12 @@ impl Rwkv7Hip {
             // Select WKV kernel: 3-tier dispatch
             //   T=1        → FusedT1Wkv (optimized decode)
             //   1 < T < 32 → WaveReduceWkv (wave-cooperative reduction)
-            //   T >= 32    → FlaChunkedWkv (FLA chunked prefill, skeleton delegates to WaveReduce)
+            //   T >= 32    → FlaChunkedWkv (5-stage FLA chunked prefill)
+            // fla_kernel was pre-created above (before ctx borrows scratch)
             let wkv_kernel: &dyn WkvKernel = if t == 1 {
                 &FusedT1Wkv
-            } else if t >= super::fla::FLA_CHUNK_THRESHOLD {
-                &super::fla::FlaChunkedWkv
+            } else if let Some(ref fla) = fla_kernel {
+                fla
             } else {
                 &WaveReduceWkv
             };

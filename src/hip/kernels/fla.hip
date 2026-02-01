@@ -1161,4 +1161,46 @@ hipError_t launch_fla_chunk_o(
     return hipGetLastError();
 }
 
+// ============================================================================
+// Utility: f16 decay to f32 log-decay conversion (kernel_fla_decay_to_log)
+//
+// Converts w_decay (f16, = exp(-exp(w))) to gk (f32, = log(w_decay)).
+// The existing WKV pipeline computes w_decay = exp(-exp(softplus_decay)),
+// but the FLA cumsum kernel needs the log-domain decay gk = log(w_decay).
+//
+// This avoids passing the pre-exponential tensor through the WkvInput interface.
+// ============================================================================
+
+__global__ __launch_bounds__(256, 4)
+void kernel_fla_decay_to_log(
+    const __half* __restrict__ w_decay,   // [N] f16 decay factor in (0, 1]
+    float* __restrict__ gk,               // [N] f32 log-decay output
+    int N
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        const float d = __half2float(w_decay[idx]);
+        // log(d) where d = exp(-exp(w)) is in (0, 1], so log(d) <= 0.
+        // Clamp to avoid log(0) = -inf.
+        gk[idx] = (d > 0.0f) ? logf(d) : -88.0f;
+    }
+}
+
+hipError_t launch_fla_decay_to_log(
+    const __half* w_decay,
+    float* gk,
+    int N,
+    hipStream_t stream
+) {
+    if (N <= 0) return hipSuccess;
+
+    const int block_size = 256;
+    const int grid_size = (N + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_fla_decay_to_log, dim3(grid_size), dim3(block_size), 0, stream,
+                       w_decay, gk, N);
+
+    return hipGetLastError();
+}
+
 } // extern "C"
