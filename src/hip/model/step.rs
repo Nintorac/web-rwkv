@@ -5,6 +5,7 @@ use half::f16;
 use super::prefill::{FusedT1Wkv, WaveReduceWkv, WkvInput, WkvKernel};
 use super::state::HipState;
 use super::Rwkv7Hip;
+#[cfg(feature = "hip-probes")]
 use crate::hip::device::Stream;
 use crate::hip::ffi::{HipErrorKind, Result};
 use crate::hip::kernels::{
@@ -31,7 +32,6 @@ use crate::hip::kernels::{
 };
 use crate::hip::scratch::HipScratch;
 use crate::hip::tensor::{TensorHip, TensorShape};
-use crate::hip::HipProf;
 
 #[cfg(feature = "hip-probes")]
 use crate::hip_probe;
@@ -55,20 +55,6 @@ fn download_f32(tensor: &TensorHip<f32>, stream: &Stream) -> Result<Vec<f32>> {
     tensor.to_vec(stream)
 }
 
-/// Sync stream only when hip-prof feature is enabled.
-/// This gives accurate per-operation GPU timings at the cost of serialization.
-#[cfg(feature = "hip-prof")]
-#[inline]
-fn prof_sync(stream: &Stream) -> Result<()> {
-    stream.synchronize()
-}
-
-#[cfg(not(feature = "hip-prof"))]
-#[inline]
-fn prof_sync(_stream: &Stream) -> Result<()> {
-    Ok(())
-}
-
 impl Rwkv7Hip {
     /// Internal step implementation with async logits copy.
     ///
@@ -84,7 +70,6 @@ impl Rwkv7Hip {
         let use_resident_state = scratch.config.resident_state;
         let b = tokens.len();
         let t = tokens[0].len();
-        let mut prof = HipProf::new("step_inner");
 
         let ctx = &scratch.blas_ctx;
         let stream = ctx.stream();
@@ -118,9 +103,7 @@ impl Rwkv7Hip {
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
         let lens_shape = TensorShape::new(b, 1, 1, 1);
         let mut lens_gpu = scratch.lens_gpu.resized_view_mut(lens_shape)?;
-        prof.time("lens_upload", || {
-            lens_gpu.copy_from_slice(&lens_i32, stream)
-        })?;
+        lens_gpu.copy_from_slice(&lens_i32, stream)?;
 
         // Shapes for this forward pass
         let std_shape = TensorShape::new(n_embd, t, b, 1);
@@ -179,7 +162,7 @@ impl Rwkv7Hip {
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
         let mut logits_f32 = scratch.logits_f32.resized_view_mut(out_shape)?;
 
-        prof.time("embedding", || {
+        {
             // Embedding lookup: tokens[b][t] -> x[c, t, b]
             // Embedding table is kept on CPU - use pinned staging buffer for async upload
             let emb_data = &self.embed.w;
@@ -200,9 +183,7 @@ impl Rwkv7Hip {
                     .emb_staging
                     .copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
             }
-            prof_sync(stream)?;
-            Ok(())
-        })?;
+        }
 
         let (mut att_shift_gpu, mut ffn_shift_gpu, mut wkv_state_gpu) = if use_resident_state {
             (
@@ -211,7 +192,7 @@ impl Rwkv7Hip {
                 std::mem::take(&mut scratch.wkv_state_gpu),
             )
         } else {
-            prof.time("state_upload", || {
+            {
                 // Upload state to GPU using pinned async transfers
                 let mut att_shift_gpu = Vec::with_capacity(n_layer);
                 for s in &state.att_shift_states {
@@ -239,8 +220,8 @@ impl Rwkv7Hip {
                     }
                     wkv_state_gpu.push(gpu_tensor);
                 }
-                Ok((att_shift_gpu, ffn_shift_gpu, wkv_state_gpu))
-            })?
+                (att_shift_gpu, ffn_shift_gpu, wkv_state_gpu)
+            }
         };
 
         let result = (|| {
@@ -274,7 +255,7 @@ impl Rwkv7Hip {
 
                 // Apply ln0 for layer 0
                 if layer_idx == 0 {
-                    prof.time("ln0", || {
+                    {
                         layer_norm_f16(
                             &x,
                             &self.embed.ln.weight,
@@ -284,8 +265,7 @@ impl Rwkv7Hip {
                             stream,
                         )?;
                         copy_tensor_f16(&x_ln, &mut x, stream)?;
-                        Ok(())
-                    })?;
+                    }
 
                     // PostEmbedLayerNorm probe
                     #[cfg(feature = "hip-probes")]
@@ -300,7 +280,7 @@ impl Rwkv7Hip {
                 }
 
                 // ==== Time-Mix (Attention) ====
-                prof.time("att_ln", || {
+                {
                     layer_norm_f16(
                         &x,
                         &layer.att_ln.weight,
@@ -309,9 +289,7 @@ impl Rwkv7Hip {
                         1e-5,
                         stream,
                     )?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttLayerNorm probe
                 #[cfg(feature = "hip-probes")]
@@ -326,7 +304,7 @@ impl Rwkv7Hip {
 
                 // Token shifts for attention - use masked kernel for x_r to get correct state
                 // The masked kernel extracts state at lengths[b]-1 instead of T-1
-                prof.time("att_shift", || {
+                {
                     channel_mix_state_f16_masked(
                         &x_ln,
                         &att_shift_gpu[layer_idx],
@@ -377,9 +355,7 @@ impl Rwkv7Hip {
                         &mut temp1,
                         stream,
                     )?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // Update shift state - new_att_shift has correct state from masked kernel
                 std::mem::swap(&mut new_att_shift, &mut att_shift_gpu[layer_idx]);
@@ -406,13 +382,11 @@ impl Rwkv7Hip {
                 }
 
                 // Linear projections: r, k, v
-                prof.time("att_proj", || {
+                {
                     ctx.hgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
                     ctx.hgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
                     ctx.hgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttLinear probe (stacked: r, k, v)
                 #[cfg(feature = "hip-probes")]
@@ -433,15 +407,13 @@ impl Rwkv7Hip {
                 }
 
                 // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
-                prof.time("att_decay", || {
+                {
                     ctx.hgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
                     tanh_f16(&lora_w, &mut lora_w_tanh, stream)?;
                     ctx.hgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
                     broadcast_add_f16(&att_w, &layer.att.w0, &mut temp1, stream)?;
                     softplus_decay_f16(&temp1, &mut att_w, stream)?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttDecay probe
                 #[cfg(feature = "hip-probes")]
@@ -455,14 +427,12 @@ impl Rwkv7Hip {
                 }
 
                 // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
-                prof.time("att_adapt", || {
+                {
                     ctx.hgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
                     ctx.hgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
                     broadcast_add_f16(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
                     sigmoid_f16(&temp1, &mut att_a, stream)?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttAdapt probe
                 #[cfg(feature = "hip-probes")]
@@ -476,13 +446,11 @@ impl Rwkv7Hip {
                 }
 
                 // Gate: g = sigmoid(xg @ g1) @ g2
-                prof.time("att_gate", || {
+                {
                     ctx.hgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
                     sigmoid_f16(&lora_g, &mut lora_g_sig, stream)?;
                     ctx.hgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttGate probe
                 #[cfg(feature = "hip-probes")]
@@ -500,15 +468,14 @@ impl Rwkv7Hip {
                     if let (Some(v0), Some(v1), Some(v2)) =
                         (&layer.att.v0, &layer.att.v1, &layer.att.v2)
                     {
-                        prof.time("att_vres", || {
+                        {
                             ctx.hgemm_into(v1, &att_xv, &mut lora_v)?;
                             ctx.hgemm_into(v2, &lora_v, &mut v_lora2)?;
                             broadcast_add_f16(&v_lora2, v0, &mut temp1, stream)?;
                             sigmoid_f16(&temp1, &mut temp2, stream)?;
                             lerp_f16(&att_v, &v_first, &temp2, &mut temp1, stream)?;
                             copy_tensor_f16(&temp1, &mut att_v, stream)?;
-                            Ok(())
-                        })?;
+                        }
                     }
                     // PostAttValueResidual probe (only layers > 0)
                     #[cfg(feature = "hip-probes")]
@@ -525,11 +492,10 @@ impl Rwkv7Hip {
                 }
 
                 // L2 normalize k
-                prof.time("att_norm_k", || {
+                {
                     broadcast_mul_f16(&att_k, &layer.att.k_k, &mut temp1, stream)?;
                     l2_norm_f16(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttL2Norm probe
                 #[cfg(feature = "hip-probes")]
@@ -543,10 +509,9 @@ impl Rwkv7Hip {
                 }
 
                 // Control K
-                prof.time("att_ctrl_k", || {
+                {
                     control_k_f16(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttControlK probe
                 #[cfg(feature = "hip-probes")]
@@ -560,14 +525,13 @@ impl Rwkv7Hip {
                 }
 
                 // WKV inputs
-                prof.time("att_wkv_in", || {
+                {
                     negate_f16(&att_kk, &mut wkv_a, stream)?;
                     mul_f16(&att_kk, &att_a, &mut wkv_b, stream)?;
                     // Decay: exp(-exp(w)) where w = log(sigmoid(d)) - 0.5
                     // This gives decay = exp(-sigmoid(d) * 0.606531) in range (0.545, 1)
                     decay_exp_f16(&att_w, &mut w_decay, stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // Reshape for WKV
                 let w_decay_wkv = w_decay.reshape_view(wkv_data_shape)?;
@@ -604,7 +568,7 @@ impl Rwkv7Hip {
                 }
 
                 // Run WKV7 via trait dispatch: fused_t1 for T=1, wave_reduce for T>1
-                prof.time("wkv", || {
+                {
                     let wkv_input = WkvInput {
                         w_decay: &w_decay_wkv,
                         r: &r_wkv,
@@ -621,9 +585,7 @@ impl Rwkv7Hip {
                         &mut wkv_out_wkv,
                         stream,
                     )?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostWkv + PostWkvState probes
                 #[cfg(feature = "hip-probes")]
@@ -641,7 +603,7 @@ impl Rwkv7Hip {
                 }
 
                 // Group norm on WKV output
-                prof.time("wkv_norm", || {
+                {
                     group_norm_f16(
                         &wkv_out,
                         &layer.att.gn.weight,
@@ -651,8 +613,7 @@ impl Rwkv7Hip {
                         64e-5,
                         stream,
                     )?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttGroupNorm probe
                 #[cfg(feature = "hip-probes")]
@@ -669,7 +630,7 @@ impl Rwkv7Hip {
                 let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
                 let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
                 let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
-                prof.time("wkv_bonus", || {
+                {
                     wkv_bonus_f16(
                         &r_wkv,
                         &k_ctrl_wkv,
@@ -678,8 +639,7 @@ impl Rwkv7Hip {
                         &mut wkv_bonus_wkv,
                         stream,
                     )?;
-                    Ok(())
-                })?;
+                }
 
                 // PostWkvBonus probe
                 #[cfg(feature = "hip-probes")]
@@ -693,11 +653,10 @@ impl Rwkv7Hip {
                 }
 
                 // Combine and gate
-                prof.time("att_gate_out", || {
+                {
                     add_f16(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
                     mul_f16(&temp1, &att_g, &mut temp2, stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttGated probe (gated output is in temp2)
                 #[cfg(feature = "hip-probes")]
@@ -711,11 +670,9 @@ impl Rwkv7Hip {
                 }
 
                 // Output projection
-                prof.time("att_out", || {
+                {
                     ctx.hgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAttOut probe
                 #[cfg(feature = "hip-probes")]
@@ -729,11 +686,10 @@ impl Rwkv7Hip {
                 }
 
                 // Residual
-                prof.time("att_resid", || {
+                {
                     add_f16(&x, &att_out, &mut temp1, stream)?;
                     copy_tensor_f16(&temp1, &mut x, stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostAtt probe
                 #[cfg(feature = "hip-probes")]
@@ -747,7 +703,7 @@ impl Rwkv7Hip {
                 }
 
                 // ==== Channel-Mix (FFN) ====
-                prof.time("ffn_ln", || {
+                {
                     layer_norm_f16(
                         &x,
                         &layer.ffn_ln.weight,
@@ -756,8 +712,7 @@ impl Rwkv7Hip {
                         1e-5,
                         stream,
                     )?;
-                    Ok(())
-                })?;
+                }
 
                 // PostFfnLayerNorm probe
                 #[cfg(feature = "hip-probes")]
@@ -771,7 +726,7 @@ impl Rwkv7Hip {
                 }
 
                 // Token shift for FFN - use masked kernel for correct state extraction
-                prof.time("ffn_shift", || {
+                {
                     channel_mix_state_f16_masked(
                         &x_ln,
                         &ffn_shift_gpu[layer_idx],
@@ -781,9 +736,7 @@ impl Rwkv7Hip {
                         &lens_gpu,
                         stream,
                     )?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // Update FFN shift state - new_ffn_shift has correct state from masked kernel
                 std::mem::swap(&mut new_ffn_shift, &mut ffn_shift_gpu[layer_idx]);
@@ -800,11 +753,9 @@ impl Rwkv7Hip {
                 }
 
                 // Key projection
-                prof.time("ffn_k", || {
+                {
                     ctx.hgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostFfnLinear probe
                 #[cfg(feature = "hip-probes")]
@@ -818,10 +769,9 @@ impl Rwkv7Hip {
                 }
 
                 // Squared ReLU
-                prof.time("ffn_relu2", || {
+                {
                     squared_relu_f16(&ffn_k, &mut ffn_k_sq, stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostFfnActivate probe
                 #[cfg(feature = "hip-probes")]
@@ -835,11 +785,9 @@ impl Rwkv7Hip {
                 }
 
                 // Value projection
-                prof.time("ffn_v", || {
+                {
                     ctx.hgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
-                    prof_sync(stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostFfnOut probe
                 #[cfg(feature = "hip-probes")]
@@ -853,11 +801,10 @@ impl Rwkv7Hip {
                 }
 
                 // Residual
-                prof.time("ffn_resid", || {
+                {
                     add_f16(&x, &ffn_out, &mut temp1, stream)?;
                     copy_tensor_f16(&temp1, &mut x, stream)?;
-                    Ok(())
-                })?;
+                }
 
                 // PostFfn probe
                 #[cfg(feature = "hip-probes")]
@@ -875,7 +822,7 @@ impl Rwkv7Hip {
             #[cfg(feature = "hip-probes")]
             { probe_ctx.layer = None; }
 
-            prof.time("head", || {
+            {
                 // ==== Output Head ====
                 layer_norm_f16(
                     &x,
@@ -887,9 +834,7 @@ impl Rwkv7Hip {
                 )?;
 
                 ctx.hgemm_into(&self.head.w, &x_ln, &mut logits)?;
-                prof_sync(stream)?;
-                Ok(())
-            })?;
+            }
 
             // PostHeadLayerNorm probe (x_ln holds head layer norm output)
             #[cfg(feature = "hip-probes")]
@@ -913,12 +858,11 @@ impl Rwkv7Hip {
                 }
             }
 
-            prof.time("logits_download", || {
+            {
                 // Convert f16 logits to f32 on GPU, then download asynchronously
                 copy_f16_to_f32(&logits, &mut logits_f32, stream)?;
                 logits_f32.copy_to_slice_async(scratch.logits_staging.as_slice_mut(), stream)?;
-                Ok(())
-            })?;
+            }
 
             Ok(())
         })();
@@ -928,7 +872,7 @@ impl Rwkv7Hip {
             scratch.ffn_state_gpu = ffn_shift_gpu;
             scratch.wkv_state_gpu = wkv_state_gpu;
         } else if result.is_ok() {
-            prof.time("state_download", || {
+            {
                 // Download state back to host using pinned async transfers
                 for (i, gpu_state) in att_shift_gpu.iter().enumerate() {
                     unsafe {
@@ -948,12 +892,8 @@ impl Rwkv7Hip {
                             .copy_from_device_async(gpu_state.as_ptr(), stream.handle())?;
                     }
                 }
-                Ok(())
-            })?;
+            }
         }
-
-        #[cfg(feature = "hip-prof")]
-        prof.print(&format!("b={b} t={t} layers={n_layer}"));
 
         result
     }
