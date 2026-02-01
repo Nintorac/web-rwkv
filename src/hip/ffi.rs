@@ -746,6 +746,27 @@ extern "C" {
         n_seq: c_int,
         stream: HipStream,
     ) -> HipError;
+
+    /// Stage 5: Output combination.
+    /// Combines intra-chunk attention with inter-chunk state contributions:
+    ///   o = qg @ h + A_qk @ v + A_qb @ v_new
+    /// Output is f16 matching existing WKV output layout [K, H, T, B].
+    pub fn launch_fla_chunk_o(
+        qg: *const f32,
+        v: *const f16,
+        v_new: *const f32,
+        a_qk: *const f32,
+        a_qb: *const f32,
+        h: *const f32,
+        o: *mut f16,
+        chunk_indices: *const c_int,
+        cu_seqlens: *const c_int,
+        k: c_int,
+        h_dim: c_int,
+        c: c_int,
+        total_chunks: c_int,
+        stream: HipStream,
+    ) -> HipError;
 }
 
 /// HIP success error code

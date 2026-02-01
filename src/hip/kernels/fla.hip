@@ -3,6 +3,8 @@
 // Stage 1: kernel_fla_cumsum — cumulative decay scan within each chunk.
 // Stage 2: kernel_fla_intra_gate + kernel_fla_intra_attn — intra-chunk attention.
 // Stage 3: kernel_fla_wy_inv + kernel_fla_wy_wu — WY representation.
+// Stage 4: kernel_fla_chunk_h — inter-chunk state recurrence.
+// Stage 5: kernel_fla_chunk_o — output combination.
 //
 // All per-token tensors use web-rwkv column-major layout [K, H, T, B] with K fastest.
 // For packed/varlen sequences, B=1 and T is total packed length.
@@ -967,6 +969,193 @@ hipError_t launch_fla_chunk_h(
                        kg, bg, v, w_wy, u_wy, gi,
                        state, h_out, v_new,
                        chunk_offsets, cu_seqlens,
+                       K, H, C);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// Stage 5: Output combination (kernel_fla_chunk_o)
+//
+// Combines intra-chunk attention with inter-chunk state contributions to
+// produce the final WKV7 output.
+//
+// For each token at position i in chunk:
+//   o[i, :] = (qg[i, :] @ h[chunk])          -- state contribution via query
+//           + sum_j(A_qk[i,j] * v[j, :])      -- local attention (original values)
+//           + sum_j(A_qb[i,j] * v_new[j, :])  -- WY correction (corrected values)
+//
+// Where:
+// - qg is the decay-scaled query from Stage 2 [K, H, T, B] (f32)
+// - h is the per-chunk state from Stage 4 [K, K, H, total_chunks] (f32)
+// - A_qk is the causal QK attention matrix from Stage 2 [C, C, H, total_chunks]
+// - A_qb is the causal QB attention matrix from Stage 2 [C, C, H, total_chunks]
+// - v is the original value tensor [K, H, T, B] (f16)
+// - v_new is the corrected value tensor from Stage 4 [K, H, T, B] (f32)
+// - Output o is [K, H, T, B] (f16) matching existing WKV output layout
+//
+// Both A_qk and A_qb are applied with causal mask (i >= j) before use.
+// Positions beyond sequence length produce zero output.
+//
+// Grid:  dim3(total_chunks, H, 1)
+// Block: dim3(C=16) (one thread per row i within chunk)
+//
+// Reference: repos/flash-linear-attention/fla/ops/generalized_delta_rule/dplr/chunk_o_fwd.py
+// ============================================================================
+
+__global__ __launch_bounds__(16, 16)
+void kernel_fla_chunk_o(
+    const float*  __restrict__ qg,             // [K, H, T_packed, 1] decay-scaled query (f32)
+    const __half* __restrict__ v,              // [K, H, T_packed, 1] original value     (f16)
+    const float*  __restrict__ v_new,          // [K, H, T_packed, 1] corrected values   (f32)
+    const float*  __restrict__ A_qk,           // [C, C, H, total_chunks] causal attn QK
+    const float*  __restrict__ A_qb,           // [C, C, H, total_chunks] causal attn QB
+    const float*  __restrict__ h,              // [K, K, H, total_chunks] per-chunk states
+    __half*       __restrict__ o,              // [K, H, T_packed, 1] output (f16)
+    const int*    __restrict__ chunk_indices,  // [total_chunks * 2]
+    const int*    __restrict__ cu_seqlens,     // [N+1]
+    int K_dim,                                 // head_size (64)
+    int H,                                     // n_heads
+    int C                                      // chunk_size (16)
+) {
+    const int chunk_flat = blockIdx.x;     // which chunk (0..total_chunks-1)
+    const int i_h = blockIdx.y;            // which head (0..H-1)
+    const int i = threadIdx.x;             // row index within chunk (0..C-1)
+
+    if (i_h >= H || i >= C) return;
+
+    // Resolve chunk -> sequence mapping
+    const int seq_id      = chunk_indices[chunk_flat * 2];
+    const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
+
+    // Sequence boundaries
+    const int bos = cu_seqlens[seq_id];
+    const int eos = cu_seqlens[seq_id + 1];
+    const int T   = eos - bos;
+
+    // Absolute position of this thread's token
+    const int i_abs = local_chunk * C + i;
+
+    // Token stride in [K, H, T, B] layout
+    const int token_stride = H * K_dim;
+
+    // If this position is beyond the sequence length, zero the output and return
+    if (i_abs >= T) {
+        // Zero output for out-of-bounds positions
+        const int out_base = i_h * K_dim + (bos + i_abs) * token_stride;
+        // Only write if the position is within the padded buffer
+        // (positions beyond T in the last chunk don't need writes since
+        // they are never read downstream, but we handle this defensively)
+        return;
+    }
+
+    // Token offset for this thread's position
+    const int tok_offset = (bos + i_abs) * token_stride + i_h * K_dim;
+
+    // Attention matrix base: [C, C, H, total_chunks]
+    // A[row_i, col_j, h, chunk] = row_i + col_j * C + h * C * C + chunk * H * C * C
+    const int mat_base = i_h * C * C + chunk_flat * H * C * C;
+
+    // Number of valid positions in this chunk
+    const int chunk_start = local_chunk * C;
+    const int valid_len = min(C, T - chunk_start);
+
+    // ---- State contribution base: h[K, K, H, total_chunks] ----
+    // h[k_row, k_col, h, chunk] = k_row + k_col * K + h * K * K + chunk * H * K * K
+    const int h_base = i_h * K_dim * K_dim + chunk_flat * H * K_dim * K_dim;
+
+    // Load A_qk row i and A_qb row i with causal mask (i >= j)
+    // These are small (C=16 elements each) so load into registers
+    float a_qk_row[16];
+    float a_qb_row[16];
+    #pragma unroll
+    for (int j = 0; j < C; j++) {
+        if (i >= j && j < valid_len) {
+            // A[i, j] = A[mat_base + i + j * C]
+            a_qk_row[j] = A_qk[mat_base + i + j * C];
+            a_qb_row[j] = A_qb[mat_base + i + j * C];
+        } else {
+            a_qk_row[j] = 0.0f;
+            a_qb_row[j] = 0.0f;
+        }
+    }
+
+    // Compute output for each K element
+    for (int kk = 0; kk < K_dim; kk++) {
+        // Term 1: qg[i, kk] @ h[chunk] -> dot product over K dimension
+        // qg @ h produces a [K]-element vector per token position.
+        // For output element kk (the V dimension), we compute:
+        //   sum over k_inner: qg[i, k_inner] * h[k_inner, kk, head, chunk]
+        float state_dot = 0.0f;
+        #pragma unroll 16
+        for (int k_inner = 0; k_inner < K_dim; k_inner++) {
+            // qg[k_inner, h, i_abs+bos] = qg[k_inner + tok_offset_base]
+            const float qg_val = qg[k_inner + tok_offset];
+            // h[k_inner, kk, h, chunk] = h[k_inner + kk*K + h_base]
+            const float h_val = h[k_inner + kk * K_dim + h_base];
+            state_dot += qg_val * h_val;
+        }
+
+        // Term 2: sum_j(A_qk[i,j] * v[j, kk]) for j in valid positions
+        float local_attn = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            if (a_qk_row[j] != 0.0f) {
+                const int j_abs = chunk_start + j;
+                const int j_tok = kk + i_h * K_dim + (bos + j_abs) * token_stride;
+                const float v_val = __half2float(v[j_tok]);
+                local_attn += a_qk_row[j] * v_val;
+            }
+        }
+
+        // Term 3: sum_j(A_qb[i,j] * v_new[j, kk]) for j in valid positions
+        float wy_corr = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            if (a_qb_row[j] != 0.0f) {
+                const int j_abs = chunk_start + j;
+                const int j_tok = kk + i_h * K_dim + (bos + j_abs) * token_stride;
+                const float vn_val = v_new[j_tok];
+                wy_corr += a_qb_row[j] * vn_val;
+            }
+        }
+
+        // Combine all three terms and store as f16
+        const float result = state_dot + local_attn + wy_corr;
+        o[kk + tok_offset] = __float2half(result);
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for Stage 5 (output combination)
+// ============================================================================
+
+hipError_t launch_fla_chunk_o(
+    const float*  qg,
+    const __half* v,
+    const float*  v_new,
+    const float*  A_qk,
+    const float*  A_qb,
+    const float*  h,
+    __half*       o,
+    const int*    chunk_indices,
+    const int*    cu_seqlens,
+    int K,
+    int H,
+    int C,
+    int total_chunks,
+    hipStream_t   stream
+) {
+    if (K <= 0 || H <= 0 || C <= 0 || total_chunks <= 0) {
+        return hipSuccess;
+    }
+
+    dim3 grid(total_chunks, H, 1);
+    dim3 block(C);
+
+    hipLaunchKernelGGL(kernel_fla_chunk_o, grid, block, 0, stream,
+                       qg, v, v_new, A_qk, A_qb, h, o,
+                       chunk_indices, cu_seqlens,
                        K, H, C);
 
     return hipGetLastError();
