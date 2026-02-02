@@ -45,6 +45,7 @@ pub fn fla_cumsum(
     ge: &mut TensorHip<f32>,
     chunk_indices: &TensorHip<i32>,
     cu_seqlens: &TensorHip<i32>,
+    batch_offsets: &TensorHip<i32>,
     chunk_size: usize,
     total_chunks: usize,
     stream: &Stream,
@@ -96,10 +97,10 @@ pub fn fla_cumsum(
         });
     }
 
-    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() {
+    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() || !batch_offsets.is_contiguous() {
         return Err(HipErrorKind {
             code: -1,
-            message: "fla_cumsum: chunk_indices and cu_seqlens must be contiguous".to_string(),
+            message: "fla_cumsum: chunk_indices, cu_seqlens, and batch_offsets must be contiguous".to_string(),
         });
     }
 
@@ -114,6 +115,7 @@ pub fn fla_cumsum(
             ge.as_mut_ptr(),
             chunk_indices.as_ptr(),
             cu_seqlens.as_ptr(),
+            batch_offsets.as_ptr(),
             k as c_int,
             h as c_int,
             chunk_size as c_int,
@@ -184,6 +186,7 @@ pub fn fla_intra(
     A_ab: &mut TensorHip<f32>,
     chunk_indices: &TensorHip<i32>,
     cu_seqlens: &TensorHip<i32>,
+    batch_offsets: &TensorHip<i32>,
     chunk_size: usize,
     total_chunks: usize,
     stream: &Stream,
@@ -309,10 +312,10 @@ pub fn fla_intra(
             message: "fla_intra: all attention matrix tensors must be contiguous".to_string(),
         });
     }
-    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() {
+    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() || !batch_offsets.is_contiguous() {
         return Err(HipErrorKind {
             code: -1,
-            message: "fla_intra: chunk_indices and cu_seqlens must be contiguous".to_string(),
+            message: "fla_intra: chunk_indices, cu_seqlens, and batch_offsets must be contiguous".to_string(),
         });
     }
 
@@ -338,6 +341,7 @@ pub fn fla_intra(
             A_ab.as_mut_ptr(),
             chunk_indices.as_ptr(),
             cu_seqlens.as_ptr(),
+            batch_offsets.as_ptr(),
             k_dim as c_int,
             h as c_int,
             chunk_size as c_int,
@@ -392,6 +396,7 @@ pub fn fla_wy_repr(
     u_wy: &mut TensorHip<f32>,
     chunk_indices: &TensorHip<i32>,
     cu_seqlens: &TensorHip<i32>,
+    batch_offsets: &TensorHip<i32>,
     chunk_size: usize,
     total_chunks: usize,
     stream: &Stream,
@@ -481,10 +486,10 @@ pub fn fla_wy_repr(
             message: "fla_wy_repr: all tensors must be contiguous".to_string(),
         });
     }
-    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() {
+    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() || !batch_offsets.is_contiguous() {
         return Err(HipErrorKind {
             code: -1,
-            message: "fla_wy_repr: chunk_indices and cu_seqlens must be contiguous".to_string(),
+            message: "fla_wy_repr: chunk_indices, cu_seqlens, and batch_offsets must be contiguous".to_string(),
         });
     }
 
@@ -503,6 +508,7 @@ pub fn fla_wy_repr(
             u_wy.as_mut_ptr(),
             chunk_indices.as_ptr(),
             cu_seqlens.as_ptr(),
+            batch_offsets.as_ptr(),
             k_dim as c_int,
             h as c_int,
             chunk_size as c_int,
@@ -569,6 +575,7 @@ pub fn fla_chunk_h(
     v_new: &mut TensorHip<f32>,
     chunk_offsets: &TensorHip<i32>,
     cu_seqlens: &TensorHip<i32>,
+    batch_offsets: &TensorHip<i32>,
     chunk_size: usize,
     n_seq: usize,
     stream: &Stream,
@@ -673,10 +680,10 @@ pub fn fla_chunk_h(
             message: "fla_chunk_h: state and h_out must be contiguous".to_string(),
         });
     }
-    if !chunk_offsets.is_contiguous() || !cu_seqlens.is_contiguous() {
+    if !chunk_offsets.is_contiguous() || !cu_seqlens.is_contiguous() || !batch_offsets.is_contiguous() {
         return Err(HipErrorKind {
             code: -1,
-            message: "fla_chunk_h: chunk_offsets and cu_seqlens must be contiguous".to_string(),
+            message: "fla_chunk_h: chunk_offsets, cu_seqlens, and batch_offsets must be contiguous".to_string(),
         });
     }
 
@@ -697,6 +704,7 @@ pub fn fla_chunk_h(
             v_new.as_mut_ptr(),
             chunk_offsets.as_ptr(),
             cu_seqlens.as_ptr(),
+            batch_offsets.as_ptr(),
             k_dim as c_int,
             h as c_int,
             chunk_size as c_int,
@@ -755,6 +763,7 @@ pub fn fla_chunk_o(
     o: &mut TensorHip<f16>,
     chunk_indices: &TensorHip<i32>,
     cu_seqlens: &TensorHip<i32>,
+    batch_offsets: &TensorHip<i32>,
     chunk_size: usize,
     total_chunks: usize,
     stream: &Stream,
@@ -873,10 +882,10 @@ pub fn fla_chunk_o(
             message: "fla_chunk_o: h (per-chunk state) must be contiguous".to_string(),
         });
     }
-    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() {
+    if !chunk_indices.is_contiguous() || !cu_seqlens.is_contiguous() || !batch_offsets.is_contiguous() {
         return Err(HipErrorKind {
             code: -1,
-            message: "fla_chunk_o: chunk_indices and cu_seqlens must be contiguous".to_string(),
+            message: "fla_chunk_o: chunk_indices, cu_seqlens, and batch_offsets must be contiguous".to_string(),
         });
     }
 
@@ -895,6 +904,7 @@ pub fn fla_chunk_o(
             o.as_mut_ptr(),
             chunk_indices.as_ptr(),
             cu_seqlens.as_ptr(),
+            batch_offsets.as_ptr(),
             k_dim as c_int,
             h_dim as c_int,
             chunk_size as c_int,

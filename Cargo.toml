@@ -83,6 +83,7 @@ npyz = { version = "0.8.4", features = ["half", "npz"] }
 ratatui = { version = "0.30", features = ["all-widgets"] }
 serde_yaml = "0.9"
 simple_logger = { version = "5.1", features = ["stderr"] }
+test-case = "3.3.1"
 tokio = { version = "1.41", features = ["full"] }
 web-rwkv-bench = { path = "crates/web-rwkv-bench" }
 

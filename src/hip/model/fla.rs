@@ -31,7 +31,8 @@ use crate::hip::tensor::{TensorHip, TensorShape};
 
 /// Threshold sequence length for dispatching to FLA chunked prefill.
 /// Sequences with T >= this value use FLA; shorter sequences use WaveReduceWkv.
-pub const FLA_CHUNK_THRESHOLD: usize = 32;
+/// FLA handles all prefill (T>1), so the threshold is set to 2.
+pub const FLA_CHUNK_THRESHOLD: usize = 2;
 
 /// FLA chunked WKV7 kernel for efficient prefill.
 ///
@@ -166,10 +167,9 @@ impl FlaChunkedWkv {
     /// * `state` - Per-layer recurrent state `[K, K, H, B]` (f32), updated in-place
     /// * `output` - Output tensor `[K, H, T, B]` (f16)
     /// * `lengths` - Per-batch real sequence lengths (CPU-side, one entry per batch element).
-    ///   Used to build cu_seqlens so that FLA only processes real tokens and
-    ///   ignores padding. For B=1, cu_seqlens = `[0, lengths[0]]`. For B>1
-    ///   with padding, the padded layout cannot be represented with standard
-    ///   cu_seqlens; see bd-2sh.8.11.
+    ///   Used to build cu_seqlens (packed convention) for chunk counting and bounds
+    ///   checking: `cu_seqlens[b] = sum(lengths[0..b])`. With packed/concatenated
+    ///   layout, `batch_offsets[b] = cu_seqlens[b]` (no padding gaps).
     /// * `stream` - HIP stream for kernel launches
     #[allow(non_snake_case)]
     pub fn compute(
@@ -196,49 +196,29 @@ impl FlaChunkedWkv {
         // Step 0: Compute chunk indices on CPU and upload to GPU
         // ================================================================
 
-        // Build cu_seqlens from actual per-batch lengths.
-        //
-        // For the padded layout [K, H, T_padded, B], batch b's tokens occupy
-        // positions [b * T_padded .. (b+1) * T_padded) in the flat token space.
-        // The real (non-padding) tokens are at [b * T_padded .. b * T_padded + lens[b]).
-        //
-        // The cu_seqlens convention requires cu_seqlens[b] = bos (start) and
-        // cu_seqlens[b+1] = eos (end) for sequence b. In a packed layout,
-        // eos_b == bos_{b+1}, but in the padded layout there is a gap of
-        // (T_padded - lens[b]) between eos_b and bos_{b+1}.
-        //
-        // For B=1, this is trivial: cu_seqlens = [0, lens[0]].
-        //
-        // For B>1, each batch element must start at b * T_padded. Since
-        // cu_seqlens[b+1] serves as BOTH eos_b AND bos_{b+1}, this only works
-        // when lens[b] == T_padded (no padding gap). When there IS padding
-        // (lens[b] < T_padded), the standard cu_seqlens convention cannot
-        // encode both the correct end position and the correct start position
-        // of the next batch in a single value.
-        //
-        // For B>1 with padding, we fall back to the padded cu_seqlens
-        // (using T_padded as each batch's length) which processes garbage
-        // padding tokens but produces correct memory offsets. The full fix
-        // for B>1 with variable lengths requires data repacking or kernel
-        // changes, tracked in bd-2sh.8.11.
-        let cu_seqlens_host: Vec<u32> = if bb == 1 {
-            // B=1: use real length directly. No ambiguity since there is no
-            // "next batch" whose start we need to encode.
-            vec![0, lengths[0] as u32]
-        } else {
-            // B>1: check if all sequences fill the padded length (no padding).
-            // If so, cu_seqlens = [0, T, 2T, ..., B*T] is already correct.
-            // If any sequence has padding, we must fall back to the padded
-            // cu_seqlens since the packed convention cannot represent gaps.
-            let all_full = lengths.iter().all(|&l| l == t);
-            if all_full {
-                // No padding in any batch element -- lengths == T_padded.
-                (0..=bb).map(|i| (i * t) as u32).collect()
-            } else {
-                // Some batch elements have padding. Fall back to padded offsets.
-                // TODO(bd-2sh.8.11): implement data repacking for B>1 with padding.
-                (0..=bb).map(|i| (i * t) as u32).collect()
+        // Build cu_seqlens from actual per-batch lengths (packed convention).
+        // cu_seqlens[b] = sum(lengths[0..b]), cu_seqlens[b+1] - cu_seqlens[b] = lengths[b].
+        // This is used for chunk counting and bounds checking (sequence length T).
+        let cu_seqlens_host: Vec<u32> = {
+            let mut cs = Vec::with_capacity(bb + 1);
+            cs.push(0u32);
+            let mut accum = 0u32;
+            for &l in lengths.iter() {
+                accum += l as u32;
+                cs.push(accum);
             }
+            cs
+        };
+
+        // Build batch_offsets for data addressing.
+        // For B=1: offset is [0] (only one sequence, no gaps).
+        // For B>1: sequences are padded to seq_len (T_max), so each batch
+        // element starts at b * seq_len in the time dimension. The tensor
+        // layout is [K, H, T_max, B], so batch_offsets = [0, T, 2T, ...].
+        let batch_offsets_host: Vec<i32> = if bb == 1 {
+            vec![0i32]
+        } else {
+            (0..bb).map(|b| (b * t) as i32).collect()
         };
 
         // Compute chunk indices and offsets on CPU
@@ -269,6 +249,10 @@ impl FlaChunkedWkv {
         let cu_shape = TensorShape::new(bb + 1, 1, 1, 1);
         let cu_seqlens_flat: Vec<i32> = cu_seqlens_host.iter().map(|&x| x as i32).collect();
         let cu_seqlens_gpu = TensorHip::<i32>::from_slice(&cu_seqlens_flat, cu_shape, stream)?;
+
+        // batch_offsets on GPU
+        let bo_shape = TensorShape::new(bb, 1, 1, 1);
+        let batch_offsets_gpu = TensorHip::<i32>::from_slice(&batch_offsets_host, bo_shape, stream)?;
 
         // ================================================================
         // Stage 0.5: Convert raw att_w (f16) to gk (f32) = -exp(att_w)
@@ -303,6 +287,7 @@ impl FlaChunkedWkv {
             &mut self.fla_ge,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
+            &batch_offsets_gpu,
             c,
             total_chunks,
             stream,
@@ -340,6 +325,7 @@ impl FlaChunkedWkv {
             &mut self.fla_A_ab,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
+            &batch_offsets_gpu,
             c,
             total_chunks,
             stream,
@@ -360,6 +346,7 @@ impl FlaChunkedWkv {
             &mut self.fla_u_wy,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
+            &batch_offsets_gpu,
             c,
             total_chunks,
             stream,
@@ -386,6 +373,7 @@ impl FlaChunkedWkv {
             &mut self.fla_v_new,
             &chunk_offsets_gpu,
             &cu_seqlens_gpu,
+            &batch_offsets_gpu,
             c,
             n_seq,
             stream,
@@ -406,6 +394,7 @@ impl FlaChunkedWkv {
             output,
             &chunk_indices_gpu,
             &cu_seqlens_gpu,
+            &batch_offsets_gpu,
             c,
             total_chunks,
             stream,
@@ -719,36 +708,28 @@ mod tests {
     // FLA dispatch threshold
     // ------------------------------------------------------------------
 
-    /// Verify FLA_CHUNK_THRESHOLD is consistent with fla_chunk_size.
-    /// FLA needs at least one full chunk (C=16 by default) to be useful,
-    /// so the threshold should be >= chunk_size. Currently threshold = 32
-    /// which means at least 2 full chunks are required.
+    /// Verify FLA_CHUNK_THRESHOLD is set to 2, meaning FLA handles all T>1.
     #[test]
-    fn test_fla_threshold_consistent_with_chunk_size() {
-        use crate::hip::scratch::FLA_CHUNK_SIZE;
-
-        assert!(
-            FLA_CHUNK_THRESHOLD >= FLA_CHUNK_SIZE,
-            "FLA_CHUNK_THRESHOLD ({}) must be >= FLA_CHUNK_SIZE ({}) \
-             so at least one full chunk is guaranteed",
-            FLA_CHUNK_THRESHOLD,
-            FLA_CHUNK_SIZE,
+    fn test_fla_threshold_handles_all_prefill() {
+        assert_eq!(
+            FLA_CHUNK_THRESHOLD, 2,
+            "FLA_CHUNK_THRESHOLD should be 2 (FLA handles all T>1)"
         );
     }
 
     /// Verify the dispatch boundary values.
-    /// T < 32 should NOT use FLA, T >= 32 should use FLA.
+    /// T < 2 should NOT use FLA (T=1 is recurrent), T >= 2 should use FLA.
     #[test]
     fn test_fla_dispatch_boundary() {
-        // Below threshold: no FLA
+        // T=1 is recurrent, not FLA
         assert!(
-            31 < FLA_CHUNK_THRESHOLD,
-            "T=31 should be below threshold"
+            1 < FLA_CHUNK_THRESHOLD,
+            "T=1 should be below threshold (recurrent)"
         );
         // At threshold: yes FLA
         assert!(
-            32 >= FLA_CHUNK_THRESHOLD,
-            "T=32 should be at or above threshold"
+            2 >= FLA_CHUNK_THRESHOLD,
+            "T=2 should be at or above threshold"
         );
         // Well above threshold: yes FLA
         assert!(

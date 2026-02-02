@@ -48,6 +48,7 @@ void kernel_fla_cumsum(
     float* __restrict__ ge,                 // [K, H, T_packed, 1] exclusive cumsum output
     const int* __restrict__ chunk_indices,  // [total_chunks * 2] flat: (seq_id, local_chunk_id)
     const int* __restrict__ cu_seqlens,     // [N+1] cumulative sequence lengths
+    const int* __restrict__ batch_offsets,  // [N] data offsets per sequence
     int K,                                  // head_size (64)
     int H,                                  // n_heads
     int C                                   // chunk_size (16)
@@ -63,9 +64,8 @@ void kernel_fla_cumsum(
     const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
 
     // Sequence boundaries
-    const int bos = cu_seqlens[seq_id];
-    const int eos = cu_seqlens[seq_id + 1];
-    const int T   = eos - bos;  // sequence length
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
 
     // Stride for advancing one token in column-major [K, H, T, B] layout
     const int token_stride = H * K;
@@ -106,6 +106,7 @@ hipError_t launch_fla_cumsum(
     float* ge,
     const int* chunk_indices,
     const int* cu_seqlens,
+    const int* batch_offsets,
     int K,
     int H,
     int C,
@@ -120,7 +121,7 @@ hipError_t launch_fla_cumsum(
     dim3 block(K);
 
     hipLaunchKernelGGL(kernel_fla_cumsum, grid, block, 0, stream,
-                       gk, gi, ge, chunk_indices, cu_seqlens,
+                       gk, gi, ge, chunk_indices, cu_seqlens, batch_offsets,
                        K, H, C);
 
     return hipGetLastError();
@@ -158,6 +159,7 @@ void kernel_fla_intra_gate(
     float* __restrict__ bg_out,                // [K, H, T_packed, 1] decay-scaled b
     const int* __restrict__ chunk_indices,     // [total_chunks * 2]
     const int* __restrict__ cu_seqlens,        // [N+1]
+    const int* __restrict__ batch_offsets,     // [N] data offsets per sequence
     int K_dim,                                 // head_size (64)
     int H,                                     // n_heads
     int C                                      // chunk_size (16)
@@ -173,9 +175,8 @@ void kernel_fla_intra_gate(
     const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
 
     // Sequence boundaries
-    const int bos = cu_seqlens[seq_id];
-    const int eos = cu_seqlens[seq_id + 1];
-    const int T   = eos - bos;
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
 
     // Early exit for chunks entirely beyond sequence
     if (local_chunk * C >= T) return;
@@ -255,6 +256,7 @@ void kernel_fla_intra_attn(
     float* __restrict__ A_ab,                  // [C, C, H, total_chunks]
     const int* __restrict__ chunk_indices,     // [total_chunks * 2]
     const int* __restrict__ cu_seqlens,        // [N+1]
+    const int* __restrict__ batch_offsets,     // [N] data offsets per sequence
     int K_dim,                                 // head_size (64)
     int H,                                     // n_heads
     int C                                      // chunk_size (16)
@@ -270,9 +272,8 @@ void kernel_fla_intra_attn(
     const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
 
     // Sequence boundaries
-    const int bos = cu_seqlens[seq_id];
-    const int eos = cu_seqlens[seq_id + 1];
-    const int T   = eos - bos;
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
 
     // Absolute position of row i
     const int i_abs = local_chunk * C + i;
@@ -394,6 +395,7 @@ hipError_t launch_fla_intra(
     float* A_ab,
     const int* chunk_indices,
     const int* cu_seqlens,
+    const int* batch_offsets,
     int K,
     int H,
     int C,
@@ -411,7 +413,7 @@ hipError_t launch_fla_intra(
 
         hipLaunchKernelGGL(kernel_fla_intra_gate, grid, block, 0, stream,
                            q, k, a, b, gi, ge, qg, kg, ag, bg,
-                           chunk_indices, cu_seqlens,
+                           chunk_indices, cu_seqlens, batch_offsets,
                            K, H, C);
 
         hipError_t err = hipGetLastError();
@@ -426,7 +428,7 @@ hipError_t launch_fla_intra(
         hipLaunchKernelGGL(kernel_fla_intra_attn, grid, block, 0, stream,
                            q, k, a, b, gi, ge,
                            A_qk, A_qb, A_ak, A_ab,
-                           chunk_indices, cu_seqlens,
+                           chunk_indices, cu_seqlens, batch_offsets,
                            K, H, C);
 
         return hipGetLastError();
@@ -575,6 +577,7 @@ void kernel_fla_wy_wu(
     float* __restrict__ u_wy,                   // [K, H, T_packed, 1] f32 output
     const int* __restrict__ chunk_indices,      // [total_chunks * 2]
     const int* __restrict__ cu_seqlens,         // [N+1]
+    const int* __restrict__ batch_offsets,      // [N] data offsets per sequence
     int K_dim,                                  // head_size (64)
     int H,                                      // n_heads
     int C                                       // chunk_size (16)
@@ -590,9 +593,8 @@ void kernel_fla_wy_wu(
     const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
 
     // Sequence boundaries
-    const int bos = cu_seqlens[seq_id];
-    const int eos = cu_seqlens[seq_id + 1];
-    const int T   = eos - bos;
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
 
     // Absolute position of row i in the sequence
     const int i_abs = local_chunk * C + i;
@@ -720,6 +722,7 @@ hipError_t launch_fla_wy_repr(
     float* u_wy,
     const int* chunk_indices,
     const int* cu_seqlens,
+    const int* batch_offsets,
     int K,
     int H,
     int C,
@@ -749,7 +752,7 @@ hipError_t launch_fla_wy_repr(
 
         hipLaunchKernelGGL(kernel_fla_wy_wu, grid, block, 0, stream,
                            A_ab_inv, A_ak, ag, v, w_wy, u_wy,
-                           chunk_indices, cu_seqlens,
+                           chunk_indices, cu_seqlens, batch_offsets,
                            K, H, C);
 
         return hipGetLastError();
@@ -805,6 +808,7 @@ void kernel_fla_chunk_h(
     float*        __restrict__ v_new,          // [K, H, T, B] corrected values output
     const int*    __restrict__ chunk_offsets,  // [N+1] cumulative chunk counts
     const int*    __restrict__ cu_seqlens,     // [N+1] sequence boundaries
+    const int*    __restrict__ batch_offsets,  // [N] data offsets per sequence
     int K_dim,                                 // head_size (64)
     int H,                                     // n_heads
     int C                                      // chunk_size (16)
@@ -817,9 +821,8 @@ void kernel_fla_chunk_h(
     const int v_col    = threadIdx.x;           // column index (0..K-1)
 
     // Sequence boundaries
-    const int bos = cu_seqlens[i_n];
-    const int eos = cu_seqlens[i_n + 1];
-    const int T   = eos - bos;                  // sequence length
+    const int bos = batch_offsets[i_n];
+    const int T   = cu_seqlens[i_n + 1] - cu_seqlens[i_n];
     if (T <= 0) return;
 
     // Chunk range for this sequence
@@ -829,14 +832,15 @@ void kernel_fla_chunk_h(
     // Token stride in [K, H, T, B] layout: advance one token
     const int token_stride = H * K_dim;
 
-    // State base offset: state[k, v, h, seq] = k + v*K + h*K*K + seq*H*K*K
+    // State base offset: state[k, v, h, seq] = k*K + v + h*K*K + seq*H*K*K
+    // V (column) is fastest, matching recurrent WKV and Python fixture layout.
     const int state_base = i_h * K_dim * K_dim + i_n * H * K_dim * K_dim;
 
     // ---- Load initial state column into registers ----
     float h_col[64];
     #pragma unroll
     for (int k = 0; k < 64; k++) {
-        h_col[k] = state[k + v_col * K_dim + state_base];
+        h_col[k] = state[k * K_dim + v_col + state_base];
     }
 
     // Shared memory for data broadcast to all threads:
@@ -849,12 +853,12 @@ void kernel_fla_chunk_h(
         const int chunk_start = i_t * C;
 
         // Step 1: Store current state column to fla_h
-        // fla_h layout: [K, K, H, total_chunks]
-        // element (k, v, h, chunk_id) = k + v*K + h*K*K + chunk_id*H*K*K
+        // fla_h layout: [K, K, H, total_chunks], V (column) fastest
+        // element (k, v, h, chunk_id) = k*K + v + h*K*K + chunk_id*H*K*K
         const int h_out_base = i_h * K_dim * K_dim + chunk_id * H * K_dim * K_dim;
         #pragma unroll
         for (int k = 0; k < 64; k++) {
-            h_out[k + v_col * K_dim + h_out_base] = h_col[k];
+            h_out[k * K_dim + v_col + h_out_base] = h_col[k];
         }
 
         // Zero the chunk contribution accumulator
@@ -940,10 +944,10 @@ void kernel_fla_chunk_h(
     }
 
     // ---- Write final state ----
-    // state[k, v, h, seq] = k + v*K + h*K*K + seq*H*K*K
+    // state[k, v, h, seq] = k*K + v + h*K*K + seq*H*K*K  (V fastest)
     #pragma unroll
     for (int k = 0; k < 64; k++) {
-        state[k + v_col * K_dim + state_base] = h_col[k];
+        state[k * K_dim + v_col + state_base] = h_col[k];
     }
 }
 
@@ -963,6 +967,7 @@ hipError_t launch_fla_chunk_h(
     float*        v_new,
     const int*    chunk_offsets,
     const int*    cu_seqlens,
+    const int*    batch_offsets,
     int K,
     int H,
     int C,
@@ -979,7 +984,7 @@ hipError_t launch_fla_chunk_h(
     hipLaunchKernelGGL(kernel_fla_chunk_h, grid, block, 0, stream,
                        kg, bg, v, w_wy, u_wy, gi,
                        state, h_out, v_new,
-                       chunk_offsets, cu_seqlens,
+                       chunk_offsets, cu_seqlens, batch_offsets,
                        K, H, C);
 
     return hipGetLastError();
@@ -1025,6 +1030,7 @@ void kernel_fla_chunk_o(
     __half*       __restrict__ o,              // [K, H, T_packed, 1] output (f16)
     const int*    __restrict__ chunk_indices,  // [total_chunks * 2]
     const int*    __restrict__ cu_seqlens,     // [N+1]
+    const int*    __restrict__ batch_offsets,  // [N] data offsets per sequence
     int K_dim,                                 // head_size (64)
     int H,                                     // n_heads
     int C                                      // chunk_size (16)
@@ -1040,9 +1046,8 @@ void kernel_fla_chunk_o(
     const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
 
     // Sequence boundaries
-    const int bos = cu_seqlens[seq_id];
-    const int eos = cu_seqlens[seq_id + 1];
-    const int T   = eos - bos;
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
 
     // Absolute position of this thread's token
     const int i_abs = local_chunk * C + i;
@@ -1071,8 +1076,8 @@ void kernel_fla_chunk_o(
     const int chunk_start = local_chunk * C;
     const int valid_len = min(C, T - chunk_start);
 
-    // ---- State contribution base: h[K, K, H, total_chunks] ----
-    // h[k_row, k_col, h, chunk] = k_row + k_col * K + h * K * K + chunk * H * K * K
+    // ---- State contribution base: h[K, K, H, total_chunks], V fastest ----
+    // h[k_row, k_col, h, chunk] = k_row * K + k_col + h * K * K + chunk * H * K * K
     const int h_base = i_h * K_dim * K_dim + chunk_flat * H * K_dim * K_dim;
 
     // Load A_qk row i and A_qb row i with causal mask (i >= j)
@@ -1103,7 +1108,7 @@ void kernel_fla_chunk_o(
         #pragma unroll 16
         for (int k_inner = 0; k_inner < K_dim; k_inner++) {
             const float qg_val = qg[k_inner + tok_offset];
-            const float h_val = h[k_inner + kk * K_dim + h_base];
+            const float h_val = h[k_inner * K_dim + kk + h_base];
             pairs[k_inner] = qg_val * h_val;
         }
         // Pairwise reduce: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
@@ -1160,6 +1165,7 @@ hipError_t launch_fla_chunk_o(
     __half*       o,
     const int*    chunk_indices,
     const int*    cu_seqlens,
+    const int*    batch_offsets,
     int K,
     int H,
     int C,
@@ -1175,7 +1181,7 @@ hipError_t launch_fla_chunk_o(
 
     hipLaunchKernelGGL(kernel_fla_chunk_o, grid, block, 0, stream,
                        qg, v, v_new, A_qk, A_qb, h, o,
-                       chunk_indices, cu_seqlens,
+                       chunk_indices, cu_seqlens, batch_offsets,
                        K, H, C);
 
     return hipGetLastError();

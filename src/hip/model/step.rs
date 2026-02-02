@@ -2,7 +2,7 @@
 
 use half::f16;
 
-use super::prefill::{FusedT1Wkv, WaveReduceWkv, WkvInput, WkvKernel};
+use super::prefill::{FusedT1Wkv, WkvInput, WkvKernel};
 use super::state::HipState;
 use super::Rwkv7Hip;
 #[cfg(feature = "hip-probes")]
@@ -79,7 +79,10 @@ impl Rwkv7Hip {
         // of the FLA scratch buffers. This must happen before ctx borrows
         // scratch.blas_ctx, since &mut HipScratch conflicts with any
         // outstanding borrows.
-        let mut fla_kernel = if t >= super::fla::FLA_CHUNK_THRESHOLD {
+        //
+        // 2-tier dispatch: T=1 -> FusedT1Wkv (decode), T>1 -> FLA (prefill).
+        // FLA replaces WaveReduceWkv entirely for all prefill lengths.
+        let mut fla_kernel = if t > 1 {
             Some(super::fla::FlaChunkedWkv::new(
                 scratch, head_size, n_head, t, b,
             )?)
@@ -211,13 +214,9 @@ impl Rwkv7Hip {
             let mut temp1 = scratch.temp1.resized_view_mut(std_shape)?;
             let mut temp2 = scratch.temp2.resized_view_mut(std_shape)?;
 
-            // Select WKV kernel for recurrent path (T=1 or 1 < T < FLA_CHUNK_THRESHOLD).
-            // FLA (T >= threshold) is dispatched separately via fla_kernel.compute().
-            let wkv_kernel: &dyn WkvKernel = if t == 1 {
-                &FusedT1Wkv
-            } else {
-                &WaveReduceWkv
-            };
+            // 2-tier dispatch: T=1 uses FusedT1Wkv, T>1 uses FLA.
+            // The wkv_kernel is only used when fla_kernel is None (i.e., T=1).
+            let wkv_kernel: &dyn WkvKernel = &FusedT1Wkv;
 
             // PostEmbed probe: embedding output before any layer processing
             #[cfg(feature = "hip-probes")]
@@ -359,12 +358,19 @@ impl Rwkv7Hip {
                             let xv_data = download_f16_as_f32(&att_xv, stream)?;
                             let xa_data = download_f16_as_f32(&att_xa, stream)?;
                             let xg_data = download_f16_as_f32(&att_xg, stream)?;
-                            let stacked: Vec<f32> = [&xr_data, &xw_data, &xk_data, &xv_data, &xa_data, &xg_data]
-                                .into_iter()
-                                .flatten()
-                                .copied()
-                                .collect();
-                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttTokenShift, &stacked, [n_embd, actual_t, b, 6]);
+                            let tensors: &[&[f32]] = &[&xr_data, &xw_data, &xk_data, &xv_data, &xa_data, &xg_data];
+                            let n_stack = tensors.len();
+                            let mut stacked = Vec::with_capacity(n_embd * n_stack * actual_t * b);
+                            // Interleave by token: for each (b, t) position, append all stacks
+                            for b_idx in 0..b {
+                                for t_idx in 0..actual_t {
+                                    let base = n_embd * (t_idx + t * b_idx);
+                                    for tensor in tensors {
+                                        stacked.extend_from_slice(&tensor[base..base + n_embd]);
+                                    }
+                                }
+                            }
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttTokenShift, &stacked, [n_embd * n_stack, actual_t, b, 1]);
                         }
                     }
                 }
@@ -384,12 +390,19 @@ impl Rwkv7Hip {
                             let r_data = download_f16_as_f32(&att_r, stream)?;
                             let k_data = download_f16_as_f32(&att_k, stream)?;
                             let v_data = download_f16_as_f32(&att_v, stream)?;
-                            let stacked: Vec<f32> = [&r_data, &k_data, &v_data]
-                                .into_iter()
-                                .flatten()
-                                .copied()
-                                .collect();
-                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttLinear, &stacked, [n_embd, actual_t, b, 3]);
+                            let tensors: &[&[f32]] = &[&r_data, &k_data, &v_data];
+                            let n_stack = tensors.len();
+                            let mut stacked = Vec::with_capacity(n_embd * n_stack * actual_t * b);
+                            // Interleave by token: for each (b, t) position, append all stacks
+                            for b_idx in 0..b {
+                                for t_idx in 0..actual_t {
+                                    let base = n_embd * (t_idx + t * b_idx);
+                                    for tensor in tensors {
+                                        stacked.extend_from_slice(&tensor[base..base + n_embd]);
+                                    }
+                                }
+                            }
+                            hip_probe!(self, probe_ctx, probe::HipHook::PostAttLinear, &stacked, [n_embd * n_stack, actual_t, b, 1]);
                         }
                     }
                 }
@@ -531,23 +544,30 @@ impl Rwkv7Hip {
                 let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
                 let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
 
-                // PreWkv probe (stacked: w_decay, r, k_ctrl, v, wkv_a, wkv_b) + PreWkvState
+                // PreWkv probe (stacked: att_w, r, k_ctrl, v, wkv_a, wkv_b) + PreWkvState
                 #[cfg(feature = "hip-probes")]
                 {
                     if let Some(ref probes) = self.probes {
                         if probes.contains_key(&probe::HipHook::PreWkv) {
-                            let wd = download_f16_as_f32(&w_decay, stream)?;
+                            let wd = download_f16_as_f32(&att_w, stream)?;
                             let r_d = download_f16_as_f32(&att_r, stream)?;
                             let kc = download_f16_as_f32(&att_k_ctrl, stream)?;
                             let v_d = download_f16_as_f32(&att_v, stream)?;
                             let wa = download_f16_as_f32(&wkv_a, stream)?;
                             let wb = download_f16_as_f32(&wkv_b, stream)?;
-                            let stacked: Vec<f32> = [&wd, &r_d, &kc, &v_d, &wa, &wb]
-                                .into_iter()
-                                .flatten()
-                                .copied()
-                                .collect();
-                            hip_probe!(self, probe_ctx, probe::HipHook::PreWkv, &stacked, [n_embd, actual_t, b, 6]);
+                            let tensors: &[&[f32]] = &[&wd, &r_d, &kc, &v_d, &wa, &wb];
+                            let n_stack = tensors.len();
+                            let mut stacked = Vec::with_capacity(n_embd * n_stack * actual_t * b);
+                            // Interleave by token: for each (b, t) position, append all stacks
+                            for b_idx in 0..b {
+                                for t_idx in 0..actual_t {
+                                    let base = n_embd * (t_idx + t * b_idx);
+                                    for tensor in tensors {
+                                        stacked.extend_from_slice(&tensor[base..base + n_embd]);
+                                    }
+                                }
+                            }
+                            hip_probe!(self, probe_ctx, probe::HipHook::PreWkv, &stacked, [n_embd * n_stack, actual_t, b, 1]);
                         }
                         if probes.contains_key(&probe::HipHook::PreWkvState) {
                             let data = download_f32(&wkv_state_gpu[layer_idx], stream)?;
@@ -556,9 +576,9 @@ impl Rwkv7Hip {
                     }
                 }
 
-                // Run WKV7: FLA path for T >= threshold, recurrent path otherwise.
-                // FLA receives raw att_w (pre-exponentiation) for better precision;
-                // recurrent kernels receive w_decay = exp(-exp(att_w)) as before.
+                // Run WKV7: 2-tier dispatch.
+                // T>1 (prefill): FLA receives raw att_w (pre-exponentiation) for better precision.
+                // T=1 (decode): FusedT1Wkv receives w_decay = exp(-exp(att_w)).
                 if let Some(ref mut fla) = fla_kernel {
                     fla.compute(
                         &att_w_wkv,
@@ -862,9 +882,15 @@ impl Rwkv7Hip {
             }
 
             {
-                // Convert f16 logits to f32 on GPU, then download asynchronously
+                // Convert f16 logits to f32 on GPU, then download asynchronously.
+                // The staging buffer is pre-allocated for max_prefill_chunk but the
+                // logits tensor is sized for the actual T (max_len). Take a sub-slice.
                 copy_f16_to_f32(&logits, &mut logits_f32, stream)?;
-                logits_f32.copy_to_slice_async(scratch.logits_staging.as_slice_mut(), stream)?;
+                let logits_len = logits_f32.len();
+                logits_f32.copy_to_slice_async(
+                    &mut scratch.logits_staging.as_slice_mut()[..logits_len],
+                    stream,
+                )?;
             }
 
             Ok(())
@@ -935,12 +961,21 @@ impl Rwkv7Hip {
             });
         }
 
-        if max_len > chunk_size {
+        // Validate total token count fits within scratch allocation.
+        // For B>1 with T>1 (prefill), sequences are padded to max_len, so
+        // the effective total is batch_size * max_len.
+        // For B=1 or T=1, no padding is needed, so total is sum of lens.
+        let t_effective = if batch_size > 1 && max_len > 1 {
+            batch_size * max_len
+        } else {
+            lens.iter().sum()
+        };
+        if t_effective > chunk_size {
             return Err(HipErrorKind {
                 code: -1,
                 message: format!(
-                    "step() requires sequence length <= chunk_size ({} vs {})",
-                    max_len, chunk_size
+                    "step() requires effective token count <= chunk_size ({} vs {})",
+                    t_effective, chunk_size
                 ),
             });
         }
@@ -958,16 +993,36 @@ impl Rwkv7Hip {
             }
         }
 
-        // Pad sequences to chunk_size
-        let chunk_tokens: Vec<Vec<u32>> = x
-            .iter()
-            .map(|seq| {
-                let mut padded = seq.to_vec();
-                padded.resize(chunk_size, 0);
-                padded
-            })
-            .collect();
-        let chunk_refs: Vec<&[u32]> = chunk_tokens.iter().map(|v| v.as_slice()).collect();
+        // Dispatch strategy:
+        // - B=1 (any T): pass sequence directly, no padding needed.
+        // - B>1, T=1 (decode): pass sequences directly, FusedT1Wkv handles B>1 natively.
+        // - B>1, T>1 (prefill): pad shorter sequences to max_len so dispatch() gets
+        //   uniform-length sequences. FLA uses per-batch cu_seqlens for real lengths.
+        let (dispatch_tokens_storage, dispatch_refs, dispatch_lens);
+
+        if batch_size > 1 && max_len > 1 {
+            // B>1 prefill: pad shorter sequences to max_len (token 0 as padding)
+            let padded: Vec<Vec<u32>> = x
+                .iter()
+                .map(|seq| {
+                    let mut v = seq.to_vec();
+                    v.resize(max_len, 0);
+                    v
+                })
+                .collect();
+            dispatch_tokens_storage = padded;
+            dispatch_refs = dispatch_tokens_storage
+                .iter()
+                .map(|v| v.as_slice())
+                .collect::<Vec<_>>();
+            // Pass real per-sequence lengths so FLA can build cu_seqlens
+            dispatch_lens = lens.clone();
+        } else {
+            // B=1 or T=1: pass sequences directly, no padding needed
+            dispatch_tokens_storage = Vec::new(); // unused
+            dispatch_refs = x.to_vec();
+            dispatch_lens = lens.clone();
+        }
 
         let n_vocab = self.info.n_vocab;
         let n_layer = self.info.n_layer;
@@ -999,7 +1054,7 @@ impl Rwkv7Hip {
         }
 
         // Run the forward pass (all GPU-resident, no state param)
-        self.dispatch(&chunk_refs, scratch, &lens)?;
+        self.dispatch(&dispatch_refs, scratch, &dispatch_lens)?;
 
         // D2H: download scratch GPU buffers to a fresh HipState
         let stream_handle = scratch.blas_ctx.stream().handle();
@@ -1024,13 +1079,31 @@ impl Rwkv7Hip {
         // Sync the stream -- all GPU work and D->H transfers are now complete
         scratch.blas_ctx.synchronize()?;
 
-        // Extract real tokens from padded staging buffer
-        let padded = scratch.logits_staging.as_slice();
-        let mut logits = Vec::new();
-        for (b, &real_len) in lens.iter().enumerate() {
-            for t in 0..real_len {
-                let offset = (b * chunk_size + t) * n_vocab;
-                logits.extend_from_slice(&padded[offset..offset + n_vocab]);
+        // Extract logits from staging buffer.
+        // Layout is [n_vocab, T_stride, B] where T_stride depends on dispatch mode:
+        // - B>1, T>1 (padded): T_stride = max_len, skip padding positions
+        // - B=1 or T=1 (no padding): T_stride = lens[b], contiguous
+        let staging = scratch.logits_staging.as_slice();
+        let t_total: usize = lens.iter().sum();
+        let mut logits = Vec::with_capacity(t_total * n_vocab);
+
+        if batch_size > 1 && max_len > 1 {
+            // Padded layout: logits at [n_vocab, max_len, B], extract only real tokens
+            for (b, &real_len) in lens.iter().enumerate() {
+                for t in 0..real_len {
+                    let offset = (b * max_len + t) * n_vocab;
+                    logits.extend_from_slice(&staging[offset..offset + n_vocab]);
+                }
+            }
+        } else {
+            // Packed/contiguous layout: no padding gaps
+            let mut token_offset = 0usize;
+            for &real_len in lens.iter() {
+                for t in 0..real_len {
+                    let offset = (token_offset + t) * n_vocab;
+                    logits.extend_from_slice(&staging[offset..offset + n_vocab]);
+                }
+                token_offset += real_len;
             }
         }
 
@@ -1080,43 +1153,84 @@ impl Rwkv7Hip {
             });
         }
 
-        if max_len > chunk_size {
+        // Validate total token count fits within scratch allocation.
+        // Same strategy as step(): B>1 with T>1 pads to max_len.
+        let t_effective = if batch_size > 1 && max_len > 1 {
+            batch_size * max_len
+        } else {
+            lens.iter().sum()
+        };
+        if t_effective > chunk_size {
             return Err(HipErrorKind {
                 code: -1,
                 message: format!(
-                    "infer_resident() requires sequence length <= chunk_size ({} vs {})",
-                    max_len, chunk_size
+                    "infer_resident() requires effective token count <= chunk_size ({} vs {})",
+                    t_effective, chunk_size
                 ),
             });
         }
 
-        // Pad sequences to chunk_size
-        let chunk_tokens: Vec<Vec<u32>> = x
-            .iter()
-            .map(|seq| {
-                let mut padded = seq.to_vec();
-                padded.resize(chunk_size, 0);
-                padded
-            })
-            .collect();
-        let chunk_refs: Vec<&[u32]> = chunk_tokens.iter().map(|v| v.as_slice()).collect();
+        // Dispatch strategy (same as step()):
+        // - B=1 (any T): pass sequence directly, no padding needed.
+        // - B>1, T=1 (decode): pass sequences directly, FusedT1Wkv handles B>1 natively.
+        // - B>1, T>1 (prefill): pad shorter sequences to max_len.
+        let (dispatch_tokens_storage, dispatch_refs, dispatch_lens);
+
+        if batch_size > 1 && max_len > 1 {
+            // B>1 prefill: pad shorter sequences to max_len (token 0 as padding)
+            let padded: Vec<Vec<u32>> = x
+                .iter()
+                .map(|seq| {
+                    let mut v = seq.to_vec();
+                    v.resize(max_len, 0);
+                    v
+                })
+                .collect();
+            dispatch_tokens_storage = padded;
+            dispatch_refs = dispatch_tokens_storage
+                .iter()
+                .map(|v| v.as_slice())
+                .collect::<Vec<_>>();
+            dispatch_lens = lens.clone();
+        } else {
+            // B=1 or T=1: pass sequences directly, no padding needed
+            dispatch_tokens_storage = Vec::new(); // unused
+            dispatch_refs = x.to_vec();
+            dispatch_lens = lens.clone();
+        }
 
         let n_vocab = self.info.n_vocab;
 
         // Run the forward pass (state stays GPU-resident, no H2D/D2H)
-        self.dispatch(&chunk_refs, scratch, &lens)?;
+        self.dispatch(&dispatch_refs, scratch, &dispatch_lens)?;
 
         // Sync the stream
         let stream = scratch.blas_ctx.stream();
         stream.synchronize()?;
 
-        // Extract real tokens from padded staging buffer
-        let padded = scratch.logits_staging.as_slice();
-        let mut logits = Vec::new();
-        for (b, &real_len) in lens.iter().enumerate() {
-            for t in 0..real_len {
-                let offset = (b * chunk_size + t) * n_vocab;
-                logits.extend_from_slice(&padded[offset..offset + n_vocab]);
+        // Extract logits from staging buffer.
+        // Same layout logic as step(): padded vs contiguous.
+        let staging = scratch.logits_staging.as_slice();
+        let t_total: usize = lens.iter().sum();
+        let mut logits = Vec::with_capacity(t_total * n_vocab);
+
+        if batch_size > 1 && max_len > 1 {
+            // Padded layout: logits at [n_vocab, max_len, B], extract only real tokens
+            for (b, &real_len) in lens.iter().enumerate() {
+                for t in 0..real_len {
+                    let offset = (b * max_len + t) * n_vocab;
+                    logits.extend_from_slice(&staging[offset..offset + n_vocab]);
+                }
+            }
+        } else {
+            // Packed/contiguous layout: no padding gaps
+            let mut token_offset = 0usize;
+            for &real_len in lens.iter() {
+                for t in 0..real_len {
+                    let offset = (token_offset + t) * n_vocab;
+                    logits.extend_from_slice(&staging[offset..offset + n_vocab]);
+                }
+                token_offset += real_len;
             }
         }
 
@@ -1590,16 +1704,14 @@ mod tests {
     // === End-to-end FLA prefill tests (bd-2sh.8.10) ===
     //
     // These tests verify that the FLA chunked prefill path produces results
-    // matching the recurrent (WaveReduceWkv) path, and that state transfers
+    // matching the recurrent (token-by-token) path, and that state transfers
     // correctly from FLA prefill to recurrent decode.
     //
-    // Key design: dispatch() pads sequences to max_prefill_chunk, so the
-    // dispatch comparison `t >= FLA_CHUNK_THRESHOLD` compares against the
-    // padded chunk size, not the real sequence length.
+    // 2-tier dispatch:
+    // - T == 1 => FusedT1Wkv (decode)
+    // - T > 1  => FlaChunkedWkv (prefill)
     //
-    // - max_prefill_chunk >= 32 => FLA path (FlaChunkedWkv)
-    // - max_prefill_chunk = 1  => T=1 path (FusedT1Wkv)
-    // - 1 < max_prefill_chunk < 32 => recurrent path (WaveReduceWkv)
+    // max_prefill_chunk only limits the max allowed sequence length (scratch size).
 
     /// Helper: compute top-k token indices from a logits slice.
     fn top_k_indices(logits: &[f32], vocab: usize, token_idx: usize, k: usize) -> Vec<usize> {
@@ -1631,10 +1743,10 @@ mod tests {
 
     /// End-to-end FLA vs recurrent correctness test.
     ///
-    /// Runs the same tokens through both paths and compares the last-token
-    /// logits. The FLA path uses max_prefill_chunk=256 (T=256 >= 32 triggers
-    /// FLA dispatch). The recurrent path uses max_prefill_chunk=16 (T=16 < 32
-    /// uses WaveReduceWkv).
+    /// Runs the same 64 tokens through both paths and compares the last-token
+    /// logits. The FLA path uses real T=64 > 1 (triggers FLA dispatch).
+    /// The recurrent path processes tokens one at a time (each step T=1,
+    /// uses FusedT1Wkv).
     ///
     /// Since the two paths use mathematically equivalent but numerically
     /// different algorithms (chunked parallel vs sequential recurrent),
@@ -1649,11 +1761,11 @@ mod tests {
             return;
         }
 
-        // Input: 10 real tokens (well below both chunk sizes)
-        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        // Input: 64 real tokens — T > 1 triggers FLA dispatch
+        let tokens: Vec<u32> = (1..=64).collect();
         let n_real = tokens.len();
 
-        // FLA path: max_prefill_chunk=256 => dispatch sees T=256 >= 32 => FLA
+        // FLA path: T=64 > 1 => FlaChunkedWkv
         let model_fla = Rwkv7Hip::load(model_path).expect("load");
         let config_fla = HipRuntimeConfig::new(256, 1);
         let model_fla = model_fla.with_config(config_fla).expect("config");
@@ -1661,13 +1773,20 @@ mod tests {
             .step(&[&tokens], None)
             .expect("FLA step failed");
 
-        // Recurrent path: max_prefill_chunk=16 => dispatch sees T=16 < 32 => WaveReduceWkv
+        // Recurrent path: process one token at a time (each step T=1 => FusedT1Wkv)
         let model_rec = Rwkv7Hip::load(model_path).expect("load");
-        let config_rec = HipRuntimeConfig::new(16, 1);
+        let config_rec = HipRuntimeConfig::new(256, 1);
         let model_rec = model_rec.with_config(config_rec).expect("config");
-        let (logits_rec, state_rec) = model_rec
-            .step(&[&tokens], None)
-            .expect("Recurrent step failed");
+        let mut logits_rec = Vec::new();
+        let mut state_rec_opt: Option<HipState> = None;
+        for &tok in &tokens {
+            let (logits, new_state) = model_rec
+                .step(&[&[tok]], state_rec_opt)
+                .expect("Recurrent step failed");
+            logits_rec.extend(logits);
+            state_rec_opt = Some(new_state);
+        }
+        let state_rec = state_rec_opt.unwrap();
 
         let vocab = model_fla.info.n_vocab;
 
@@ -1729,7 +1848,7 @@ mod tests {
         }
 
         println!("=== FLA vs Recurrent Comparison (bd-2sh.8.10) ===");
-        println!("  Tokens: {} real, FLA chunk=256, Recurrent chunk=16", n_real);
+        println!("  Tokens: {} real, FLA chunk=256, Recurrent T=1", n_real);
         println!("  Last-token cosine similarity: {:.6}", cos_sim);
         println!(
             "  Last-token top-1: FLA={}, Recurrent={} ({})",
@@ -1768,9 +1887,9 @@ mod tests {
 
     /// FLA prefill -> recurrent decode state continuity test.
     ///
-    /// 1. Prefill N tokens with FLA (chunk_size=256, T=256 >= 32 => FLA)
+    /// 1. Prefill 48 tokens with FLA (T=48 > 1 => FlaChunkedWkv)
     /// 2. Decode 1 more token with recurrent (step with T=1 => FusedT1Wkv)
-    /// 3. Compare the decode output against doing all N+1 tokens recurrently
+    /// 3. Compare the decode output against doing all tokens recurrently (T=1 each)
     ///
     /// This tests that the WKV state produced by FLA is compatible with
     /// subsequent recurrent decode, which is the core prefill->decode transition.
@@ -1784,11 +1903,11 @@ mod tests {
             return;
         }
 
-        // 8 tokens for prefill, 1 token for decode
-        let prefill_tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let decode_token: u32 = 9;
+        // 48 tokens for prefill (T > 1 triggers FLA), 1 token for decode
+        let prefill_tokens: Vec<u32> = (1..=48).collect();
+        let decode_token: u32 = 49;
 
-        // === Path A: FLA prefill (256 chunk) -> recurrent decode (1 token) ===
+        // === Path A: FLA prefill (T=48 > 1 => FLA) -> recurrent decode (T=1) ===
         let model_a = Rwkv7Hip::load(model_path).expect("load");
         let config_a = HipRuntimeConfig::new(256, 1);
         let model_a = model_a.with_config(config_a).expect("config");
@@ -1803,19 +1922,23 @@ mod tests {
             .step(&[&[decode_token]], Some(state_a))
             .expect("Decode after FLA failed");
 
-        // === Path B: All recurrent (16 chunk, token by token for last) ===
+        // === Path B: All recurrent (token-by-token, each T=1 => FusedT1Wkv) ===
         let model_b = Rwkv7Hip::load(model_path).expect("load");
-        let config_b = HipRuntimeConfig::new(16, 1);
+        let config_b = HipRuntimeConfig::new(256, 1);
         let model_b = model_b.with_config(config_b).expect("config");
 
-        // Prefill recurrently
-        let (_logits_prefill_b, state_b) = model_b
-            .step(&[&prefill_tokens], None)
-            .expect("Recurrent prefill failed");
+        // Prefill recurrently one token at a time
+        let mut state_b: Option<HipState> = None;
+        for &tok in &prefill_tokens {
+            let (_logits, new_state) = model_b
+                .step(&[&[tok]], state_b)
+                .expect("Recurrent prefill step failed");
+            state_b = Some(new_state);
+        }
 
         // Decode recurrently
         let (logits_decode_b, _) = model_b
-            .step(&[&[decode_token]], Some(state_b))
+            .step(&[&[decode_token]], state_b)
             .expect("Recurrent decode failed");
 
         let vocab = model_a.info.n_vocab;
@@ -1905,12 +2028,12 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("load");
-        // Default HipRuntime: chunk_size=256 >= 32, so FLA is active for prefill
+        // Default HipRuntime: max_prefill_chunk=256, FLA is active when T > 1
         let runtime = HipRuntime::new(model, 1);
         let vocab = runtime.info().n_vocab;
 
-        // Prefill: 20 tokens (dispatches to FLA since chunk_size=256)
-        let prompt: Vec<u32> = (1..=20).collect();
+        // Prefill: 48 tokens (T=48 > 1, dispatches to FLA)
+        let prompt: Vec<u32> = (1..=48).collect();
         let logits = runtime.infer_one(&prompt).expect("FLA prefill via HipRuntime failed");
 
         // Basic sanity: output shape
@@ -1963,18 +2086,16 @@ mod tests {
         println!("test_fla_transparent_via_hip_runtime PASSED");
     }
 
-    /// Verify the 3-tier dispatch is correct by checking which path fires
-    /// for different max_prefill_chunk values.
+    /// Verify the 2-tier dispatch is correct by comparing results across
+    /// different processing strategies for the same input tokens.
     ///
-    /// This test uses the step() API at the boundary conditions:
-    /// - chunk_size=1 -> T=1 -> FusedT1Wkv
-    /// - chunk_size=16 -> T=16 < 32 -> WaveReduceWkv
-    /// - chunk_size=32 -> T=32 >= 32 -> FlaChunkedWkv
-    /// - chunk_size=256 -> T=256 >= 32 -> FlaChunkedWkv
+    /// Uses 64 tokens and compares:
+    /// - Tier 1 (FusedT1Wkv): token-by-token streaming (T=1 per step)
+    /// - Tier 2 (FlaChunkedWkv): full batch (T=64 > 1)
     ///
-    /// All paths should produce finite, sane logits for the same input.
+    /// Both paths should produce finite, sane logits for the same input.
     #[test]
-    fn test_three_tier_dispatch() {
+    fn test_two_tier_dispatch() {
         use std::path::Path;
 
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
@@ -1983,11 +2104,11 @@ mod tests {
             return;
         }
 
-        let tokens: Vec<u32> = vec![1, 2, 3];
+        let tokens: Vec<u32> = (1..=64).collect();
 
-        // Tier 1: FusedT1Wkv (one token at a time)
+        // Tier 1: FusedT1Wkv (one token at a time, T=1 per step)
         let model_t1 = Rwkv7Hip::load(model_path).expect("load");
-        let model_t1 = model_t1.with_config(HipRuntimeConfig::new(1, 1)).expect("config");
+        let model_t1 = model_t1.with_config(HipRuntimeConfig::new(256, 1)).expect("config");
         let mut t1_logits = Vec::new();
         let mut state: Option<HipState> = None;
         for &tok in &tokens {
@@ -1998,80 +2119,38 @@ mod tests {
             state = Some(new_state);
         }
 
-        // Tier 2: WaveReduceWkv (T=16, below FLA threshold)
-        let model_wr = Rwkv7Hip::load(model_path).expect("load");
-        let model_wr = model_wr.with_config(HipRuntimeConfig::new(16, 1)).expect("config");
-        let (wr_logits, _) = model_wr
+        // Tier 2: FlaChunkedWkv (full batch, T=64 > 1)
+        let model_fla = Rwkv7Hip::load(model_path).expect("load");
+        let model_fla = model_fla.with_config(HipRuntimeConfig::new(256, 1)).expect("config");
+        let (fla_logits, _) = model_fla
             .step(&[&tokens], None)
-            .expect("WaveReduce step failed");
-
-        // Tier 3: FlaChunkedWkv at threshold (T=32)
-        let model_fla32 = Rwkv7Hip::load(model_path).expect("load");
-        let model_fla32 = model_fla32.with_config(HipRuntimeConfig::new(32, 1)).expect("config");
-        let (fla32_logits, _) = model_fla32
-            .step(&[&tokens], None)
-            .expect("FLA@32 step failed");
-
-        // Tier 3: FlaChunkedWkv large (T=256)
-        let model_fla256 = Rwkv7Hip::load(model_path).expect("load");
-        let model_fla256 = model_fla256.with_config(HipRuntimeConfig::new(256, 1)).expect("config");
-        let (fla256_logits, _) = model_fla256
-            .step(&[&tokens], None)
-            .expect("FLA@256 step failed");
+            .expect("FLA step failed");
 
         let vocab = model_t1.info.n_vocab;
         let n_real = tokens.len();
 
-        // All paths should produce correct number of logits
+        // Both paths should produce correct number of logits
         assert_eq!(t1_logits.len(), n_real * vocab, "T1 logits size");
-        assert_eq!(wr_logits.len(), n_real * vocab, "WR logits size");
-        assert_eq!(fla32_logits.len(), n_real * vocab, "FLA32 logits size");
-        assert_eq!(fla256_logits.len(), n_real * vocab, "FLA256 logits size");
+        assert_eq!(fla_logits.len(), n_real * vocab, "FLA logits size");
 
-        // All paths should produce finite logits
+        // Both paths should produce finite logits
         assert!(t1_logits.iter().all(|x| x.is_finite()), "T1 logits finite");
-        assert!(wr_logits.iter().all(|x| x.is_finite()), "WR logits finite");
-        assert!(fla32_logits.iter().all(|x| x.is_finite()), "FLA32 logits finite");
-        assert!(fla256_logits.iter().all(|x| x.is_finite()), "FLA256 logits finite");
+        assert!(fla_logits.iter().all(|x| x.is_finite()), "FLA logits finite");
 
-        // WaveReduce (T>1 recurrent) should match T=1 streaming closely
-        // (these are the same recurrent algorithm, just chunked vs streaming)
-        let cos_t1_wr = cosine_similarity(&t1_logits, &wr_logits, vocab, n_real - 1);
+        // FLA should be at least roughly similar to T=1 recurrent
+        let cos_t1_fla = cosine_similarity(&t1_logits, &fla_logits, vocab, n_real - 1);
 
-        // FLA paths should agree with each other
-        let cos_fla32_fla256 = cosine_similarity(&fla32_logits, &fla256_logits, vocab, n_real - 1);
-
-        // FLA should be at least roughly similar to recurrent
-        let cos_wr_fla256 = cosine_similarity(&wr_logits, &fla256_logits, vocab, n_real - 1);
-
-        println!("=== 3-Tier Dispatch Test (bd-2sh.8.10) ===");
-        println!("  T=1 vs WaveReduce cosine: {:.6}", cos_t1_wr);
-        println!("  FLA@32 vs FLA@256 cosine: {:.6}", cos_fla32_fla256);
-        println!("  WaveReduce vs FLA@256 cosine: {:.6}", cos_wr_fla256);
-
-        // T=1 streaming vs WaveReduce should be very close (same algorithm)
-        assert!(
-            cos_t1_wr > 0.95,
-            "T=1 vs WaveReduce cosine {:.6} too low",
-            cos_t1_wr
-        );
-
-        // FLA@32 and FLA@256 should be very close (same FLA algorithm, just
-        // different padding -- the real tokens are the same)
-        assert!(
-            cos_fla32_fla256 > 0.95,
-            "FLA@32 vs FLA@256 cosine {:.6} too low",
-            cos_fla32_fla256
-        );
+        println!("=== 2-Tier Dispatch Test (bd-2sh.8.10) ===");
+        println!("  T=1 vs FLA cosine: {:.6}", cos_t1_fla);
 
         // FLA vs recurrent should be at least roughly similar
         assert!(
-            cos_wr_fla256 > 0.90,
-            "WaveReduce vs FLA cosine {:.6} too low",
-            cos_wr_fla256
+            cos_t1_fla > 0.90,
+            "T=1 vs FLA cosine {:.6} too low",
+            cos_t1_fla
         );
 
-        println!("test_three_tier_dispatch PASSED");
+        println!("test_two_tier_dispatch PASSED");
     }
 
     /// Detailed ranking analysis comparing FLA vs recurrent logit distributions.
@@ -2096,11 +2175,11 @@ mod tests {
             return;
         }
 
-        // Input: 10 real tokens
-        let tokens: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        // Input: 64 real tokens (T > 1 triggers FLA dispatch)
+        let tokens: Vec<u32> = (1..=64).collect();
         let n_real = tokens.len();
 
-        // FLA path: max_prefill_chunk=256 => FLA dispatch
+        // FLA path: T=64 > 1 => FlaChunkedWkv
         let model_fla = Rwkv7Hip::load(model_path).expect("load");
         let config_fla = HipRuntimeConfig::new(256, 1);
         let model_fla = model_fla.with_config(config_fla).expect("config");
@@ -2108,13 +2187,19 @@ mod tests {
             .step(&[&tokens], None)
             .expect("FLA step failed");
 
-        // Recurrent path: max_prefill_chunk=16 => WaveReduceWkv
+        // Recurrent path: one token at a time (each step T=1 => FusedT1Wkv)
         let model_rec = Rwkv7Hip::load(model_path).expect("load");
-        let config_rec = HipRuntimeConfig::new(16, 1);
+        let config_rec = HipRuntimeConfig::new(256, 1);
         let model_rec = model_rec.with_config(config_rec).expect("config");
-        let (logits_rec, _) = model_rec
-            .step(&[&tokens], None)
-            .expect("Recurrent step failed");
+        let mut logits_rec = Vec::new();
+        let mut state_rec: Option<HipState> = None;
+        for &tok in &tokens {
+            let (logits, new_state) = model_rec
+                .step(&[&[tok]], state_rec)
+                .expect("Recurrent step failed");
+            logits_rec.extend(logits);
+            state_rec = Some(new_state);
+        }
 
         let vocab = model_fla.info.n_vocab;
 
