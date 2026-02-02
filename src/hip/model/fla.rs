@@ -165,6 +165,11 @@ impl FlaChunkedWkv {
     /// * `b` - Adaptation-weighted normalized key (wkv_b), shape `[K, H, T, B]` (f16)
     /// * `state` - Per-layer recurrent state `[K, K, H, B]` (f32), updated in-place
     /// * `output` - Output tensor `[K, H, T, B]` (f16)
+    /// * `lengths` - Per-batch real sequence lengths (CPU-side, one entry per batch element).
+    ///   Used to build cu_seqlens so that FLA only processes real tokens and
+    ///   ignores padding. For B=1, cu_seqlens = `[0, lengths[0]]`. For B>1
+    ///   with padding, the padded layout cannot be represented with standard
+    ///   cu_seqlens; see bd-2sh.8.11.
     /// * `stream` - HIP stream for kernel launches
     #[allow(non_snake_case)]
     pub fn compute(
@@ -177,6 +182,7 @@ impl FlaChunkedWkv {
         b: &TensorHip<f16>,
         state: &mut TensorHip<f32>,
         output: &mut TensorHip<f16>,
+        lengths: &[usize],
         stream: &Stream,
     ) -> Result<()> {
         let t = self.seq_len;
@@ -190,8 +196,50 @@ impl FlaChunkedWkv {
         // Step 0: Compute chunk indices on CPU and upload to GPU
         // ================================================================
 
-        // Build cu_seqlens for equal-length batches: [0, T, 2T, ..., B*T]
-        let cu_seqlens_host: Vec<u32> = (0..=bb).map(|i| (i * t) as u32).collect();
+        // Build cu_seqlens from actual per-batch lengths.
+        //
+        // For the padded layout [K, H, T_padded, B], batch b's tokens occupy
+        // positions [b * T_padded .. (b+1) * T_padded) in the flat token space.
+        // The real (non-padding) tokens are at [b * T_padded .. b * T_padded + lens[b]).
+        //
+        // The cu_seqlens convention requires cu_seqlens[b] = bos (start) and
+        // cu_seqlens[b+1] = eos (end) for sequence b. In a packed layout,
+        // eos_b == bos_{b+1}, but in the padded layout there is a gap of
+        // (T_padded - lens[b]) between eos_b and bos_{b+1}.
+        //
+        // For B=1, this is trivial: cu_seqlens = [0, lens[0]].
+        //
+        // For B>1, each batch element must start at b * T_padded. Since
+        // cu_seqlens[b+1] serves as BOTH eos_b AND bos_{b+1}, this only works
+        // when lens[b] == T_padded (no padding gap). When there IS padding
+        // (lens[b] < T_padded), the standard cu_seqlens convention cannot
+        // encode both the correct end position and the correct start position
+        // of the next batch in a single value.
+        //
+        // For B>1 with padding, we fall back to the padded cu_seqlens
+        // (using T_padded as each batch's length) which processes garbage
+        // padding tokens but produces correct memory offsets. The full fix
+        // for B>1 with variable lengths requires data repacking or kernel
+        // changes, tracked in bd-2sh.8.11.
+        let cu_seqlens_host: Vec<u32> = if bb == 1 {
+            // B=1: use real length directly. No ambiguity since there is no
+            // "next batch" whose start we need to encode.
+            vec![0, lengths[0] as u32]
+        } else {
+            // B>1: check if all sequences fill the padded length (no padding).
+            // If so, cu_seqlens = [0, T, 2T, ..., B*T] is already correct.
+            // If any sequence has padding, we must fall back to the padded
+            // cu_seqlens since the packed convention cannot represent gaps.
+            let all_full = lengths.iter().all(|&l| l == t);
+            if all_full {
+                // No padding in any batch element -- lengths == T_padded.
+                (0..=bb).map(|i| (i * t) as u32).collect()
+            } else {
+                // Some batch elements have padding. Fall back to padded offsets.
+                // TODO(bd-2sh.8.11): implement data repacking for B>1 with padding.
+                (0..=bb).map(|i| (i * t) as u32).collect()
+            }
+        };
 
         // Compute chunk indices and offsets on CPU
         let chunk_indices_host = prepare_chunk_indices(&cu_seqlens_host, c);

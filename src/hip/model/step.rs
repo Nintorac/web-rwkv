@@ -569,6 +569,7 @@ impl Rwkv7Hip {
                         &wkv_b_wkv,
                         &mut wkv_state_gpu[layer_idx],
                         &mut wkv_out_wkv,
+                        lens,
                         stream,
                     )?;
                 } else {
