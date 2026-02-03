@@ -30,7 +30,7 @@ use crate::hip::kernels::{
     tanh_f16,
     wkv_bonus_f16,
 };
-use crate::hip::scratch::HipScratch;
+use crate::hip::scratch::PrefillScratch;
 use crate::hip::tensor::{TensorHip, TensorShape};
 
 #[cfg(feature = "hip-probes")]
@@ -64,7 +64,7 @@ impl Rwkv7Hip {
     pub(super) fn dispatch(
         &self,
         tokens: &[&[u32]],
-        scratch: &mut HipScratch,
+        scratch: &mut PrefillScratch,
         lens: &[usize],
     ) -> Result<()> {
         let b = tokens.len();
@@ -77,7 +77,7 @@ impl Rwkv7Hip {
         // Pre-create FLA kernel views before ctx borrows scratch.
         // FlaChunkedWkv::new takes &mut scratch to create non-owning views
         // of the FLA scratch buffers. This must happen before ctx borrows
-        // scratch.blas_ctx, since &mut HipScratch conflicts with any
+        // scratch.blas_ctx, since &mut PrefillScratch conflicts with any
         // outstanding borrows.
         //
         // 2-tier dispatch: T=1 -> FusedT1Wkv (decode), T>1 -> FLA (prefill).

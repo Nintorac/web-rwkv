@@ -52,7 +52,7 @@ pub use pinned::PinnedBuffer;
 pub use tensor::{TensorHip, TensorShape, TensorView};
 
 // Re-export scratch buffer types
-pub use scratch::{HipRuntimeConfig, HipScratch, LoraDims};
+pub use scratch::{DecodeConfig, DecodeScratch, HipRuntimeConfig, HipScratch, LoraDims, PrefillConfig, PrefillScratch};
 
 // Re-export kernel functions
 pub use kernels::{
@@ -114,8 +114,8 @@ pub use blaslt::{
 
 // Re-export model types
 pub use model::{
-    AttentionHip, EmbedHip, FfnHip, HeadHip, HipState, LayerHip, LayerNormHip,
-    ModelLoadError, Rwkv7Hip, Rwkv7Model, Rwkv7ModelInfo, StateLayout,
+    AttentionHip, EmbedHip, FfnHip, HeadHip, HipDecode, HipPrefill, HipState, LayerHip,
+    LayerNormHip, ModelLoadError, Rwkv7Hip, Rwkv7Model, Rwkv7ModelInfo, StateLayout,
 };
 
 #[cfg(test)]

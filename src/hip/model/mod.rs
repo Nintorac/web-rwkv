@@ -1,13 +1,17 @@
 //! RWKV7 HIP model loading and step (inference) implementation.
 
+pub mod decode;
 pub mod fla;
+pub mod hip_prefill;
 pub mod prefill;
 pub mod state;
 mod step;
 pub mod weights;
 
 // Re-export all public types from submodules
+pub use decode::HipDecode;
 pub use fla::FlaChunkedWkv;
+pub use hip_prefill::HipPrefill;
 pub use prefill::{FusedT1Wkv, WaveReduceWkv, WkvInput, WkvKernel};
 pub use state::{HipState, StateLayout};
 pub use weights::{
@@ -20,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use super::device::Stream;
 use super::ffi::{HipErrorKind, Result};
-use super::scratch::HipScratch;
+use super::scratch::PrefillScratch;
 use super::scratch::{HipRuntimeConfig, LoraDims};
 use super::tensor::TensorHip;
 
@@ -80,7 +84,7 @@ pub struct Rwkv7Hip {
     pub(crate) model: Arc<Rwkv7Model>,
 
     /// Lazily initialized scratch buffers for GPU-native forward pass.
-    pub(crate) scratch: Mutex<Option<HipScratch>>,
+    pub(crate) scratch: Mutex<Option<PrefillScratch>>,
 
     #[cfg(feature = "hip-probes")]
     pub(crate) probes: Option<HipProbeMapRef>,
@@ -465,7 +469,7 @@ impl Rwkv7Hip {
     /// ```
     pub fn with_config(self, config: HipRuntimeConfig) -> Result<Self> {
         let lora_dims = self.model.lora_dims();
-        let scratch = HipScratch::new(&self.model.info, lora_dims, config)?;
+        let scratch = PrefillScratch::new(&self.model.info, lora_dims, config)?;
         *self.scratch.lock().unwrap() = Some(scratch);
         Ok(self)
     }

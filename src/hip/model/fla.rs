@@ -26,7 +26,7 @@ use crate::hip::ffi::Result;
 use crate::hip::kernels::fla::{
     fla_chunk_h, fla_chunk_o, fla_cumsum, fla_neg_exp_f16_to_f32, fla_intra, fla_wy_repr,
 };
-use crate::hip::scratch::HipScratch;
+use crate::hip::scratch::PrefillScratch;
 use crate::hip::tensor::{TensorHip, TensorShape};
 
 /// Threshold sequence length for dispatching to FLA chunked prefill.
@@ -36,7 +36,7 @@ pub const FLA_CHUNK_THRESHOLD: usize = 2;
 
 /// FLA chunked WKV7 kernel for efficient prefill.
 ///
-/// Holds pre-sized views of the FLA scratch buffers from [`HipScratch`] plus
+/// Holds pre-sized views of the FLA scratch buffers from [`PrefillScratch`] plus
 /// configuration parameters for the current forward pass. Constructed at the
 /// dispatch point in `dispatch()` when T >= [`FLA_CHUNK_THRESHOLD`].
 ///
@@ -110,7 +110,7 @@ impl FlaChunkedWkv {
     /// * `batch_size` - Batch size (B)
     #[allow(non_snake_case)]
     pub fn new(
-        scratch: &mut HipScratch,
+        scratch: &mut PrefillScratch,
         head_size: usize,
         n_head: usize,
         seq_len: usize,
