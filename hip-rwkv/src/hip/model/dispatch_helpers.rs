@@ -146,12 +146,14 @@ pub struct WkvCallInputs<'a> {
 /// For layer 0, also applies ln0 (embedding layer norm) in-place on `x`.
 ///
 /// # Arguments
-/// * `tokens` - Batch of token sequences, shape `[b][t]`
+/// * `tokens` - Batch of token sequences, shape `[b][t_b]` (variable per batch)
 /// * `embed` - Embedding weights (CPU-side table + layer norm)
 /// * `n_embd` - Embedding dimension
 /// * `emb_staging` - Pinned host staging buffer for async upload
-/// * `x` - GPU tensor to receive embedded tokens, shape `[n_embd, t, b]`
+/// * `x` - GPU tensor to receive embedded tokens
 /// * `x_ln` - Temporary buffer for layer norm output
+/// * `batch_offsets` - Per-batch token offsets (CPU-side). For rectangular layout
+///   this is `[0, t, 2t, ...]`; for packed sequences this is `cu_seqlens`.
 /// * `stream` - HIP stream for async operations
 pub fn embed_lookup(
     tokens: &[&[u32]],
@@ -160,22 +162,24 @@ pub fn embed_lookup(
     emb_staging: &mut PinnedBuffer<f16>,
     x: &mut TensorHip<f16>,
     x_ln: &mut TensorHip<f16>,
+    batch_offsets: &[i32],
     stream: &Stream,
     probe: &mut Option<ProbeState<'_>>,
 ) -> Result<()> {
     let b = tokens.len();
-    let t = tokens[0].len();
 
-    // Embedding lookup: tokens[b][t] -> x[c, t, b]
+    // Embedding lookup: tokens[b][t_b] -> x[c, t, b]
     // Embedding table is kept on CPU - use pinned staging buffer for async upload
+    // Uses batch_offsets for addressing: dst = (batch_offsets[b] + t) * n_embd
     let emb_data = &embed.w;
     let emb_stride = embed.n_embd;
     let x_host = emb_staging.as_slice_mut();
     for batch_idx in 0..b {
-        for time_idx in 0..t {
+        let bos = batch_offsets[batch_idx] as usize;
+        for time_idx in 0..tokens[batch_idx].len() {
             let token = tokens[batch_idx][time_idx] as usize;
             let src_offset = token * emb_stride;
-            let dst_offset = batch_idx * t * n_embd + time_idx * n_embd;
+            let dst_offset = (bos + time_idx) * n_embd;
             x_host[dst_offset..dst_offset + n_embd]
                 .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
         }

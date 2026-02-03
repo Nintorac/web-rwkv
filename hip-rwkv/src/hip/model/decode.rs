@@ -474,6 +474,7 @@ impl HipDecode {
             &mut scratch.emb_staging,
             &mut x,
             &mut x_ln,
+            &offsets_i32,
             stream,
             &mut probe_state,
         )?;
