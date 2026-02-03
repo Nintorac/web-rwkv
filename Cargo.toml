@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/web-rwkv-derive", "crates/web-rwkv-bench"]
+members = [".", "crates/web-rwkv-derive", "crates/web-rwkv-bench", "hip-rwkv"]
 
 [workspace.package]
 authors = ["Zhenyuan Zhang <cryscan@umich.edu>"]

@@ -1,0 +1,16 @@
+[package]
+name = "hip-rwkv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+web-rwkv = { version = "0.10.19", path = "..", default-features = false }
+half = { version = "2.7", features = ["bytemuck", "serde"] }
+bytemuck = { version = "1.24", features = ["extern_crate_alloc"] }
+safetensors = "0.6"
+memmap2 = "0.9"
+futures = "0.3"
+
+[features]
+default = []
+hip-probes = []
