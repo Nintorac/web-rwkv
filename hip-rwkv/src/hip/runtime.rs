@@ -18,12 +18,12 @@ use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
 
 #[cfg(feature = "hip-probes")]
 use super::probe::{HipProbeMap, HipProbeMapRef};
-use crate::runtime::{
+use web_rwkv::runtime::{
     infer::{Rnn, RnnInput, RnnOutput, RnnOutputBatch, RnnRedirect, Token},
     JobInput, Runtime, RuntimeError,
 };
-use crate::tensor::shape::Shape;
-use crate::tensor::{
+use web_rwkv::tensor::shape::Shape;
+use web_rwkv::tensor::{
     TensorCpu, TensorError, TensorErrorKind, TensorInit, TensorShape as TensorShapeTrait,
 };
 
@@ -291,7 +291,7 @@ impl HipRuntime {
         // Convert to TensorCpu
         let vocab_size = self.model.info.n_vocab;
         let total_tokens: usize = sequences.iter().map(|s| s.len()).sum();
-        let shape = crate::tensor::shape::Shape::new(vocab_size, total_tokens, 1, 1);
+        let shape = web_rwkv::tensor::shape::Shape::new(vocab_size, total_tokens, 1, 1);
 
         TensorInit::from_data(shape, logits).map_err(|e| super::HipErrorKind {
             code: -1,
@@ -545,12 +545,12 @@ impl Runtime<Rnn> for HipRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::shape::Shape;
+    use web_rwkv::tensor::shape::Shape;
     use std::path::Path;
 
     #[cfg(feature = "tokio")]
     use {
-        crate::{
+        web_rwkv::{
             context::{ContextBuilder, InstanceExt},
             runtime::{
                 infer::{Rnn, RnnInput, RnnInputBatch, RnnOption},
