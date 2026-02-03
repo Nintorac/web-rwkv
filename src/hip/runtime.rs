@@ -15,6 +15,9 @@ use futures::future::BoxFuture;
 use super::model::{HipDecode, HipPrefill, Rwkv7Model};
 use super::scratch::{DecodeConfig, HipRuntimeConfig, PrefillConfig};
 use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
+
+#[cfg(feature = "hip-probes")]
+use super::probe::{HipProbeMap, HipProbeMapRef};
 use crate::runtime::{
     infer::{Rnn, RnnInput, RnnOutput, RnnOutputBatch, RnnRedirect, Token},
     JobInput, Runtime, RuntimeError,
@@ -127,17 +130,34 @@ impl HipRuntime {
         let chunk_size = config.max_prefill_chunk;
         let shared_model = model.model();
 
+        // Extract probes from Rwkv7Hip if present
+        #[cfg(feature = "hip-probes")]
+        let probes_ref = model.probes.clone();
+
         // Create prefill module with the full config
         let prefill_config = PrefillConfig {
             max_prefill_chunk: config.max_prefill_chunk,
             batch_size: config.batch_size,
             fla_chunk_size: config.fla_chunk_size,
         };
-        let prefill = HipPrefill::new(shared_model.clone(), prefill_config)?;
+        let mut prefill = HipPrefill::new(shared_model.clone(), prefill_config)?;
 
         // Create decode module with matching batch size
         let decode_config = DecodeConfig::new(config.batch_size);
-        let decode = HipDecode::new(shared_model.clone(), decode_config)?;
+        let mut decode = HipDecode::new(shared_model.clone(), decode_config)?;
+
+        // Wire probes into both modules
+        #[cfg(feature = "hip-probes")]
+        {
+            prefill.set_probes(probes_ref.clone());
+            decode.set_probes(probes_ref);
+        }
+        // Suppress unused mut warning when probes feature is disabled
+        #[cfg(not(feature = "hip-probes"))]
+        {
+            let _ = &mut prefill;
+            let _ = &mut decode;
+        }
 
         Ok(Self {
             model: shared_model,
@@ -282,6 +302,61 @@ impl HipRuntime {
     /// Run single-sequence inference (convenience method).
     pub fn infer_one(&self, tokens: &[u32]) -> Result<TensorCpu<f32>, super::HipErrorKind> {
         self.infer(&[tokens])
+    }
+
+    /// Stateful step API compatible with legacy test patterns.
+    ///
+    /// If `state` is `Some`, loads it into the appropriate module before running.
+    /// If `state` is `None`, resets internal state to zeros.
+    /// Returns `(flat_logits, new_state)` where logits is `Vec<f32>`.
+    ///
+    /// 2-tier dispatch (matching the old monolithic `step()`):
+    /// - T=1 -> HipDecode (FusedT1Wkv) for numerical consistency
+    /// - T>1 -> HipPrefill (FLA chunked)
+    ///
+    /// State layout conversion is handled automatically:
+    /// - HipDecode::load_state() handles FLA -> Decode transpose
+    /// - HipPrefill::load_state() handles Decode -> FLA transpose
+    ///
+    /// For new code that keeps state GPU-resident, use `infer()` instead.
+    pub fn step(
+        &self,
+        x: &[&[u32]],
+        state: Option<HipState>,
+    ) -> std::result::Result<(Vec<f32>, HipState), super::HipErrorKind> {
+        let mut inner = self.inner.lock().unwrap();
+
+        let max_len = x.iter().map(|s| s.len()).max().unwrap_or(0);
+        let all_t1 = max_len == 1 && x.iter().all(|s| s.len() == 1);
+
+        if all_t1 {
+            // T=1: load state into decode, run FusedT1Wkv, download state
+            match state {
+                Some(ref s) => {
+                    inner.decode.load_state(s)?;
+                }
+                None => {
+                    inner.decode.reset_state()?;
+                }
+            }
+            let logits = inner.decode.decode(x)?;
+            let new_state = inner.decode.get_state()?;
+            Ok((logits, new_state))
+        } else {
+            // T>1: load state into prefill, run FLA, download state
+            match state {
+                Some(ref s) => {
+                    inner.prefill.load_state(s)?;
+                }
+                None => {
+                    inner.prefill.reset_state()?;
+                }
+            }
+            let logits = inner.prefill.prefill(x)?;
+            inner.needs_state_transfer = true;
+            let new_state = inner.prefill.get_state()?;
+            Ok((logits, new_state))
+        }
     }
 
     /// Pad sequences to max length for batched inference.

@@ -16,7 +16,7 @@ use common::{assert_tensors_close, TestFixture, Tolerances};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use web_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntimeConfig, HipState, Rwkv7Hip};
+use web_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, HipState, Rwkv7Hip};
 
 /// Storage for captured probe data, keyed by (hook, layer).
 type CapturedData = Arc<Mutex<HashMap<(HipHook, Option<usize>), Vec<f32>>>>;
@@ -649,9 +649,8 @@ fn test_fla_ground_truth_t2_chunked() {
         .expect("Failed to load model")
         .with_probes(probes);
     let rt_config = HipRuntimeConfig::new(256, 1);
-    let model = model
-        .with_config(rt_config)
-        .expect("Failed to configure model");
+    let model = HipRuntime::with_config(model, rt_config)
+        .expect("Failed to configure runtime");
 
     let n_layer = model.info().n_layer;
 

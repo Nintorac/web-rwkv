@@ -51,15 +51,14 @@ fn test_hip_against_ground_truth() {
     println!("  Tokens: {:?}", tokens_i64);
     println!("  Steps: {}", n_steps);
 
-    // Load model
-    use web_rwkv::hip::HipRuntimeConfig;
+    // Load model via HipRuntime
+    use web_rwkv::hip::{HipRuntime, HipRuntimeConfig};
     let model =
         web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
             .expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model
-        .with_config(config)
-        .expect("Failed to configure model");
+    let model = HipRuntime::with_config(model, config)
+        .expect("Failed to configure runtime");
 
     // State for streaming inference (starts as None, then chains through)
     let mut state: Option<web_rwkv::hip::HipState> = None;

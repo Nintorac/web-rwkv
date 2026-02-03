@@ -15,7 +15,7 @@ use common::{assert_tensors_close, TestFixture, Tolerances};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use web_rwkv::hip::{HipHook, HipProbeBuilder, HipState, Rwkv7Hip};
+use web_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, HipState, Rwkv7Hip};
 
 /// Result of a single tensor comparison.
 struct ValidationResult {
@@ -360,15 +360,13 @@ fn test_hip_layer_by_layer_step0() {
     // Build probes
     let (probes, captured) = build_capture_probes();
 
-    // Load model with probes
-    use web_rwkv::hip::HipRuntimeConfig;
+    // Load model with probes via HipRuntime
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model
-        .with_config(config)
-        .expect("Failed to configure model");
+    let model = HipRuntime::with_config(model, config)
+        .expect("Failed to configure runtime");
 
     let n_layer = model.info().n_layer;
 
@@ -552,14 +550,12 @@ fn test_probe_coverage() {
 
     let (probes, captured) = build_capture_probes();
 
-    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model
-        .with_config(config)
-        .expect("Failed to configure model");
+    let model = HipRuntime::with_config(model, config)
+        .expect("Failed to configure runtime");
 
     let n_layer = model.info().n_layer;
 
@@ -668,12 +664,10 @@ fn test_hip_divergence_progression() {
     );
 
     // Load model (without probes for speed)
-    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model
-        .with_config(config)
-        .expect("Failed to configure model");
+    let model = HipRuntime::with_config(model, config)
+        .expect("Failed to configure runtime");
     let mut state: Option<HipState> = None;
 
     for step in 0..n_steps {

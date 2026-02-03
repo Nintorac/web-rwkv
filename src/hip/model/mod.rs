@@ -6,7 +6,6 @@ pub mod fla;
 pub mod hip_prefill;
 pub mod prefill;
 pub mod state;
-mod step;
 pub mod weights;
 
 // Re-export all public types from submodules

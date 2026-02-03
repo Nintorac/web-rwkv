@@ -19,14 +19,18 @@ use std::sync::Arc;
 
 use half::f16;
 
-use super::dispatch_helpers;
+use super::dispatch_helpers::{self, ProbeState};
 use super::fla::FlaChunkedWkv;
 use super::state::{HipState, StateLayout};
 use super::{Rwkv7Model, Rwkv7ModelInfo};
-use crate::hip::ffi::{HipErrorKind, Result};
+use crate::hip::ffi::{check, hip_memcpy_h2d, HipErrorKind, Result};
+use crate::hip::kernels::fla::state_transpose;
 use crate::hip::pinned::PinnedBuffer;
 use crate::hip::scratch::{PrefillConfig, PrefillScratch};
-use crate::hip::tensor::TensorShape;
+use crate::hip::tensor::{TensorHip, TensorShape};
+
+#[cfg(feature = "hip-probes")]
+use crate::hip::probe::{self, HipProbeMapRef};
 
 /// Standalone prefill module for RWKV7 on HIP.
 ///
@@ -48,6 +52,10 @@ pub struct HipPrefill {
 
     /// Owned scratch buffers including all FLA intermediates and GPU state.
     scratch: PrefillScratch,
+
+    /// Optional probe hooks for capturing intermediate values.
+    #[cfg(feature = "hip-probes")]
+    probes: Option<HipProbeMapRef>,
 }
 
 impl std::fmt::Debug for HipPrefill {
@@ -75,7 +83,27 @@ impl HipPrefill {
         let lora_dims = model.lora_dims();
         let runtime_config = config.to_runtime_config();
         let scratch = PrefillScratch::new(&model.info, lora_dims, runtime_config)?;
-        Ok(Self { model, scratch })
+        Ok(Self {
+            model,
+            scratch,
+            #[cfg(feature = "hip-probes")]
+            probes: None,
+        })
+    }
+
+    /// Attach probes for capturing intermediate values during prefill.
+    ///
+    /// Only available with `hip-probes` feature.
+    #[cfg(feature = "hip-probes")]
+    pub fn with_probes(mut self, probes: HipProbeMapRef) -> Self {
+        self.probes = Some(probes);
+        self
+    }
+
+    /// Set probes on an existing instance (for use by HipRuntime).
+    #[cfg(feature = "hip-probes")]
+    pub fn set_probes(&mut self, probes: Option<HipProbeMapRef>) {
+        self.probes = probes;
     }
 
     /// Access model info (dimensions, vocab size, etc.).
@@ -146,6 +174,101 @@ impl HipPrefill {
             v_first: None,
             layout: StateLayout::Fla,
         })
+    }
+
+    /// Load state from a CPU-side `HipState` into the GPU scratch.
+    ///
+    /// Copies all per-layer state tensors (att_shift, ffn_shift, wkv_state)
+    /// from pinned host memory to GPU. This is the inverse of `get_state()`.
+    ///
+    /// Layout conversion is handled automatically:
+    /// - FLA layout: direct copy (same layout as prefill scratch)
+    /// - Decode layout: WKV state is transposed from [V_row, K_col] to [K_row, V_col]
+    ///
+    /// # Errors
+    /// Returns error if host-to-GPU copy fails or batch size mismatches.
+    pub fn load_state(&mut self, state: &HipState) -> Result<()> {
+        let n_layer = self.model.info.n_layer;
+        let n_head = self.model.info.n_head;
+        let batch_size = self.scratch.config.batch_size;
+
+        if state.att_states.len() != n_layer
+            || state.att_shift_states.len() != n_layer
+            || state.ffn_states.len() != n_layer
+        {
+            return Err(crate::hip::ffi::HipErrorKind {
+                code: -1,
+                message: format!(
+                    "load_state: layer count mismatch (state has {}/{}/{}, model has {})",
+                    state.att_states.len(),
+                    state.att_shift_states.len(),
+                    state.ffn_states.len(),
+                    n_layer
+                ),
+            });
+        }
+
+        let stream = self.scratch.blas_ctx.stream();
+        let stream_handle = stream.handle();
+
+        // Copy att_shift and ffn states (layout-independent)
+        for i in 0..n_layer {
+            unsafe {
+                state.att_shift_states[i].copy_to_device_async(
+                    self.scratch.att_shift_state_gpu[i].as_mut_ptr(),
+                    stream_handle,
+                )?;
+                state.ffn_states[i].copy_to_device_async(
+                    self.scratch.ffn_state_gpu[i].as_mut_ptr(),
+                    stream_handle,
+                )?;
+            }
+        }
+
+        // Copy WKV state with optional transpose
+        if state.layout == StateLayout::Decode {
+            // Source is in Decode layout [V_row, K_col], need to transpose to
+            // FLA layout [K_row, V_col]. Upload to temp GPU tensor, then transpose.
+            let wkv_shape = self.scratch.wkv_state_gpu[0].shape();
+            let mut temp_wkv = TensorHip::<f32>::new(wkv_shape)?;
+
+            for i in 0..n_layer {
+                let src_data = state.att_states[i].as_slice();
+                let byte_count = src_data.len() * std::mem::size_of::<f32>();
+                unsafe {
+                    check(hip_memcpy_h2d(
+                        temp_wkv.as_mut_ptr() as *mut std::ffi::c_void,
+                        src_data.as_ptr() as *const std::ffi::c_void,
+                        byte_count,
+                        stream_handle,
+                    ))?;
+                }
+
+                // Transpose: Decode layout -> FLA layout
+                state_transpose(
+                    &temp_wkv,
+                    &mut self.scratch.wkv_state_gpu[i],
+                    n_head,
+                    batch_size,
+                    stream,
+                )?;
+            }
+        } else {
+            // Source is already in FLA layout, direct copy
+            for i in 0..n_layer {
+                unsafe {
+                    state.att_states[i].copy_to_device_async(
+                        self.scratch.wkv_state_gpu[i].as_mut_ptr(),
+                        stream_handle,
+                    )?;
+                }
+            }
+        }
+
+        // Synchronize to ensure all H2D copies complete
+        stream.synchronize()?;
+
+        Ok(())
     }
 
     /// Run FLA-only prefill on a batch of token sequences.
@@ -306,6 +429,35 @@ impl HipPrefill {
         let n_vocab = self.model.info.n_vocab;
         let lora_dims = &scratch.lora_dims;
 
+        // Initialize probe context (compiles out without feature)
+        #[cfg(feature = "hip-probes")]
+        let mut probe_ctx = probe::ProbeContext {
+            layer: None,
+            batch_size: b,
+            seq_len: *lens.iter().max().unwrap_or(&t),
+            chunk_size: t,
+            n_embd,
+            n_head,
+            head_size,
+            n_layer,
+            shape_storage: [0; probe::MAX_SHAPE_DIMS],
+            shape_len: 0,
+        };
+
+        // Build ProbeState if probes are attached
+        #[cfg(feature = "hip-probes")]
+        let probes_ref = self.probes.as_ref();
+
+        #[cfg(feature = "hip-probes")]
+        let mut probe_state: Option<ProbeState<'_>> = probes_ref.map(|p| ProbeState {
+            probes: p,
+            ctx: &mut probe_ctx,
+            t_stride: t,
+        });
+
+        #[cfg(not(feature = "hip-probes"))]
+        let mut probe_state: Option<ProbeState<'_>> = None;
+
         // Convert lens to i32 tensor for masked kernel
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
         let lens_shape = TensorShape::new(b, 1, 1, 1);
@@ -380,6 +532,7 @@ impl HipPrefill {
             &mut x,
             &mut x_ln,
             stream,
+            &mut probe_state,
         )?;
 
         // Take state out of scratch for the layer loop
@@ -398,6 +551,14 @@ impl HipPrefill {
             // Process each layer
             for layer_idx in 0..n_layer {
                 let layer = &self.model.layers[layer_idx];
+
+                // Update probe layer context
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref mut ps) = probe_state {
+                        ps.ctx.layer = Some(layer_idx);
+                    }
+                }
 
                 // Attention block with FLA closure
                 dispatch_helpers::attention_block(
@@ -461,11 +622,13 @@ impl HipPrefill {
                             stream,
                         )
                     },
+                    &mut probe_state,
                 )?;
 
                 // FFN block
                 dispatch_helpers::ffn_block(
                     layer,
+                    n_embd,
                     &mut x,
                     &mut x_ln,
                     &mut ffn_xk,
@@ -478,12 +641,23 @@ impl HipPrefill {
                     &lens_gpu,
                     ctx,
                     stream,
+                    &mut probe_state,
                 )?;
+            }
+
+            // Reset probe layer context for output head
+            #[cfg(feature = "hip-probes")]
+            {
+                if let Some(ref mut ps) = probe_state {
+                    ps.ctx.layer = None;
+                }
             }
 
             // Output head
             dispatch_helpers::output_head(
                 &self.model.head,
+                n_embd,
+                n_vocab,
                 &x,
                 &mut x_ln,
                 &mut logits,
@@ -491,6 +665,7 @@ impl HipPrefill {
                 &mut scratch.logits_staging,
                 ctx,
                 stream,
+                &mut probe_state,
             )?;
 
             Ok(())

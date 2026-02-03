@@ -111,14 +111,13 @@ fn run_chunked(chunk_size: usize) -> (Vec<(usize, Vec<f32>)>, usize) {
     let n_steps = config.i64("n_steps")[0] as usize;
     let n_vocab = 65536;
 
-    use web_rwkv::hip::HipRuntimeConfig;
+    use web_rwkv::hip::{HipRuntime, HipRuntimeConfig};
     let model =
         web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
             .expect("Failed to load model");
     let rt_config = HipRuntimeConfig::new(256, 1);
-    let model = model
-        .with_config(rt_config)
-        .expect("Failed to configure model");
+    let model = HipRuntime::with_config(model, rt_config)
+        .expect("Failed to configure runtime");
 
     let mut state: Option<web_rwkv::hip::HipState> = None;
     let mut results = Vec::with_capacity(n_steps);

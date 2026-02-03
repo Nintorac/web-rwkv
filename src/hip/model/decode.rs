@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use super::dispatch_helpers;
+use super::dispatch_helpers::{self, ProbeState};
 use super::prefill::{FusedT1Wkv, WkvInput, WkvKernel};
 use super::state::{HipState, StateLayout};
 use super::{Rwkv7Model, Rwkv7ModelInfo};
@@ -38,6 +38,9 @@ use crate::hip::ffi::{check, hip_memcpy_h2d, HipErrorKind, Result};
 use crate::hip::kernels::fla::state_transpose;
 use crate::hip::scratch::{DecodeConfig, DecodeScratch};
 use crate::hip::tensor::{TensorHip, TensorShape};
+
+#[cfg(feature = "hip-probes")]
+use crate::hip::probe::{self, HipProbeMapRef};
 
 /// Standalone decode module for T=1 token generation.
 ///
@@ -52,6 +55,9 @@ pub struct HipDecode {
     model: Arc<Rwkv7Model>,
     /// T=1 scratch buffers (no FLA buffers)
     scratch: DecodeScratch,
+    /// Optional probe hooks for capturing intermediate values.
+    #[cfg(feature = "hip-probes")]
+    probes: Option<HipProbeMapRef>,
 }
 
 impl std::fmt::Debug for HipDecode {
@@ -75,7 +81,18 @@ impl HipDecode {
     pub fn new(model: Arc<Rwkv7Model>, config: DecodeConfig) -> Result<Self> {
         let lora_dims = model.lora_dims();
         let scratch = DecodeScratch::new(&model.info, lora_dims, config)?;
-        Ok(Self { model, scratch })
+        Ok(Self {
+            model,
+            scratch,
+            #[cfg(feature = "hip-probes")]
+            probes: None,
+        })
+    }
+
+    /// Set probes on an existing instance (for use by HipRuntime).
+    #[cfg(feature = "hip-probes")]
+    pub fn set_probes(&mut self, probes: Option<HipProbeMapRef>) {
+        self.probes = probes;
     }
 
     /// Get a reference to the model info.
@@ -220,6 +237,62 @@ impl HipDecode {
         self.scratch.reset_state_gpu()
     }
 
+    /// Extract the current GPU-resident state as a CPU-side `HipState`.
+    ///
+    /// Copies all per-layer state tensors (att_shift, ffn_shift, wkv_state)
+    /// from GPU to pinned host memory. The returned state is tagged with
+    /// [`StateLayout::Decode`] since the FusedT1Wkv kernel stores WKV state
+    /// in V-row, K-col layout.
+    ///
+    /// # Errors
+    /// Returns error if GPU-to-host copy fails.
+    pub fn get_state(&self) -> Result<HipState> {
+        use crate::hip::pinned::PinnedBuffer;
+        use half::f16;
+
+        let batch_size = self.scratch.config.batch_size;
+        let n_layer = self.model.info.n_layer;
+        let stream = self.scratch.blas_ctx.stream();
+
+        let mut att_states = Vec::with_capacity(n_layer);
+        let mut att_shift_states = Vec::with_capacity(n_layer);
+        let mut ffn_states = Vec::with_capacity(n_layer);
+
+        for layer_idx in 0..n_layer {
+            // WKV state
+            let wkv_gpu = &self.scratch.wkv_state_gpu[layer_idx];
+            let wkv_elems = wkv_gpu.shape().len();
+            let mut wkv_buf = PinnedBuffer::<f32>::new(wkv_elems)?;
+            wkv_gpu.copy_to_slice_async(wkv_buf.as_slice_mut(), stream)?;
+            att_states.push(wkv_buf);
+
+            // Attention shift state
+            let att_shift_gpu = &self.scratch.att_shift_state_gpu[layer_idx];
+            let att_shift_elems = att_shift_gpu.shape().len();
+            let mut att_shift_buf = PinnedBuffer::<f16>::new(att_shift_elems)?;
+            att_shift_gpu.copy_to_slice_async(att_shift_buf.as_slice_mut(), stream)?;
+            att_shift_states.push(att_shift_buf);
+
+            // FFN shift state
+            let ffn_gpu = &self.scratch.ffn_state_gpu[layer_idx];
+            let ffn_elems = ffn_gpu.shape().len();
+            let mut ffn_buf = PinnedBuffer::<f16>::new(ffn_elems)?;
+            ffn_gpu.copy_to_slice_async(ffn_buf.as_slice_mut(), stream)?;
+            ffn_states.push(ffn_buf);
+        }
+
+        stream.synchronize()?;
+
+        Ok(HipState {
+            batch_size,
+            att_states,
+            att_shift_states,
+            ffn_states,
+            v_first: None,
+            layout: StateLayout::Decode,
+        })
+    }
+
     /// Run a single decode step (T=1 per sequence) using FusedT1Wkv.
     ///
     /// Each inner slice must contain exactly one token. Returns logits as
@@ -297,6 +370,35 @@ impl HipDecode {
         let ctx = &scratch.blas_ctx;
         let stream = ctx.stream();
 
+        // Initialize probe context (compiles out without feature)
+        #[cfg(feature = "hip-probes")]
+        let mut probe_ctx = probe::ProbeContext {
+            layer: None,
+            batch_size: b,
+            seq_len: 1,
+            chunk_size: t,
+            n_embd,
+            n_head,
+            head_size,
+            n_layer,
+            shape_storage: [0; probe::MAX_SHAPE_DIMS],
+            shape_len: 0,
+        };
+
+        // Build ProbeState if probes are attached
+        #[cfg(feature = "hip-probes")]
+        let probes_ref = self.probes.as_ref();
+
+        #[cfg(feature = "hip-probes")]
+        let mut probe_state: Option<ProbeState<'_>> = probes_ref.map(|p| ProbeState {
+            probes: p,
+            ctx: &mut probe_ctx,
+            t_stride: t,
+        });
+
+        #[cfg(not(feature = "hip-probes"))]
+        let mut probe_state: Option<ProbeState<'_>> = None;
+
         // Convert lens to i32 tensor for masked kernel
         let lens_i32: Vec<i32> = lens.iter().map(|&l| l as i32).collect();
         let lens_shape = TensorShape::new(b, 1, 1, 1);
@@ -369,6 +471,7 @@ impl HipDecode {
             &mut x,
             &mut x_ln,
             stream,
+            &mut probe_state,
         )?;
 
         // Take state vectors out of scratch for the dispatch
@@ -391,6 +494,14 @@ impl HipDecode {
             // Process each layer
             for layer_idx in 0..n_layer {
                 let layer = &self.model.layers[layer_idx];
+
+                // Update probe layer context
+                #[cfg(feature = "hip-probes")]
+                {
+                    if let Some(ref mut ps) = probe_state {
+                        ps.ctx.layer = Some(layer_idx);
+                    }
+                }
 
                 // Attention block with FusedT1Wkv closure
                 dispatch_helpers::attention_block(
@@ -452,11 +563,13 @@ impl HipDecode {
                         };
                         wkv_kernel.compute(&wkv_input, wkv_state, wkv_out_wkv, stream)
                     },
+                    &mut probe_state,
                 )?;
 
                 // FFN block
                 dispatch_helpers::ffn_block(
                     layer,
+                    n_embd,
                     &mut x,
                     &mut x_ln,
                     &mut ffn_xk,
@@ -469,12 +582,23 @@ impl HipDecode {
                     &lens_gpu,
                     ctx,
                     stream,
+                    &mut probe_state,
                 )?;
+            }
+
+            // Reset probe layer context for output head
+            #[cfg(feature = "hip-probes")]
+            {
+                if let Some(ref mut ps) = probe_state {
+                    ps.ctx.layer = None;
+                }
             }
 
             // Output head
             dispatch_helpers::output_head(
                 &self.model.head,
+                n_embd,
+                n_vocab,
                 &x,
                 &mut x_ln,
                 &mut logits,
@@ -482,6 +606,7 @@ impl HipDecode {
                 &mut scratch.logits_staging,
                 ctx,
                 stream,
+                &mut probe_state,
             )?;
 
             Ok(())

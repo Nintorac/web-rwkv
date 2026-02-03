@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use web_rwkv::hip::{HipHook, HipProbeBuilder, Rwkv7Hip};
+use web_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
 /// Test that probes capture intermediate values during step.
 #[test]
@@ -59,19 +59,16 @@ fn test_probe_captures_intermediates() {
         })
         .build();
 
-    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
     let config = HipRuntimeConfig::new(256, 1);
-    let model = model
-        .with_config(config)
-        .expect("Failed to configure model");
+    let runtime = HipRuntime::with_config(model, config).expect("Failed to configure runtime");
 
-    let n_layer = model.info().n_layer;
+    let n_layer = runtime.info().n_layer;
 
     // Run step
-    let (_logits, _state) = model.step(&[&[0, 1, 2]], None).expect("Step failed");
+    let (_logits, _state) = runtime.step(&[&[0, 1, 2]], None).expect("Step failed");
 
     // Check captured values
     let captured = captured.lock().unwrap();
@@ -153,25 +150,22 @@ fn test_probe_context() {
         })
         .build();
 
-    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
     let config = HipRuntimeConfig::new(256, 2);
-    let model = model
-        .with_config(config)
-        .expect("Failed to configure model");
+    let runtime = HipRuntime::with_config(model, config).expect("Failed to configure runtime");
 
     // Test with batch_size=2, seq_len=4
     let tokens = vec![0u32, 1, 2, 3];
-    let (_logits, _state) = model
+    let (_logits, _state) = runtime
         .step(&[&tokens, &tokens], None)
         .expect("Step failed");
 
     let contexts = contexts.lock().unwrap();
 
     // Should have one context per layer
-    assert_eq!(contexts.len(), model.info().n_layer);
+    assert_eq!(contexts.len(), runtime.info().n_layer);
 
     // Check first layer context
     let (hook, layer, batch_size, seq_len, shape) = &contexts[0];
@@ -179,7 +173,7 @@ fn test_probe_context() {
     assert_eq!(*layer, Some(0));
     assert_eq!(*batch_size, 2);
     assert_eq!(*seq_len, 4);
-    assert_eq!(shape, &[model.info().n_embd, 4, 2]); // [C, T, B]
+    assert_eq!(shape, &[runtime.info().n_embd, 4, 2]); // [C, T, B]
 
     println!("Context test passed - captured {} contexts", contexts.len());
 }
@@ -206,22 +200,19 @@ fn test_probe_with_masked_step() {
         })
         .build();
 
-    use web_rwkv::hip::HipRuntimeConfig;
     let model = Rwkv7Hip::load(model_path)
         .expect("Failed to load model")
         .with_probes(probes);
     let config = HipRuntimeConfig::new(256, 2);
-    let model = model
-        .with_config(config)
-        .expect("Failed to configure model");
+    let runtime = HipRuntime::with_config(model, config).expect("Failed to configure runtime");
 
-    let n_layer = model.info().n_layer;
+    let n_layer = runtime.info().n_layer;
 
     // Use step with variable lengths (new API handles this automatically)
     let seq1 = vec![0u32, 1, 2]; // length 3
     let seq2 = vec![0u32, 1, 2, 3, 4]; // length 5
 
-    let (_logits, _state) = model
+    let (_logits, _state) = runtime
         .step(&[&seq1, &seq2], None)
         .expect("Step failed");
 
