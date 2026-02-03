@@ -1,6 +1,7 @@
 //! RWKV7 HIP model loading and step (inference) implementation.
 
 pub mod decode;
+pub mod dispatch_helpers;
 pub mod fla;
 pub mod hip_prefill;
 pub mod prefill;

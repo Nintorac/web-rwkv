@@ -19,16 +19,11 @@ use std::sync::Arc;
 
 use half::f16;
 
+use super::dispatch_helpers;
 use super::fla::FlaChunkedWkv;
 use super::state::{HipState, StateLayout};
 use super::{Rwkv7Model, Rwkv7ModelInfo};
 use crate::hip::ffi::{HipErrorKind, Result};
-use crate::hip::kernels::{
-    add_f16, broadcast_add_f16, broadcast_mul_f16, channel_mix_state_f16,
-    channel_mix_state_f16_masked, control_k_f16, copy_f16_to_f32, copy_tensor_f16,
-    group_norm_f16, l2_norm_f16, layer_norm_f16, lerp_f16, mul_f16, negate_f16, sigmoid_f16,
-    softplus_decay_f16, squared_relu_f16, tanh_f16, wkv_bonus_f16,
-};
 use crate::hip::pinned::PinnedBuffer;
 use crate::hip::scratch::{PrefillConfig, PrefillScratch};
 use crate::hip::tensor::TensorShape;
@@ -289,8 +284,8 @@ impl HipPrefill {
 
     /// Core FLA-only GPU forward pass.
     ///
-    /// Runs all layers using the FLA chunked attention kernel exclusively
-    /// (never dispatches to FusedT1Wkv). State is GPU-resident in scratch.
+    /// Uses the shared dispatch helpers with FLA closures for the WKV
+    /// kernel call. State is GPU-resident in scratch and updated in-place.
     fn dispatch_fla(&mut self, tokens: &[&[u32]], lens: &[usize]) -> Result<()> {
         let b = tokens.len();
         let t = tokens[0].len();
@@ -347,10 +342,9 @@ impl HipPrefill {
         let mut att_k_ctrl = scratch.att_k_ctrl.resized_view_mut(std_shape)?;
         let mut wkv_a = scratch.wkv_a.resized_view_mut(std_shape)?;
         let mut wkv_b = scratch.wkv_b.resized_view_mut(std_shape)?;
-        // Note: w_decay is not used by FLA (FLA receives raw att_w for better precision).
-        // We still allocate and compute it because removing it would change scratch
-        // buffer semantics. The cost is negligible.
-        let mut _w_decay = scratch.w_decay.resized_view_mut(std_shape)?;
+        // Note: w_decay is computed inside attention_block (decay_exp_f16) but
+        // FLA ignores it and uses raw att_w instead. The cost is negligible.
+        let mut w_decay = scratch.w_decay.resized_view_mut(std_shape)?;
         let mut wkv_out = scratch.wkv_out.resized_view_mut(std_shape)?;
         let mut wkv_normed = scratch.wkv_normed.resized_view_mut(std_shape)?;
         let mut wkv_bonus = scratch.wkv_bonus.resized_view_mut(std_shape)?;
@@ -377,26 +371,16 @@ impl HipPrefill {
         let mut logits = scratch.logits.resized_view_mut(out_shape)?;
         let mut logits_f32 = scratch.logits_f32.resized_view_mut(out_shape)?;
 
-        {
-            // Embedding lookup: tokens[b][t] -> x[c, t, b]
-            let emb_data = &self.model.embed.w;
-            let emb_stride = self.model.embed.n_embd;
-            let x_host = scratch.emb_staging.as_slice_mut();
-            for batch_idx in 0..b {
-                for time_idx in 0..t {
-                    let token = tokens[batch_idx][time_idx] as usize;
-                    let src_offset = token * emb_stride;
-                    let dst_offset = batch_idx * t * n_embd + time_idx * n_embd;
-                    x_host[dst_offset..dst_offset + n_embd]
-                        .copy_from_slice(&emb_data[src_offset..src_offset + n_embd]);
-                }
-            }
-            unsafe {
-                scratch
-                    .emb_staging
-                    .copy_to_device_async(x.as_mut_ptr(), stream.handle())?;
-            }
-        }
+        // Embedding lookup + ln0
+        dispatch_helpers::embed_lookup(
+            tokens,
+            &self.model.embed,
+            n_embd,
+            &mut scratch.emb_staging,
+            &mut x,
+            &mut x_ln,
+            stream,
+        )?;
 
         // Take state out of scratch for the layer loop
         let (mut att_shift_gpu, mut ffn_shift_gpu, mut wkv_state_gpu) = (
@@ -415,268 +399,97 @@ impl HipPrefill {
             for layer_idx in 0..n_layer {
                 let layer = &self.model.layers[layer_idx];
 
-                // Apply ln0 for layer 0
-                if layer_idx == 0 {
-                    layer_norm_f16(
-                        &x,
-                        &self.model.embed.ln.weight,
-                        &self.model.embed.ln.bias,
-                        &mut x_ln,
-                        1e-5,
-                        stream,
-                    )?;
-                    copy_tensor_f16(&x_ln, &mut x, stream)?;
-                }
-
-                // ==== Time-Mix (Attention) ====
-                layer_norm_f16(
-                    &x,
-                    &layer.att_ln.weight,
-                    &layer.att_ln.bias,
+                // Attention block with FLA closure
+                dispatch_helpers::attention_block(
+                    layer_idx,
+                    layer,
+                    &mut x,
                     &mut x_ln,
-                    1e-5,
-                    stream,
-                )?;
-
-                // Token shifts for attention
-                {
-                    channel_mix_state_f16_masked(
-                        &x_ln,
-                        &att_shift_gpu[layer_idx],
-                        &layer.att.x_r,
-                        &mut att_xr,
-                        &mut new_att_shift,
-                        &lens_gpu,
-                        stream,
-                    )?;
-                    channel_mix_state_f16(
-                        &x_ln,
-                        &att_shift_gpu[layer_idx],
-                        &layer.att.x_w,
-                        &mut att_xw,
-                        &mut temp1,
-                        stream,
-                    )?;
-                    channel_mix_state_f16(
-                        &x_ln,
-                        &att_shift_gpu[layer_idx],
-                        &layer.att.x_k,
-                        &mut att_xk,
-                        &mut temp1,
-                        stream,
-                    )?;
-                    channel_mix_state_f16(
-                        &x_ln,
-                        &att_shift_gpu[layer_idx],
-                        &layer.att.x_v,
-                        &mut att_xv,
-                        &mut temp1,
-                        stream,
-                    )?;
-                    channel_mix_state_f16(
-                        &x_ln,
-                        &att_shift_gpu[layer_idx],
-                        &layer.att.x_a,
-                        &mut att_xa,
-                        &mut temp1,
-                        stream,
-                    )?;
-                    channel_mix_state_f16(
-                        &x_ln,
-                        &att_shift_gpu[layer_idx],
-                        &layer.att.x_g,
-                        &mut att_xg,
-                        &mut temp1,
-                        stream,
-                    )?;
-                }
-
-                // Update shift state
-                copy_tensor_f16(&new_att_shift, &mut att_shift_gpu[layer_idx], stream)?;
-
-                // Linear projections: r, k, v
-                {
-                    ctx.hgemm_into(&layer.att.w_r, &att_xr, &mut att_r)?;
-                    ctx.hgemm_into(&layer.att.w_k, &att_xk, &mut att_k)?;
-                    ctx.hgemm_into(&layer.att.w_v, &att_xv, &mut att_v)?;
-                }
-
-                // Decay: w = -softplus(-(w0 + tanh(xw @ w1) @ w2)) - 0.5
-                {
-                    ctx.hgemm_into(&layer.att.w1, &att_xw, &mut lora_w)?;
-                    tanh_f16(&lora_w, &mut lora_w_tanh, stream)?;
-                    ctx.hgemm_into(&layer.att.w2, &lora_w_tanh, &mut att_w)?;
-                    broadcast_add_f16(&att_w, &layer.att.w0, &mut temp1, stream)?;
-                    softplus_decay_f16(&temp1, &mut att_w, stream)?;
-                }
-
-                // Adaptation: a = sigmoid(a0 + (xa @ a1) @ a2)
-                {
-                    ctx.hgemm_into(&layer.att.a1, &att_xa, &mut lora_a)?;
-                    ctx.hgemm_into(&layer.att.a2, &lora_a, &mut lora_a_proj)?;
-                    broadcast_add_f16(&lora_a_proj, &layer.att.a0, &mut temp1, stream)?;
-                    sigmoid_f16(&temp1, &mut att_a, stream)?;
-                }
-
-                // Gate: g = sigmoid(xg @ g1) @ g2
-                {
-                    ctx.hgemm_into(&layer.att.g1, &att_xg, &mut lora_g)?;
-                    sigmoid_f16(&lora_g, &mut lora_g_sig, stream)?;
-                    ctx.hgemm_into(&layer.att.g2, &lora_g_sig, &mut att_g)?;
-                }
-
-                // Value residual (layers > 0)
-                if layer_idx > 0 {
-                    if let (Some(v0), Some(v1), Some(v2)) =
-                        (&layer.att.v0, &layer.att.v1, &layer.att.v2)
-                    {
-                        ctx.hgemm_into(v1, &att_xv, &mut lora_v)?;
-                        ctx.hgemm_into(v2, &lora_v, &mut v_lora2)?;
-                        broadcast_add_f16(&v_lora2, v0, &mut temp1, stream)?;
-                        sigmoid_f16(&temp1, &mut temp2, stream)?;
-                        lerp_f16(&att_v, &v_first, &temp2, &mut temp1, stream)?;
-                        copy_tensor_f16(&temp1, &mut att_v, stream)?;
-                    }
-                } else {
-                    copy_tensor_f16(&att_v, &mut v_first, stream)?;
-                }
-
-                // L2 normalize k
-                {
-                    broadcast_mul_f16(&att_k, &layer.att.k_k, &mut temp1, stream)?;
-                    l2_norm_f16(&temp1, &mut att_kk, head_size, 1e-12, stream)?;
-                }
-
-                // Control K
-                control_k_f16(&layer.att.k_a, &att_a, &att_k, &mut att_k_ctrl, stream)?;
-
-                // WKV inputs
-                // Note: decay_exp_f16 is NOT called here because FLA receives
-                // raw att_w directly (pre-exponentiation) for better precision.
-                {
-                    negate_f16(&att_kk, &mut wkv_a, stream)?;
-                    mul_f16(&att_kk, &att_a, &mut wkv_b, stream)?;
-                }
-
-                // Reshape for WKV
-                let att_w_wkv = att_w.reshape_view(wkv_data_shape)?;
-                let r_wkv = att_r.reshape_view(wkv_data_shape)?;
-                let k_ctrl_wkv = att_k_ctrl.reshape_view(wkv_data_shape)?;
-                let v_wkv = att_v.reshape_view(wkv_data_shape)?;
-                let wkv_a_wkv = wkv_a.reshape_view(wkv_data_shape)?;
-                let wkv_b_wkv = wkv_b.reshape_view(wkv_data_shape)?;
-                let mut wkv_out_wkv = wkv_out.reshape_view_mut(wkv_data_shape)?;
-
-                // Run FLA chunked WKV (always FLA, never FusedT1Wkv)
-                fla_kernel.compute(
-                    &att_w_wkv,
-                    &r_wkv,
-                    &k_ctrl_wkv,
-                    &v_wkv,
-                    &wkv_a_wkv,
-                    &wkv_b_wkv,
-                    &mut wkv_state_gpu[layer_idx],
-                    &mut wkv_out_wkv,
-                    lens,
-                    stream,
-                )?;
-
-                // Group norm on WKV output
-                group_norm_f16(
-                    &wkv_out,
-                    &layer.att.gn.weight,
-                    &layer.att.gn.bias,
+                    &mut att_xr,
+                    &mut att_xw,
+                    &mut att_xk,
+                    &mut att_xv,
+                    &mut att_xa,
+                    &mut att_xg,
+                    &mut att_shift_gpu[layer_idx],
+                    &mut new_att_shift,
+                    &mut att_r,
+                    &mut att_k,
+                    &mut att_v,
+                    &mut att_w,
+                    &mut att_a,
+                    &mut att_g,
+                    &mut att_kk,
+                    &mut att_k_ctrl,
+                    &mut wkv_a,
+                    &mut wkv_b,
+                    &mut w_decay,
+                    &mut wkv_out,
                     &mut wkv_normed,
-                    n_head,
-                    64e-5,
-                    stream,
-                )?;
-
-                // WKV bonus
-                let r_k_shape = TensorShape::new(head_size, n_head, 1, 1);
-                let r_k_wkv = layer.att.r_k.reshape_view(r_k_shape)?;
-                let mut wkv_bonus_wkv = wkv_bonus.reshape_view_mut(wkv_data_shape)?;
-                wkv_bonus_f16(
-                    &r_wkv,
-                    &k_ctrl_wkv,
-                    &v_wkv,
-                    &r_k_wkv,
-                    &mut wkv_bonus_wkv,
-                    stream,
-                )?;
-
-                // Combine and gate
-                {
-                    add_f16(&wkv_normed, &wkv_bonus, &mut temp1, stream)?;
-                    mul_f16(&temp1, &att_g, &mut temp2, stream)?;
-                }
-
-                // Output projection
-                ctx.hgemm_into(&layer.att.w_o, &temp2, &mut att_out)?;
-
-                // Residual
-                {
-                    add_f16(&x, &att_out, &mut temp1, stream)?;
-                    copy_tensor_f16(&temp1, &mut x, stream)?;
-                }
-
-                // ==== Channel-Mix (FFN) ====
-                layer_norm_f16(
-                    &x,
-                    &layer.ffn_ln.weight,
-                    &layer.ffn_ln.bias,
-                    &mut x_ln,
-                    1e-5,
-                    stream,
-                )?;
-
-                // Token shift for FFN
-                channel_mix_state_f16_masked(
-                    &x_ln,
-                    &ffn_shift_gpu[layer_idx],
-                    &layer.ffn.x_k,
-                    &mut ffn_xk,
-                    &mut new_ffn_shift,
+                    &mut wkv_bonus,
+                    &mut att_out,
+                    &mut v_first,
+                    &mut lora_w,
+                    &mut lora_w_tanh,
+                    &mut lora_a,
+                    &mut lora_a_proj,
+                    &mut lora_g,
+                    &mut lora_g_sig,
+                    &mut lora_v,
+                    &mut v_lora2,
+                    &mut temp1,
+                    &mut temp2,
                     &lens_gpu,
+                    &mut wkv_state_gpu[layer_idx],
+                    head_size,
+                    n_head,
+                    wkv_data_shape,
+                    ctx,
                     stream,
+                    // FLA closure: uses raw att_w (pre-exponentiation) for better precision
+                    |inputs, wkv_state, wkv_out_wkv| {
+                        fla_kernel.compute(
+                            inputs.att_w_wkv,
+                            inputs.r_wkv,
+                            inputs.k_ctrl_wkv,
+                            inputs.v_wkv,
+                            inputs.wkv_a_wkv,
+                            inputs.wkv_b_wkv,
+                            wkv_state,
+                            wkv_out_wkv,
+                            lens,
+                            stream,
+                        )
+                    },
                 )?;
 
-                // Update FFN shift state
-                copy_tensor_f16(&new_ffn_shift, &mut ffn_shift_gpu[layer_idx], stream)?;
-
-                // Key projection
-                ctx.hgemm_into(&layer.ffn.w_k, &ffn_xk, &mut ffn_k)?;
-
-                // Squared ReLU
-                squared_relu_f16(&ffn_k, &mut ffn_k_sq, stream)?;
-
-                // Value projection
-                ctx.hgemm_into(&layer.ffn.w_v, &ffn_k_sq, &mut ffn_out)?;
-
-                // Residual
-                {
-                    add_f16(&x, &ffn_out, &mut temp1, stream)?;
-                    copy_tensor_f16(&temp1, &mut x, stream)?;
-                }
+                // FFN block
+                dispatch_helpers::ffn_block(
+                    layer,
+                    &mut x,
+                    &mut x_ln,
+                    &mut ffn_xk,
+                    &mut ffn_shift_gpu[layer_idx],
+                    &mut new_ffn_shift,
+                    &mut ffn_k,
+                    &mut ffn_k_sq,
+                    &mut ffn_out,
+                    &mut temp1,
+                    &lens_gpu,
+                    ctx,
+                    stream,
+                )?;
             }
 
-            // ==== Output Head ====
-            layer_norm_f16(
+            // Output head
+            dispatch_helpers::output_head(
+                &self.model.head,
                 &x,
-                &self.model.head.ln.weight,
-                &self.model.head.ln.bias,
                 &mut x_ln,
-                1e-5,
-                stream,
-            )?;
-
-            ctx.hgemm_into(&self.model.head.w, &x_ln, &mut logits)?;
-
-            // Convert f16 logits to f32, then download asynchronously
-            copy_f16_to_f32(&logits, &mut logits_f32, stream)?;
-            let logits_len = logits_f32.len();
-            logits_f32.copy_to_slice_async(
-                &mut scratch.logits_staging.as_slice_mut()[..logits_len],
+                &mut logits,
+                &mut logits_f32,
+                &mut scratch.logits_staging,
+                ctx,
                 stream,
             )?;
 
