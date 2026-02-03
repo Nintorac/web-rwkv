@@ -102,7 +102,3 @@ tokio = ["dep:tokio"]
 trace = ["tracing", "tracing-subscriber", "tracing-tracy"]
 ## Enables backtrace for errors.
 backtrace = []
-## Enables HIP backend for AMD GPUs. Requires ROCm/TheRock installation.
-hip = []
-## Enable HIP intermediate value probing for validation against ground truth fixtures.
-hip-probes = ["hip"]

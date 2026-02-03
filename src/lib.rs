@@ -40,7 +40,4 @@ pub mod runtime;
 pub mod tensor;
 pub mod tokenizer;
 
-#[cfg(feature = "hip")]
-pub mod hip;
-
 pub use wgpu;

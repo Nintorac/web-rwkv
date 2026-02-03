@@ -41,14 +41,12 @@ use std::fs;
 use std::path::Path;
 use tokio::fs::File as TokioFile;
 
-#[cfg(feature = "hip")]
-use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 use web_rwkv::{
     context::{Context, ContextBuilder, InstanceExt},
     runtime::{
         infer::{Rnn, RnnInput, RnnInputBatch, RnnOption},
         loader::Loader,
-        model::{ContextAutoLimits, ModelBuilder, ModelCustomInfo, ModelInfo, ModelVersion},
+        model::{ContextAutoLimits, ModelBuilder, ModelInfo, ModelVersion},
         v4, v5, v6, v7, Runtime, TokioRuntime,
     },
 };
@@ -754,36 +752,11 @@ async fn create_context(info: &ModelInfo) -> anyhow::Result<Context> {
 async fn load_model(
     model_path: &str,
     batch_size: usize,
-    token_chunk_size: usize,
+    _token_chunk_size: usize,
     backend_id: &str,
 ) -> anyhow::Result<LoadedModel> {
     if backend_id == "hip" {
-        #[cfg(feature = "hip")]
-        {
-            let model = Rwkv7Hip::load(model_path)?;
-            let config = HipRuntimeConfig::new(token_chunk_size, batch_size);
-            let runtime = HipRuntime::with_config(model, config)?;
-            let hip_info = runtime.info().clone();
-            let info = ModelInfo {
-                version: ModelVersion::V7,
-                num_layer: hip_info.n_layer,
-                num_emb: hip_info.n_embd,
-                num_hidden: hip_info.n_hidden,
-                num_vocab: hip_info.n_vocab,
-                num_head: hip_info.n_head,
-                custom: ModelCustomInfo::None,
-            };
-            return Ok(LoadedModel {
-                context: None,
-                runtime: Box::new(runtime),
-                info,
-                vocab_size: hip_info.n_vocab as u32,
-            });
-        }
-        #[cfg(not(feature = "hip"))]
-        {
-            anyhow::bail!("hip backend requested but 'hip' feature is not enabled");
-        }
+        anyhow::bail!("hip backend requested but hip-rwkv crate is not available in this context");
     }
 
     let file = TokioFile::open(model_path).await?;
