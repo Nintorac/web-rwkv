@@ -795,6 +795,18 @@ extern "C" {
         total_chunks: c_int,
         stream: HipStream,
     ) -> HipError;
+
+    // Softmax kernel
+    /// Per-token softmax over the vocab dimension.
+    /// Input layout: [V, T, 1, 1] -- V contiguous elements per token, T tokens.
+    /// Three-pass numerically-stable softmax (find max, exp+sum, normalize).
+    pub fn launch_softmax_f32(
+        input: *const f32,
+        output: *mut f32,
+        vocab_size: c_int,
+        num_tokens: c_int,
+        stream: HipStream,
+    ) -> HipError;
 }
 
 /// HIP success error code

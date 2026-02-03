@@ -272,7 +272,7 @@ impl UnifiedRuntime {
                 let probs = match &self.runtime {
                     #[cfg(feature = "hip")]
                     BackendRuntime::Hip(_) => {
-                        web_rwkv::hip::softmax_one_cpu(output.0[0].0.clone())?
+                        web_rwkv::hip::softmax_hip(output.0[0].0.clone())?
                             .data()
                             .to_vec()
                     }
@@ -317,7 +317,7 @@ impl UnifiedRuntime {
 
             let probs = match &self.runtime {
                 #[cfg(feature = "hip")]
-                BackendRuntime::Hip(_) => web_rwkv::hip::softmax_one_cpu(output.0[0].0.clone())?
+                BackendRuntime::Hip(_) => web_rwkv::hip::softmax_hip(output.0[0].0.clone())?
                     .data()
                     .to_vec(),
                 BackendRuntime::Wgpu(_) => {

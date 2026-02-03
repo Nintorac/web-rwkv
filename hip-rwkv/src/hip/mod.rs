@@ -19,7 +19,7 @@ mod tensor;
 pub mod probe;
 
 // Re-export runtime types
-pub use runtime::{softmax_one_cpu, HipRuntime};
+pub use runtime::{softmax_hip, softmax_hip_batch, HipRuntime};
 
 // Re-export probe types when feature is enabled
 #[cfg(feature = "hip-probes")]
@@ -89,6 +89,7 @@ pub use kernels::{
     mul_f32,
     negate_f32,
     sigmoid_f32,
+    softmax_f32,
     softplus_decay_f32,
     squared_relu_f32,
     tanh_f32,

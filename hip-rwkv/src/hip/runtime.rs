@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 
+use super::buffer::DeviceBuffer;
+use super::device::Stream;
+use super::ffi::HipErrorKind;
+use super::kernels::softmax_f32;
 use super::model::{HipDecode, HipPrefill, Rwkv7Model};
 use super::scratch::{DecodeConfig, HipRuntimeConfig, PrefillConfig};
 use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
@@ -27,43 +31,46 @@ use web_rwkv::tensor::{
     TensorCpu, TensorError, TensorErrorKind, TensorInit, TensorShape as TensorShapeTrait,
 };
 
-/// CPU-only softmax for HIP backend.
+/// GPU softmax for HIP backend.
 ///
-/// Applies softmax over the first dimension (vocab) for each token.
-/// Uses numerically stable algorithm: subtract max before exp.
+/// Uploads input to GPU, runs softmax kernel, downloads result.
+/// Uses three-pass numerically-stable algorithm (find max, exp+sum, normalize).
 ///
 /// # Arguments
 /// * `input` - Input tensor with shape [vocab_size, num_tokens, 1, 1]
 ///
 /// # Returns
 /// Tensor with same shape, where each column sums to 1.0
-pub fn softmax_one_cpu(input: TensorCpu<f32>) -> Result<TensorCpu<f32>, TensorError> {
+pub fn softmax_hip(input: TensorCpu<f32>) -> Result<TensorCpu<f32>, HipErrorKind> {
     let shape = input.shape();
     if shape.len() == 0 {
         return Ok(input);
     }
-
-    let data = input.data();
     let vocab_size = shape[0];
-    let num_tokens = data.len() / vocab_size;
+    let num_tokens = input.data().len() / vocab_size;
 
-    let mut output = Vec::with_capacity(data.len());
+    let stream = Stream::null();
+    let mut d_input = DeviceBuffer::<f32>::new(input.data().len())?;
+    let mut d_output = DeviceBuffer::<f32>::new(input.data().len())?;
 
-    for t in 0..num_tokens {
-        let start = t * vocab_size;
-        let end = start + vocab_size;
-        let slice = &data[start..end];
+    d_input.copy_from_host(input.data(), &stream)?;
+    softmax_f32(&d_input, &mut d_output, vocab_size, num_tokens, &stream)?;
 
-        // Numerically stable: subtract max before exp
-        let max_val = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = slice.iter().map(|&x| (x - max_val).exp()).sum();
+    let mut output = vec![0.0f32; input.data().len()];
+    d_output.copy_to_host(&mut output, &stream)?;
+    stream.synchronize()?;
 
-        for &x in slice {
-            output.push((x - max_val).exp() / exp_sum);
-        }
-    }
+    TensorInit::from_data(shape, output).map_err(|e| HipErrorKind {
+        code: -1,
+        message: format!("softmax output tensor: {}", e),
+    })
+}
 
-    TensorInit::from_data(shape, output)
+/// Batched GPU softmax -- processes multiple tensors.
+pub fn softmax_hip_batch(
+    inputs: Vec<TensorCpu<f32>>,
+) -> Result<Vec<TensorCpu<f32>>, HipErrorKind> {
+    inputs.into_iter().map(softmax_hip).collect()
 }
 
 /// Mutable state for HipRuntime, protected by a Mutex for thread-safe `&self` access.
@@ -636,10 +643,10 @@ mod tests {
     }
 
     #[test]
-    fn test_softmax_cpu_basic() {
+    fn test_softmax_hip_basic() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
         let input: TensorCpu<f32> = TensorInit::from_data(Shape::new(4, 1, 1, 1), data).unwrap();
-        let output = softmax_one_cpu(input).unwrap();
+        let output = softmax_hip(input).unwrap();
 
         // Sum should be 1.0
         let sum: f32 = output.data().iter().sum();
@@ -653,15 +660,15 @@ mod tests {
         let data = output.data();
         assert!(data[0] < data[1] && data[1] < data[2] && data[2] < data[3]);
 
-        println!("Softmax CPU basic test PASSED");
+        println!("Softmax HIP basic test PASSED");
     }
 
     #[test]
-    fn test_softmax_cpu_numerical_stability() {
+    fn test_softmax_hip_numerical_stability() {
         // Large values that would overflow naive exp()
         let data = vec![1000.0f32, 1001.0, 1002.0, 1003.0];
         let input: TensorCpu<f32> = TensorInit::from_data(Shape::new(4, 1, 1, 1), data).unwrap();
-        let output = softmax_one_cpu(input).unwrap();
+        let output = softmax_hip(input).unwrap();
 
         // Should not produce NaN or Inf
         assert!(
@@ -677,16 +684,16 @@ mod tests {
             sum
         );
 
-        println!("Softmax CPU numerical stability test PASSED");
+        println!("Softmax HIP numerical stability test PASSED");
     }
 
     #[test]
-    fn test_softmax_cpu_multiple_tokens() {
+    fn test_softmax_hip_multiple_tokens() {
         // 2 tokens, vocab size 3 - each token's probs should sum to 1.0
         // Shape [3, 2, 1, 1] means vocab_size=3, num_tokens=2
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let input: TensorCpu<f32> = TensorInit::from_data(Shape::new(3, 2, 1, 1), data).unwrap();
-        let output = softmax_one_cpu(input).unwrap();
+        let output = softmax_hip(input).unwrap();
 
         let data = output.data();
 
@@ -706,19 +713,19 @@ mod tests {
             sum2
         );
 
-        println!("Softmax CPU multiple tokens test PASSED");
+        println!("Softmax HIP multiple tokens test PASSED");
     }
 
     #[test]
-    fn test_softmax_cpu_empty() {
+    fn test_softmax_hip_empty() {
         // Empty tensor should be handled gracefully
         let data: Vec<f32> = vec![];
         let input: TensorCpu<f32> = TensorInit::from_data(Shape::new(0, 0, 1, 1), data).unwrap();
-        let output = softmax_one_cpu(input).unwrap();
+        let output = softmax_hip(input).unwrap();
 
         assert_eq!(output.data().len(), 0);
 
-        println!("Softmax CPU empty test PASSED");
+        println!("Softmax HIP empty test PASSED");
     }
 
     /// Proof-of-life test: run actual inference through HipRuntime
@@ -750,7 +757,7 @@ mod tests {
         );
 
         // Apply softmax and verify it sums to 1.0 for each token
-        let probs = softmax_one_cpu(logits).expect("Softmax failed");
+        let probs = softmax_hip(logits).expect("Softmax failed");
         for t in 0..tokens.len() {
             let start = t * vocab_size;
             let end = start + vocab_size;

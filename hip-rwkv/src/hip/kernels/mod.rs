@@ -4,12 +4,14 @@ mod elementwise;
 pub mod fla;
 mod norm;
 mod rwkv_ops;
+mod softmax;
 mod wkv;
 
 pub use elementwise::*;
 pub use fla::*;
 pub use norm::*;
 pub use rwkv_ops::*;
+pub use softmax::*;
 pub use wkv::*;
 
 #[cfg(test)]
