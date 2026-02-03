@@ -229,6 +229,34 @@ impl HipRuntime {
             .expect("Failed to read prefill state")
     }
 
+    /// Load external state into the runtime.
+    ///
+    /// Loads the given state into the prefill module and marks state
+    /// transfer as needed so the next decode call will pick it up.
+    ///
+    /// This is the primary entry point for ai00's HipStateAdapter to
+    /// restore a previously saved state.
+    pub fn load_state(&self, state: &HipState) -> Result<(), super::HipErrorKind> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.prefill.load_state(state)?;
+        inner.needs_state_transfer = true;
+        Ok(())
+    }
+
+    /// Get the current recurrent state from the runtime.
+    ///
+    /// Returns the prefill module's state, which is authoritative after
+    /// a prefill pass. If only decode calls have been made since the last
+    /// `load_state`, the returned state reflects what was loaded (decode
+    /// does not write back to prefill).
+    ///
+    /// This is the primary entry point for ai00's HipStateAdapter to
+    /// save the current state for later restoration.
+    pub fn get_state(&self) -> Result<HipState, super::HipErrorKind> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.prefill.get_state()
+    }
+
     /// Transfer state from prefill to decode module.
     ///
     /// Called automatically on the first decode after a prefill pass.
