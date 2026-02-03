@@ -958,10 +958,9 @@ hipError_t launch_wkv_bonus_f16(
     if (N <= 0 || H <= 0 || T <= 0 || B <= 0) {
         return hipSuccess;
     }
-    int total = N * H * T * B;
+    int total_htb = H * T * B;
     int block_size = 256;
-    int grid_size = (total + block_size - 1) / block_size;
-    hipLaunchKernelGGL(kernel_wkv_bonus_f16, dim3(grid_size), dim3(block_size), 0, stream,
+    hipLaunchKernelGGL(kernel_wkv_bonus_f16, dim3(total_htb), dim3(block_size), 0, stream,
                        r, k, v, r_k, output, N, H, T, B);
     return hipGetLastError();
 }
