@@ -21,8 +21,8 @@ fn model_exists() -> bool {
 }
 
 fn fixtures_exist() -> bool {
-    Path::new("tests/fixtures/ground_truth/config.npz").exists()
-        && Path::new("tests/fixtures/ground_truth/step_0.npz").exists()
+    Path::new("../tests/fixtures/ground_truth/config.npz").exists()
+        && Path::new("../tests/fixtures/ground_truth/step_0.npz").exists()
 }
 
 /// Get top-k indices from logits, sorted by descending logit value.
@@ -93,12 +93,11 @@ fn spearman_correlation(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Load model and create a HipRuntime with given chunk size and batch size.
-#[cfg(feature = "hip")]
 fn make_runtime(
     chunk: usize,
     batch: usize,
-) -> web_rwkv::hip::HipRuntime {
-    use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
+) -> hip_rwkv::hip::HipRuntime {
+    use hip_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
     let model =
         Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
@@ -110,7 +109,7 @@ fn make_runtime(
 /// Load fixture tokens and n_steps from config.npz.
 fn load_fixture_tokens() -> (Vec<u32>, usize) {
     let config =
-        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
+        TestFixture::load("../tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
     let tokens: Vec<u32> = tokens_i64.iter().map(|&t| t as u32).collect();
@@ -122,7 +121,6 @@ fn load_fixture_tokens() -> (Vec<u32>, usize) {
 /// B=2 determinism: same 4-token sequence in both batch slots.
 /// Both slots must produce exactly equal logits.
 #[test]
-#[cfg(feature = "hip")]
 fn test_multi_batch_determinism() {
     if !model_exists() || !fixtures_exist() {
         eprintln!("Skipping: model or fixtures not found");
@@ -173,7 +171,6 @@ fn test_multi_batch_determinism() {
 /// Feed same token to both batch slots each step; compare each slot against fixtures.
 #[test_case(1  ; "chunk1_decode")]
 #[test_case(14 ; "chunk14_fla")]
-#[cfg(feature = "hip")]
 fn test_multi_batch_quality(chunk_size: usize) {
     if !model_exists() || !fixtures_exist() {
         eprintln!("Skipping: model or fixtures not found");
@@ -186,7 +183,7 @@ fn test_multi_batch_quality(chunk_size: usize) {
     // max_prefill_chunk must accommodate batch_size * chunk_size effective tokens
     let rt = make_runtime(chunk_size * 2, 2);
 
-    let mut state: Option<web_rwkv::hip::HipState> = None;
+    let mut state: Option<hip_rwkv::hip::HipState> = None;
     let mut top1_matches = 0usize;
     let mut total_rho = 0.0f64;
 
@@ -205,7 +202,7 @@ fn test_multi_batch_quality(chunk_size: usize) {
         for t in 0..chunk_len {
             let step_idx = pos + t;
             let fixture = TestFixture::load(&format!(
-                "tests/fixtures/ground_truth/step_{}.npz",
+                "../tests/fixtures/ground_truth/step_{}.npz",
                 step_idx
             ))
             .expect("load fixture");
@@ -267,7 +264,6 @@ fn test_multi_batch_quality(chunk_size: usize) {
 /// Mixed-length batched inference: infer(&[&tokens[0..5], &tokens[0..3]])
 /// vs two separate infer_one() runs. Compare last-token logits.
 #[test]
-#[cfg(feature = "hip")]
 fn test_multi_batch_mixed_lengths() {
     if !model_exists() || !fixtures_exist() {
         eprintln!("Skipping: model or fixtures not found");
@@ -380,7 +376,6 @@ fn test_multi_batch_mixed_lengths() {
 /// logits are finite and non-zero. Marked #[ignore] because it is slow.
 #[test]
 #[ignore]
-#[cfg(feature = "hip")]
 fn test_long_sequence_no_panic() {
     if !model_exists() || !fixtures_exist() {
         eprintln!("Skipping: model or fixtures not found");
@@ -408,7 +403,7 @@ fn test_long_sequence_no_panic() {
 
     // Also test chunked-64 calls via step()
     let rt2 = make_runtime(64, 1);
-    let mut state: Option<web_rwkv::hip::HipState> = None;
+    let mut state: Option<hip_rwkv::hip::HipState> = None;
     let mut pos = 0;
     while pos < target_len {
         let end = (pos + 64).min(target_len);
@@ -444,7 +439,6 @@ fn test_long_sequence_no_panic() {
 /// verify exact f32 equality. Marked #[ignore] because it is slow.
 #[test]
 #[ignore]
-#[cfg(feature = "hip")]
 fn test_long_sequence_determinism() {
     if !model_exists() || !fixtures_exist() {
         eprintln!("Skipping: model or fixtures not found");
@@ -494,7 +488,6 @@ fn test_long_sequence_determinism() {
 /// State continuity across chunks: 14 tokens all-at-once vs split 7+7
 /// via step() with state carry. Compare last-token logits.
 #[test]
-#[cfg(feature = "hip")]
 fn test_state_continuity_across_chunks() {
     if !model_exists() || !fixtures_exist() {
         eprintln!("Skipping: model or fixtures not found");

@@ -16,8 +16,8 @@ fn model_exists() -> bool {
 }
 
 fn ground_truth_fixtures_exist() -> bool {
-    Path::new("tests/fixtures/ground_truth/config.npz").exists()
-        && Path::new("tests/fixtures/ground_truth/step_0.npz").exists()
+    Path::new("../tests/fixtures/ground_truth/config.npz").exists()
+        && Path::new("../tests/fixtures/ground_truth/step_0.npz").exists()
 }
 
 
@@ -27,7 +27,6 @@ fn ground_truth_fixtures_exist() -> bool {
 /// the reference implementation. Processes 14 tokens sequentially and
 /// compares logits at each step.
 #[test]
-#[cfg(feature = "hip")]
 fn test_hip_against_ground_truth() {
     if !model_exists() {
         eprintln!("Skipping test: model file not found at /workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st");
@@ -43,7 +42,7 @@ fn test_hip_against_ground_truth() {
 
     // Load config to get token sequence
     let config =
-        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
+        TestFixture::load("../tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = config.i64("n_steps")[0] as usize;
 
@@ -52,16 +51,16 @@ fn test_hip_against_ground_truth() {
     println!("  Steps: {}", n_steps);
 
     // Load model via HipRuntime
-    use web_rwkv::hip::{HipRuntime, HipRuntimeConfig};
+    use hip_rwkv::hip::{HipRuntime, HipRuntimeConfig};
     let model =
-        web_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
+        hip_rwkv::hip::Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
             .expect("Failed to load model");
     let config = HipRuntimeConfig::new(256, 1);
     let model = HipRuntime::with_config(model, config)
         .expect("Failed to configure runtime");
 
     // State for streaming inference (starts as None, then chains through)
-    let mut state: Option<web_rwkv::hip::HipState> = None;
+    let mut state: Option<hip_rwkv::hip::HipState> = None;
 
     let min_pass_pct = LOGIT_MIN_PASS_PCT;
     let warn_pass_pct = LOGIT_WARN_PASS_PCT;
@@ -70,7 +69,7 @@ fn test_hip_against_ground_truth() {
     let mut all_passed = true;
     for step in 0..n_steps {
         let token = tokens_i64[step] as u32;
-        let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
+        let fixture_path = format!("../tests/fixtures/ground_truth/step_{}.npz", step);
         let fixture =
             TestFixture::load(&fixture_path).expect(&format!("Failed to load {}", fixture_path));
 
@@ -169,7 +168,6 @@ fn count_within_tolerance(
 /// After processing the full prompt, the model should predict a reasonable
 /// continuation. This is a sanity check that the model is working.
 #[test]
-#[cfg(feature = "hip")]
 fn test_ground_truth_final_prediction() {
     if !model_exists() || !ground_truth_fixtures_exist() {
         eprintln!("Skipping test: model or fixtures not found");
@@ -178,11 +176,11 @@ fn test_ground_truth_final_prediction() {
 
     // Load final step fixture
     let config =
-        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
+        TestFixture::load("../tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let n_steps = config.i64("n_steps")[0] as usize;
 
     let final_fixture = TestFixture::load(&format!(
-        "tests/fixtures/ground_truth/step_{}.npz",
+        "../tests/fixtures/ground_truth/step_{}.npz",
         n_steps - 1
     ))
     .expect("Failed to load final step fixture");

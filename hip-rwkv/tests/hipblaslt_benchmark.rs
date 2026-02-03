@@ -2,16 +2,14 @@
 //!
 //! Run with:
 //! ```
-//! cargo test --release --features hip --test hipblaslt_benchmark -- --nocapture --ignored
+//! cargo test --release --test hipblaslt_benchmark -- --nocapture --ignored
 //! ```
-
-#![cfg(feature = "hip")]
 
 use std::time::Instant;
 
 use half::f16;
 
-use web_rwkv::hip::{
+use hip_rwkv::hip::{
     device_synchronize, HipBlasContext, HipBlasLtContext, Stream, TensorHip, TensorShape,
 };
 

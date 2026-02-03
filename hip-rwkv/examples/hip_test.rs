@@ -1,8 +1,7 @@
 //! Minimal test of HIP functionality using null stream
 
-#[cfg(feature = "hip")]
 fn main() {
-    use web_rwkv::hip::{self, DeviceBuffer, Stream};
+    use hip_rwkv::hip::{self, DeviceBuffer, Stream};
 
     println!("Testing HIP with null stream...");
 
@@ -44,9 +43,4 @@ fn main() {
     assert_eq!(host_data, result, "Data mismatch!");
 
     println!("All tests passed!");
-}
-
-#[cfg(not(feature = "hip"))]
-fn main() {
-    println!("HIP feature not enabled");
 }

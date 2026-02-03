@@ -1,15 +1,13 @@
 //! HIP profiling test - run with:
 //! ```
-//! WEB_RWKV_HIP_PROF=1 cargo test --release --features hip,hip-prof --test hip_profiling -- --nocapture --ignored
+//! WEB_RWKV_HIP_PROF=1 cargo test --release --test hip_profiling -- --nocapture --ignored
 //! ```
-
-#![cfg(all(feature = "hip", feature = "tokio"))]
 
 use std::path::Path;
 
 use anyhow::Result;
 
-use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
+use hip_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
 const MODEL_PATH: &str = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
 

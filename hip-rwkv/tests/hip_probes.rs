@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use web_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, Rwkv7Hip};
+use hip_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
 /// Test that probes capture intermediate values during step.
 #[test]

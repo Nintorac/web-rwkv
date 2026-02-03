@@ -6,9 +6,9 @@
 //! This mirrors the comprehensive hook coverage of `hip_layer_validation.rs` (RNN test)
 //! but validates the chunked FLA code path (T >= FLA_CHUNK_THRESHOLD=2).
 //!
-//! Run with: cargo test --features hip,hip-probes hip_fla_validation -- --nocapture
+//! Run with: cargo test --features hip-probes hip_fla_validation -- --nocapture
 
-#![cfg(all(feature = "hip", feature = "hip-probes"))]
+#![cfg(feature = "hip-probes")]
 
 mod common;
 
@@ -16,7 +16,7 @@ use common::{assert_tensors_close, TestFixture, Tolerances};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use web_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, HipState, Rwkv7Hip};
+use hip_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, HipState, Rwkv7Hip};
 
 /// Storage for captured probe data, keyed by (hook, layer).
 type CapturedData = Arc<Mutex<HashMap<(HipHook, Option<usize>), Vec<f32>>>>;
@@ -248,7 +248,7 @@ fn is_state_hook(hook: HipHook) -> bool {
 }
 
 /// Build probes that capture ALL hook points into the shared map.
-fn build_capture_probes() -> (web_rwkv::hip::HipProbeMap, CapturedData) {
+fn build_capture_probes() -> (hip_rwkv::hip::HipProbeMap, CapturedData) {
     let captured: CapturedData = Arc::new(Mutex::new(HashMap::new()));
 
     let hooks = vec![
@@ -612,7 +612,7 @@ fn test_fla_ground_truth_t2_chunked() {
         return;
     }
 
-    let config_path = "tests/fixtures/ground_truth/config.npz";
+    let config_path = "../tests/fixtures/ground_truth/config.npz";
     if !Path::new(config_path).exists() {
         eprintln!("Skipping: config fixture not found at {}", config_path);
         eprintln!(
@@ -622,8 +622,8 @@ fn test_fla_ground_truth_t2_chunked() {
     }
 
     // Check that at least the first two step fixtures exist
-    if !Path::new("tests/fixtures/ground_truth/step_0.npz").exists()
-        || !Path::new("tests/fixtures/ground_truth/step_1.npz").exists()
+    if !Path::new("../tests/fixtures/ground_truth/step_0.npz").exists()
+        || !Path::new("../tests/fixtures/ground_truth/step_1.npz").exists()
     {
         eprintln!("Skipping: step fixtures not found");
         return;
@@ -697,8 +697,8 @@ fn test_fla_ground_truth_t2_chunked() {
         let tok1 = tokens_i64[idx_odd] as u32;
 
         // Load the two corresponding fixture files
-        let fixture_even_path = format!("tests/fixtures/ground_truth/step_{}.npz", idx_even);
-        let fixture_odd_path = format!("tests/fixtures/ground_truth/step_{}.npz", idx_odd);
+        let fixture_even_path = format!("../tests/fixtures/ground_truth/step_{}.npz", idx_even);
+        let fixture_odd_path = format!("../tests/fixtures/ground_truth/step_{}.npz", idx_odd);
 
         if !Path::new(&fixture_even_path).exists() || !Path::new(&fixture_odd_path).exists() {
             println!(

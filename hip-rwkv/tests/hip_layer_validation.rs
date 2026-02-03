@@ -3,11 +3,11 @@
 //! This test uses the probe system to capture intermediate values at every hook point
 //! and compares them against Python-generated ground truth fixtures.
 //!
-//! Run with: cargo test --features hip,hip-probes hip_layer_validation -- --nocapture
+//! Run with: cargo test --features hip-probes hip_layer_validation -- --nocapture
 //!
 //! This helps pinpoint exactly where numerical divergence starts.
 
-#![cfg(all(feature = "hip", feature = "hip-probes"))]
+#![cfg(feature = "hip-probes")]
 
 mod common;
 
@@ -15,7 +15,7 @@ use common::{assert_tensors_close, TestFixture, Tolerances};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use web_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, HipState, Rwkv7Hip};
+use hip_rwkv::hip::{HipHook, HipProbeBuilder, HipRuntime, HipRuntimeConfig, HipState, Rwkv7Hip};
 
 /// Result of a single tensor comparison.
 struct ValidationResult {
@@ -183,7 +183,7 @@ fn fixture_key_for_hook(hook: HipHook, layer: Option<usize>) -> Vec<String> {
 type CapturedData = Arc<Mutex<HashMap<(HipHook, Option<usize>), Vec<f32>>>>;
 
 /// Build probes that capture all hook points.
-fn build_capture_probes() -> (web_rwkv::hip::HipProbeMap, CapturedData) {
+fn build_capture_probes() -> (hip_rwkv::hip::HipProbeMap, CapturedData) {
     let captured: CapturedData = Arc::new(Mutex::new(HashMap::new()));
 
     let hooks = vec![
@@ -335,7 +335,7 @@ fn test_hip_layer_by_layer_step0() {
         return;
     }
 
-    let fixture_path = "tests/fixtures/ground_truth/step_0.npz";
+    let fixture_path = "../tests/fixtures/ground_truth/step_0.npz";
     if !Path::new(fixture_path).exists() {
         eprintln!("Skipping: fixture not found at {}", fixture_path);
         eprintln!(
@@ -349,7 +349,7 @@ fn test_hip_layer_by_layer_step0() {
 
     // Load config to get token
     let config =
-        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
+        TestFixture::load("../tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let token = config.i64("tokens")[0] as u32;
 
     println!(
@@ -648,13 +648,13 @@ fn test_hip_divergence_progression() {
         return;
     }
 
-    if !Path::new("tests/fixtures/ground_truth/config.npz").exists() {
+    if !Path::new("../tests/fixtures/ground_truth/config.npz").exists() {
         eprintln!("Skipping: fixtures not found");
         return;
     }
 
     let config =
-        TestFixture::load("tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
+        TestFixture::load("../tests/fixtures/ground_truth/config.npz").expect("Failed to load config");
     let tokens_i64 = config.i64("tokens");
     let n_steps = (config.i64("n_steps")[0] as usize).min(5); // Test first 5 steps
 
@@ -672,7 +672,7 @@ fn test_hip_divergence_progression() {
 
     for step in 0..n_steps {
         let token = tokens_i64[step] as u32;
-        let fixture_path = format!("tests/fixtures/ground_truth/step_{}.npz", step);
+        let fixture_path = format!("../tests/fixtures/ground_truth/step_{}.npz", step);
 
         if !Path::new(&fixture_path).exists() {
             println!("Step {}: fixture not found, skipping", step);

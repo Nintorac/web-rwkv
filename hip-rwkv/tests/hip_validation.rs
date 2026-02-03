@@ -12,9 +12,8 @@ fn model_exists() -> bool {
 }
 
 /// Load the model and create a HipRuntime with the given config.
-#[cfg(feature = "hip")]
-fn make_runtime(max_prefill_chunk: usize, batch_size: usize) -> web_rwkv::hip::HipRuntime {
-    use web_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
+fn make_runtime(max_prefill_chunk: usize, batch_size: usize) -> hip_rwkv::hip::HipRuntime {
+    use hip_rwkv::hip::{HipRuntime, HipRuntimeConfig, Rwkv7Hip};
 
     let model = Rwkv7Hip::load("/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st")
         .expect("Failed to load model");
@@ -28,7 +27,6 @@ fn make_runtime(max_prefill_chunk: usize, batch_size: usize) -> web_rwkv::hip::H
 
 /// infer(&[]) must return "Empty batch".
 #[test]
-#[cfg(feature = "hip")]
 fn test_infer_empty_batch_error() {
     if !model_exists() {
         eprintln!("Skipping: model not found");
@@ -50,7 +48,6 @@ fn test_infer_empty_batch_error() {
 /// infer(&[&[1,2], &[3,4]]) with B=1 must fail with batch size exceeded.
 /// Goes through prefill path (T>1), which checks batch size.
 #[test]
-#[cfg(feature = "hip")]
 fn test_infer_batch_exceeds_max_error() {
     if !model_exists() {
         eprintln!("Skipping: model not found");
@@ -72,7 +69,6 @@ fn test_infer_batch_exceeds_max_error() {
 
 /// infer(&[&[]]) must return "All sequences are empty".
 #[test]
-#[cfg(feature = "hip")]
 fn test_infer_all_empty_sequences_error() {
     if !model_exists() {
         eprintln!("Skipping: model not found");
@@ -93,7 +89,6 @@ fn test_infer_all_empty_sequences_error() {
 
 /// infer_one(&[1,2,3,4,5]) with chunk=4 must fail with effective token count exceeded.
 #[test]
-#[cfg(feature = "hip")]
 fn test_infer_token_count_exceeds_chunk_error() {
     if !model_exists() {
         eprintln!("Skipping: model not found");
@@ -115,7 +110,6 @@ fn test_infer_token_count_exceeds_chunk_error() {
 /// infer(&[&[1,2,3], &[4,5]]) with chunk=4, B=2 must fail on effective token count.
 /// Multi-batch prefill: effective = B * max_len = 2 * 3 = 6 > 4.
 #[test]
-#[cfg(feature = "hip")]
 fn test_infer_multi_batch_exceeds_chunk_error() {
     if !model_exists() {
         eprintln!("Skipping: model not found");
@@ -137,7 +131,6 @@ fn test_infer_multi_batch_exceeds_chunk_error() {
 /// step(&[&[1], &[2]], None) with B=1 must fail via decode batch size check.
 /// Both sequences are T=1, so step() dispatches to decode path.
 #[test]
-#[cfg(feature = "hip")]
 fn test_step_decode_batch_exceeds_max_error() {
     if !model_exists() {
         eprintln!("Skipping: model not found");
@@ -163,7 +156,6 @@ fn test_step_decode_batch_exceeds_max_error() {
 /// 4 threads x 10 iterations of infer_one() on shared Arc<HipRuntime>.
 /// Verifies no panic, all logits finite, all calls return Ok.
 #[test]
-#[cfg(feature = "hip")]
 fn test_concurrent_infer_no_panic() {
     use std::sync::Arc;
 
@@ -211,7 +203,6 @@ fn test_concurrent_infer_no_panic() {
 /// Thread 1: prefill calls (T=4), Thread 2: decode calls (T=1), concurrently.
 /// Verifies no panic, no deadlock, both threads complete.
 #[test]
-#[cfg(feature = "hip")]
 fn test_concurrent_mixed_prefill_decode() {
     use std::sync::Arc;
 

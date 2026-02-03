@@ -7,15 +7,12 @@
 //! - Chunked processing for long prompts
 //! - Different prompt styles (Q&A, continuation, chat)
 //!
-//! Run with: cargo run --example hip_gen --features hip
+//! Run with: cargo run --example hip_gen -p hip-rwkv
 
-#[cfg(feature = "hip")]
 use std::io::Write;
 
-#[cfg(feature = "hip")]
-use web_rwkv::hip::{HipRuntime, Rwkv7Hip};
+use hip_rwkv::hip::{HipRuntime, Rwkv7Hip};
 
-#[cfg(feature = "hip")]
 fn sample_argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -27,7 +24,6 @@ fn sample_argmax(logits: &[f32]) -> u32 {
 
 /// Sample from top-k logits using nucleus (top-p) sampling.
 /// Only considers the top-k candidates for efficiency.
-#[cfg(feature = "hip")]
 fn sample_top_k_nucleus(logits: &[f32], top_k: usize, top_p: f32, temperature: f32) -> u32 {
     if temperature < 1e-6 {
         return sample_argmax(logits);
@@ -77,7 +73,6 @@ fn sample_top_k_nucleus(logits: &[f32], top_k: usize, top_p: f32, temperature: f
     probs[0].0 as u32 // Fallback to top-1
 }
 
-#[cfg(feature = "hip")]
 struct GenerationConfig {
     max_tokens: usize,
     temperature: f32,
@@ -86,7 +81,6 @@ struct GenerationConfig {
     stop_tokens: Vec<u32>,
 }
 
-#[cfg(feature = "hip")]
 impl Default for GenerationConfig {
     fn default() -> Self {
         Self {
@@ -99,7 +93,6 @@ impl Default for GenerationConfig {
     }
 }
 
-#[cfg(feature = "hip")]
 fn generate_single(
     runtime: &HipRuntime,
     tokenizer: &web_rwkv::tokenizer::Tokenizer,
@@ -160,7 +153,6 @@ fn generate_single(
     String::from_utf8_lossy(&output).to_string()
 }
 
-#[cfg(feature = "hip")]
 fn generate_batched(
     model_path: &str,
     tokenizer: &web_rwkv::tokenizer::Tokenizer,
@@ -240,7 +232,6 @@ fn generate_batched(
         .collect()
 }
 
-#[cfg(feature = "hip")]
 fn main() {
     use std::path::Path;
 
@@ -257,7 +248,7 @@ fn main() {
     }
 
     // Load tokenizer
-    let tokenizer_path = "assets/vocab/rwkv_vocab_v20230424.json";
+    let tokenizer_path = "../assets/vocab/rwkv_vocab_v20230424.json";
     let tokenizer = if Path::new(tokenizer_path).exists() {
         let contents = std::fs::read_to_string(tokenizer_path).expect("Failed to read tokenizer");
         web_rwkv::tokenizer::Tokenizer::new(&contents).expect("Failed to create tokenizer")
@@ -457,9 +448,4 @@ Assistant:"#;
     println!("\n{}", "=".repeat(70));
     println!("Examples complete!");
     println!("{}", "=".repeat(70));
-}
-
-#[cfg(not(feature = "hip"))]
-fn main() {
-    println!("HIP feature not enabled. Run with: cargo run --example hip_gen --features hip");
 }

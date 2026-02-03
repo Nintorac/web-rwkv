@@ -10,8 +10,7 @@
 //! - Chunked processing for long prompts
 //! - Different prompt styles (Q&A, continuation, chat)
 //!
-//! Run with: cargo run --release --example gen_compare --features hip
-//! Or for WGPU only: cargo run --release --example gen_compare
+//! Run with: cargo run --release --example gen_compare -p hip-rwkv
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -37,8 +36,7 @@ use web_rwkv::{
     tokenizer::Tokenizer,
 };
 
-#[cfg(feature = "hip")]
-use web_rwkv::hip::{HipRuntime, Rwkv7Hip};
+use hip_rwkv::hip::{HipRuntime, Rwkv7Hip};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Compare text generation across backends")]
@@ -57,7 +55,7 @@ struct Cli {
         short,
         long,
         value_name = "FILE",
-        default_value = "assets/vocab/rwkv_vocab_v20230424.json"
+        default_value = "../assets/vocab/rwkv_vocab_v20230424.json"
     )]
     tokenizer: PathBuf,
 
@@ -152,7 +150,6 @@ impl Default for GenerationConfig {
 
 /// Backend-agnostic runtime wrapper
 enum BackendRuntime {
-    #[cfg(feature = "hip")]
     Hip(HipRuntime),
     Wgpu(Box<dyn Runtime<Rnn>>),
 }
@@ -166,7 +163,6 @@ struct UnifiedRuntime {
 }
 
 impl UnifiedRuntime {
-    #[cfg(feature = "hip")]
     fn new_hip(model_path: &std::path::Path, batch_size: usize) -> Result<Self> {
         let model = Rwkv7Hip::load(model_path.to_str().unwrap())?;
         let vocab_size = model.info().n_vocab;
@@ -234,7 +230,6 @@ impl UnifiedRuntime {
 
     fn name(&self) -> &'static str {
         match &self.runtime {
-            #[cfg(feature = "hip")]
             BackendRuntime::Hip(_) => "HIP",
             BackendRuntime::Wgpu(_) => "Vulkan/WGPU",
         }
@@ -261,7 +256,6 @@ impl UnifiedRuntime {
             }
 
             let (remaining, output) = match &self.runtime {
-                #[cfg(feature = "hip")]
                 BackendRuntime::Hip(rt) => Runtime::<Rnn>::infer(rt, input).await?,
                 BackendRuntime::Wgpu(rt) => rt.infer(input).await?,
             };
@@ -270,9 +264,8 @@ impl UnifiedRuntime {
             // Get output if any
             if output.0[0].0.shape()[1] > 0 {
                 let probs = match &self.runtime {
-                    #[cfg(feature = "hip")]
                     BackendRuntime::Hip(_) => {
-                        web_rwkv::hip::softmax_hip(output.0[0].0.clone())?
+                        hip_rwkv::hip::softmax_hip(output.0[0].0.clone())?
                             .data()
                             .to_vec()
                     }
@@ -310,14 +303,12 @@ impl UnifiedRuntime {
             let input = RnnInput::new(vec![batch], self.chunk_size);
 
             let (_, output) = match &self.runtime {
-                #[cfg(feature = "hip")]
                 BackendRuntime::Hip(rt) => Runtime::<Rnn>::infer(rt, input).await?,
                 BackendRuntime::Wgpu(rt) => rt.infer(input).await?,
             };
 
             let probs = match &self.runtime {
-                #[cfg(feature = "hip")]
-                BackendRuntime::Hip(_) => web_rwkv::hip::softmax_hip(output.0[0].0.clone())?
+                BackendRuntime::Hip(_) => hip_rwkv::hip::softmax_hip(output.0[0].0.clone())?
                     .data()
                     .to_vec(),
                 BackendRuntime::Wgpu(_) => {
@@ -504,9 +495,6 @@ async fn main() -> Result<()> {
     );
 
     // Run Vulkan/WGPU backend
-    #[cfg(not(feature = "hip"))]
-    let run_vulkan = true;
-    #[cfg(feature = "hip")]
     let run_vulkan = !cli.hip_only;
 
     if run_vulkan {
@@ -525,28 +513,18 @@ async fn main() -> Result<()> {
     }
 
     // Run HIP backend
-    #[cfg(feature = "hip")]
-    {
-        if !cli.vulkan_only {
-            println!("\n{}", "#".repeat(70));
-            println!("# HIP BACKEND");
-            println!("{}", "#".repeat(70));
+    if !cli.vulkan_only {
+        println!("\n{}", "#".repeat(70));
+        println!("# HIP BACKEND");
+        println!("{}", "#".repeat(70));
 
-            match UnifiedRuntime::new_hip(&cli.model, 1) {
-                Ok(runtime) => {
-                    run_tests(&runtime, &tokenizer).await?;
-                }
-                Err(e) => {
-                    eprintln!("Failed to initialize HIP backend: {}", e);
-                }
+        match UnifiedRuntime::new_hip(&cli.model, 1) {
+            Ok(runtime) => {
+                run_tests(&runtime, &tokenizer).await?;
             }
-        }
-    }
-
-    #[cfg(not(feature = "hip"))]
-    {
-        if cli.hip_only {
-            eprintln!("\nHIP feature not enabled. Compile with --features hip to use HIP backend.");
+            Err(e) => {
+                eprintln!("Failed to initialize HIP backend: {}", e);
+            }
         }
     }
 
