@@ -310,13 +310,22 @@ If there are conflicts, the orchestrator resolves them before proceeding to depe
 - Sequential ticket work (one at a time) — just work in `/workspace/web-rwkv/` directly
 - Tickets that touch completely disjoint files with no shared dependencies — still preferred to use worktrees for safety
 
-## Code Refactoring: Extract, Don't Rewrite
+## Never Reproduce — Always Copy
 
-When refactoring — moving code between files, extracting helper functions, or splitting modules — **never rewrite large blocks of code from scratch**. Instead:
+**Never rewrite, retype, or regenerate text that already exists.** This applies to code, plans, documentation, configs — anything. If content exists in a file, copy it directly (`cp`, `cat`, Read tool). Do not read it and then write it back from memory. Every reproduction introduces errors and wastes tokens.
+
+This applies to:
+- **Refactoring**: Use `sed` to extract exact line ranges, copy into the new location, add wrappers. Never rewrite extracted code from memory.
+- **Moving files**: Use `cp` or `mv`, not Read + Write.
+- **Plan documents**: Use `cp` to move between locations. If adding sections, use the Edit tool to insert — don't rewrite the whole file.
+- **Large edits**: Use the Edit tool with targeted `old_string`/`new_string` pairs. Never Write an entire file when only a few lines changed.
+
+### Refactoring example
+
+When moving code between files, extracting helper functions, or splitting modules:
 
 1. **Use `sed` to extract exact line ranges** from the source file:
    ```bash
-   # Extract lines 100-200 from step.rs to see the code block
    sed -n '100,200p' src/hip/model/step.rs
    ```
 
@@ -326,19 +335,20 @@ When refactoring — moving code between files, extracting helper functions, or 
 
 4. **Replace the original code** in the source file with calls to the new helpers using the Edit tool.
 
-Why this matters:
-- Rewriting 800 lines from memory introduces subtle transcription errors
-- Extracting preserves exact logic, operator precedence, and edge cases
-- It's faster, cheaper, and more reliable
-- Reviewers can verify the refactor is behavior-preserving
-
 **Anti-pattern** (do NOT do this):
 ```
 Read step.rs, understand the logic, then write dispatch_helpers.rs from scratch
 with your understanding of what the code does.
 ```
+```
+Read a plan file, then Write it to a new location from memory.
+```
 
 **Correct pattern**:
+```
+cp old/location/plan.md new/location/plan.md
+Edit new/location/plan.md to add/modify specific sections
+```
 ```
 sed -n '150,220p' src/hip/model/step.rs > extracted block
 Wrap extracted block in fn attention_block(...) { ... }
@@ -355,6 +365,7 @@ When context is compacted, preserve:
 - The `br` issue tracker workflow (ready, show, claim, close)
 - **Ticket closure requirements** (commit before close, verify acceptance criteria)
 - **Parallel work requires git worktrees** — one worktree per agent, cherry-pick/rebase back (no merge commits, linear history)
+- **Never reproduce, always copy** — use cp/mv/Edit, never rewrite existing content from memory
 - **Refactoring = extract, don't rewrite** — use sed to extract code, not retype from memory
 - Current branch context and recent commits
 - References to plan documents (e.g., `docs/RWKV7_HIP_BACKEND_PLAN.md`)
