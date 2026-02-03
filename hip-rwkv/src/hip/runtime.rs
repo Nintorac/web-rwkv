@@ -539,18 +539,19 @@ impl HipRuntime {
             return Err(RuntimeError::InputExhausted);
         }
 
-        // 3. Extract tokens from chunk
+        // 3. Extract tokens from chunk (pad empty batches with token 0)
         let token_vecs: Vec<Vec<u32>> = chunk
             .iter()
             .map(|batch| {
-                batch
+                let tokens: Vec<u32> = batch
                     .0
                     .iter()
                     .map(|t| match t {
                         Token::Token(id) => *id,
-                        Token::Embed(_) => 0, // Embed tokens not supported yet
+                        Token::Embed(_) => 0,
                     })
-                    .collect()
+                    .collect();
+                if tokens.is_empty() { vec![0] } else { tokens }
             })
             .collect();
         let token_refs: Vec<&[u32]> = token_vecs.iter().map(|v| v.as_slice()).collect();
