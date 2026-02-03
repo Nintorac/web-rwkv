@@ -19,10 +19,10 @@ use crate::hip::blas::HipBlasContext;
 use crate::hip::device::Stream;
 use crate::hip::ffi::Result;
 use crate::hip::kernels::{
-    add_f16, broadcast_add_f16, broadcast_mul_f16, channel_mix_state_f16,
-    channel_mix_state_f16_masked, control_k_f16, copy_f16_to_f32, copy_tensor_f16, decay_exp_f16,
-    group_norm_f16, l2_norm_f16, layer_norm_f16, lerp_f16, mul_f16, negate_f16, sigmoid_f16,
-    softplus_decay_f16, squared_relu_f16, tanh_f16, wkv_bonus_f16,
+    add_f16, broadcast_add_f16, broadcast_mul_f16, channel_mix_state_f16, control_k_f16,
+    copy_f16_to_f32, copy_tensor_f16, decay_exp_f16, group_norm_f16, l2_norm_f16, layer_norm_f16,
+    lerp_f16, mul_f16, negate_f16, sigmoid_f16, softplus_decay_f16, squared_relu_f16, tanh_f16,
+    wkv_bonus_f16,
 };
 use crate::hip::pinned::PinnedBuffer;
 use crate::hip::tensor::{TensorHip, TensorShape};
@@ -295,6 +295,8 @@ pub fn attention_block<F>(
     temp2: &mut TensorHip<f16>,
     // Lens GPU tensor for masked shift
     lens_gpu: &TensorHip<i32>,
+    // Batch offsets GPU tensor for packed sequence addressing
+    batch_offsets_gpu: &TensorHip<i32>,
     // WKV state for this layer
     wkv_state: &mut TensorHip<f32>,
     // Model dimensions
@@ -340,25 +342,28 @@ where
         }
     }
 
-    // Token shifts for attention - use masked kernel for x_r to get correct state
-    // The masked kernel extracts state at lengths[b]-1 instead of T-1
+    // Token shifts for attention - unified kernel uses lengths + batch_offsets
+    // x_r shift extracts the correct state at lengths[b]-1
     {
-        channel_mix_state_f16_masked(
+        channel_mix_state_f16(
             x_ln,
             att_shift_state,
             &layer.att.x_r,
             att_xr,
             new_att_shift,
             lens_gpu,
+            batch_offsets_gpu,
             stream,
         )?;
-        // Remaining shifts use regular kernel (we only need outputs, not state)
+        // Remaining shifts use same unified kernel (we only need outputs, not state)
         channel_mix_state_f16(
             x_ln,
             att_shift_state,
             &layer.att.x_w,
             att_xw,
             temp1,
+            lens_gpu,
+            batch_offsets_gpu,
             stream,
         )?;
         channel_mix_state_f16(
@@ -367,6 +372,8 @@ where
             &layer.att.x_k,
             att_xk,
             temp1,
+            lens_gpu,
+            batch_offsets_gpu,
             stream,
         )?;
         channel_mix_state_f16(
@@ -375,6 +382,8 @@ where
             &layer.att.x_v,
             att_xv,
             temp1,
+            lens_gpu,
+            batch_offsets_gpu,
             stream,
         )?;
         channel_mix_state_f16(
@@ -383,6 +392,8 @@ where
             &layer.att.x_a,
             att_xa,
             temp1,
+            lens_gpu,
+            batch_offsets_gpu,
             stream,
         )?;
         channel_mix_state_f16(
@@ -391,6 +402,8 @@ where
             &layer.att.x_g,
             att_xg,
             temp1,
+            lens_gpu,
+            batch_offsets_gpu,
             stream,
         )?;
     }
@@ -791,6 +804,8 @@ pub fn ffn_block(
     temp1: &mut TensorHip<f16>,
     // Lens GPU tensor for masked shift
     lens_gpu: &TensorHip<i32>,
+    // Batch offsets GPU tensor for packed sequence addressing
+    batch_offsets_gpu: &TensorHip<i32>,
     // BLAS context
     ctx: &HipBlasContext,
     stream: &Stream,
@@ -824,15 +839,16 @@ pub fn ffn_block(
         }
     }
 
-    // Token shift for FFN - use masked kernel for correct state extraction
+    // Token shift for FFN - unified kernel with lengths + batch_offsets
     {
-        channel_mix_state_f16_masked(
+        channel_mix_state_f16(
             x_ln,
             ffn_shift_state,
             &layer.ffn.x_k,
             ffn_xk,
             new_ffn_shift,
             lens_gpu,
+            batch_offsets_gpu,
             stream,
         )?;
     }

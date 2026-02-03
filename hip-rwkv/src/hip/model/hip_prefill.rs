@@ -464,6 +464,10 @@ impl HipPrefill {
         let mut lens_gpu = scratch.lens_gpu.resized_view_mut(lens_shape)?;
         lens_gpu.copy_from_slice(&lens_i32, stream)?;
 
+        // Rectangular batch_offsets: [0, T, 2T, ...]
+        let offsets_i32: Vec<i32> = (0..b).map(|i| (i * t) as i32).collect();
+        let batch_offsets_gpu = TensorHip::from_slice(&offsets_i32, lens_shape, stream)?;
+
         // Shapes for this forward pass
         let std_shape = TensorShape::new(n_embd, t, b, 1);
         let ffn_shape = TensorShape::new(n_hidden, t, b, 1);
@@ -601,6 +605,7 @@ impl HipPrefill {
                     &mut temp1,
                     &mut temp2,
                     &lens_gpu,
+                    &batch_offsets_gpu,
                     &mut wkv_state_gpu[layer_idx],
                     head_size,
                     n_head,
@@ -639,6 +644,7 @@ impl HipPrefill {
                     &mut ffn_out,
                     &mut temp1,
                     &lens_gpu,
+                    &batch_offsets_gpu,
                     ctx,
                     stream,
                     &mut probe_state,

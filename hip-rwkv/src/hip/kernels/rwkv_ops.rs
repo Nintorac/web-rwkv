@@ -7,9 +7,7 @@ use crate::hip::device::Stream;
 use crate::hip::ffi::{
     check,
     launch_channel_mix_state_f16,
-    launch_channel_mix_state_f16_masked,
     launch_channel_mix_state_f32,
-    launch_channel_mix_state_f32_masked,
     launch_control_k_f16,
     launch_control_k_f32,
     launch_copy_f16_to_f32,
@@ -171,17 +169,24 @@ pub fn hip_token_shift(
     Ok((output, state_out))
 }
 
-/// Launch the channel-mix state kernel.
+/// Launch the unified channel-mix state kernel.
 ///
-/// Same as token shift but with batch dimension.
-/// Input: [C, T, B, 1], state: [C, B, 1, 1], x_k: [C, 1, 1, 1]
+/// Supports packed sequences via batch_offsets and per-batch lengths.
+/// For rectangular layout, pass batch_offsets = [0, T, 2T, ...] and
+/// lengths = [T, T, T, ...].
+///
+/// Only processes tokens [0, lengths[b]) for each batch, so state_out
+/// contains x[lengths[b]-1] instead of x[T-1].
+/// Empty sequences (lengths[b]=0) preserve the input state.
 ///
 /// # Arguments
-/// * `x` - Input tensor of shape [C, T, B, 1]
+/// * `x` - Input tensor (packed or rectangular)
 /// * `state_in` - Previous state per batch of shape [C, B, 1, 1]
 /// * `x_k` - Per-channel mixing factor of shape [C, 1, 1, 1]
-/// * `output` - Output tensor of shape [C, T, B, 1]
+/// * `output` - Output tensor (same shape as x)
 /// * `state_out` - New state per batch of shape [C, B, 1, 1]
+/// * `lengths` - GPU tensor of real sequence lengths per batch [B]
+/// * `batch_offsets` - GPU tensor of token offsets per batch [B]
 /// * `stream` - HIP stream
 pub fn channel_mix_state_f32(
     x: &TensorHip<f32>,
@@ -189,19 +194,20 @@ pub fn channel_mix_state_f32(
     x_k: &TensorHip<f32>,
     output: &mut TensorHip<f32>,
     state_out: &mut TensorHip<f32>,
+    lengths: &TensorHip<i32>,
+    batch_offsets: &TensorHip<i32>,
     stream: &Stream,
 ) -> Result<()> {
     let c = x.shape()[0];
-    let t = x.shape()[1];
-    let b = x.shape()[2];
+    let b = lengths.len();
 
-    if output.shape() != x.shape() {
+    if output.len() != x.len() {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
-                "Output shape mismatch: expected {}, got {}",
-                x.shape(),
-                output.shape()
+                "Output size mismatch: expected {}, got {}",
+                x.len(),
+                output.len()
             ),
         });
     }
@@ -223,6 +229,16 @@ pub fn channel_mix_state_f32(
                 "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
                 c,
                 x_k.shape()
+            ),
+        });
+    }
+    if batch_offsets.len() != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "batch_offsets length mismatch: expected {}, got {}",
+                b,
+                batch_offsets.len()
             ),
         });
     }
@@ -234,118 +250,50 @@ pub fn channel_mix_state_f32(
             x_k.as_ptr(),
             output.as_mut_ptr(),
             state_out.as_mut_ptr(),
+            lengths.as_ptr() as *const c_int,
+            batch_offsets.as_ptr() as *const c_int,
             c as c_int,
-            t as c_int,
             b as c_int,
             stream.handle(),
         ))
     }
 }
 
-/// Channel-mix state computation with length masking for variable-length sequences.
+/// Launch the unified channel-mix state kernel (f16).
 ///
-/// Same as `channel_mix_state_f32` but respects per-batch sequence lengths.
-/// Only processes tokens [0, lengths[b]) for each batch, so state_out
-/// contains x[lengths[b]-1] instead of x[T-1].
+/// Supports packed sequences via batch_offsets and per-batch lengths.
+/// For rectangular layout, pass batch_offsets = [0, T, 2T, ...] and
+/// lengths = [T, T, T, ...].
 ///
 /// # Arguments
-/// * `x` - Input tensor of shape [C, T, B, 1]
+/// * `x` - Input tensor (packed or rectangular)
 /// * `state_in` - Previous state per batch of shape [C, B, 1, 1]
 /// * `x_k` - Per-channel mixing factor of shape [C, 1, 1, 1]
-/// * `output` - Output tensor of shape [C, T, B, 1]
+/// * `output` - Output tensor (same shape as x)
 /// * `state_out` - New state per batch of shape [C, B, 1, 1]
 /// * `lengths` - GPU tensor of real sequence lengths per batch [B]
+/// * `batch_offsets` - GPU tensor of token offsets per batch [B]
 /// * `stream` - HIP stream
-pub fn channel_mix_state_f32_masked(
-    x: &TensorHip<f32>,
-    state_in: &TensorHip<f32>,
-    x_k: &TensorHip<f32>,
-    output: &mut TensorHip<f32>,
-    state_out: &mut TensorHip<f32>,
-    lengths: &TensorHip<i32>,
-    stream: &Stream,
-) -> Result<()> {
-    let c = x.shape()[0];
-    let t = x.shape()[1];
-    let b = x.shape()[2];
-
-    if output.shape() != x.shape() {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "Output shape mismatch: expected {}, got {}",
-                x.shape(),
-                output.shape()
-            ),
-        });
-    }
-    if state_in.shape()[0] != c || state_in.shape()[1] != b {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "State shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c,
-                b,
-                state_in.shape()
-            ),
-        });
-    }
-    if x_k.shape()[0] != c {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c,
-                x_k.shape()
-            ),
-        });
-    }
-    if lengths.shape()[0] != b {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "Lengths shape mismatch: expected [{}, 1, 1, 1], got {}",
-                b,
-                lengths.shape()
-            ),
-        });
-    }
-
-    unsafe {
-        check(launch_channel_mix_state_f32_masked(
-            x.as_ptr(),
-            state_in.as_ptr(),
-            x_k.as_ptr(),
-            output.as_mut_ptr(),
-            state_out.as_mut_ptr(),
-            lengths.as_ptr() as *const c_int,
-            c as c_int,
-            t as c_int,
-            b as c_int,
-            stream.handle(),
-        ))
-    }
-}
-
 pub fn channel_mix_state_f16(
     x: &TensorHip<f16>,
     state_in: &TensorHip<f16>,
     x_k: &TensorHip<f16>,
     output: &mut TensorHip<f16>,
     state_out: &mut TensorHip<f16>,
+    lengths: &TensorHip<i32>,
+    batch_offsets: &TensorHip<i32>,
     stream: &Stream,
 ) -> Result<()> {
     let c = x.shape()[0];
-    let t = x.shape()[1];
-    let b = x.shape()[2];
+    let b = lengths.len();
 
-    if output.shape() != x.shape() {
+    if output.len() != x.len() {
         return Err(HipErrorKind {
             code: -1,
             message: format!(
-                "Output shape mismatch: expected {}, got {}",
-                x.shape(),
-                output.shape()
+                "Output size mismatch: expected {}, got {}",
+                x.len(),
+                output.len()
             ),
         });
     }
@@ -367,6 +315,16 @@ pub fn channel_mix_state_f16(
                 "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
                 c,
                 x_k.shape()
+            ),
+        });
+    }
+    if batch_offsets.len() != b {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "batch_offsets length mismatch: expected {}, got {}",
+                b,
+                batch_offsets.len()
             ),
         });
     }
@@ -378,79 +336,9 @@ pub fn channel_mix_state_f16(
             x_k.as_ptr(),
             output.as_mut_ptr(),
             state_out.as_mut_ptr(),
-            c as c_int,
-            t as c_int,
-            b as c_int,
-            stream.handle(),
-        ))
-    }
-}
-
-pub fn channel_mix_state_f16_masked(
-    x: &TensorHip<f16>,
-    state_in: &TensorHip<f16>,
-    x_k: &TensorHip<f16>,
-    output: &mut TensorHip<f16>,
-    state_out: &mut TensorHip<f16>,
-    lengths: &TensorHip<i32>,
-    stream: &Stream,
-) -> Result<()> {
-    let c = x.shape()[0];
-    let t = x.shape()[1];
-    let b = x.shape()[2];
-
-    if output.shape() != x.shape() {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "Output shape mismatch: expected {}, got {}",
-                x.shape(),
-                output.shape()
-            ),
-        });
-    }
-    if state_in.shape()[0] != c || state_in.shape()[1] != b {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "State shape mismatch: expected [{}, {}, 1, 1], got {}",
-                c,
-                b,
-                state_in.shape()
-            ),
-        });
-    }
-    if x_k.shape()[0] != c {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "x_k shape mismatch: expected [{}, 1, 1, 1], got {}",
-                c,
-                x_k.shape()
-            ),
-        });
-    }
-    if lengths.shape()[0] != b {
-        return Err(HipErrorKind {
-            code: -1,
-            message: format!(
-                "Lengths shape mismatch: expected [{}, 1, 1, 1], got {}",
-                b,
-                lengths.shape()
-            ),
-        });
-    }
-
-    unsafe {
-        check(launch_channel_mix_state_f16_masked(
-            x.as_ptr(),
-            state_in.as_ptr(),
-            x_k.as_ptr(),
-            output.as_mut_ptr(),
-            state_out.as_mut_ptr(),
             lengths.as_ptr() as *const c_int,
+            batch_offsets.as_ptr() as *const c_int,
             c as c_int,
-            t as c_int,
             b as c_int,
             stream.handle(),
         ))
@@ -458,6 +346,7 @@ pub fn channel_mix_state_f16_masked(
 }
 
 /// Compute channel-mix state on host data, returning (output, state_out).
+/// Uses rectangular batch_offsets = [0, T, 2T, ...] for backward compatibility.
 pub fn hip_channel_mix_state(
     x: &[f32],
     state_in: &[f32],
@@ -494,10 +383,17 @@ pub fn hip_channel_mix_state(
     let x_shape = TensorShape::new(c, t, b, 1);
     let state_shape = TensorShape::new(c, b, 1, 1);
     let xk_shape = TensorShape::new(c, 1, 1, 1);
+    let b_shape = TensorShape::new(b, 1, 1, 1);
+
+    // Rectangular offsets: [0, T, 2T, ...]
+    let lengths_vec: Vec<i32> = vec![t as i32; b];
+    let offsets_vec: Vec<i32> = (0..b).map(|i| (i * t) as i32).collect();
 
     let d_x = TensorHip::from_slice(x, x_shape, &stream)?;
     let d_state_in = TensorHip::from_slice(state_in, state_shape, &stream)?;
     let d_x_k = TensorHip::from_slice(x_k, xk_shape, &stream)?;
+    let d_lengths = TensorHip::from_slice(&lengths_vec, b_shape, &stream)?;
+    let d_offsets = TensorHip::from_slice(&offsets_vec, b_shape, &stream)?;
     let mut d_output = TensorHip::<f32>::new(x_shape)?;
     let mut d_state_out = TensorHip::<f32>::new(state_shape)?;
 
@@ -507,6 +403,8 @@ pub fn hip_channel_mix_state(
         &d_x_k,
         &mut d_output,
         &mut d_state_out,
+        &d_lengths,
+        &d_offsets,
         &stream,
     )?;
 

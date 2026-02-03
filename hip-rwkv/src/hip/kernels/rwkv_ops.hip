@@ -75,95 +75,25 @@ hipError_t launch_token_shift_f32(
 }
 
 // ============================================================================
-// Channel-Mix State Kernel
-// Same as token shift but with batch dimension
-// Input: [C, T, B, 1], state: [C, B, 1, 1], x_k: [C, 1, 1, 1]
+// Channel-Mix State Kernel (unified masked + batch_offsets)
+// Supports packed sequences via batch_offsets and per-batch lengths.
+// For rectangular layout, pass batch_offsets = [0, T, 2T, ...] and
+// lengths = [T, T, T, ...].
 // Formula: output[t] = x[t] + x_k * (prev[t] - x[t])
 // Where prev[0] = state_in, prev[t>0] = x[t-1]
-// State is updated to x[T-1] for each batch
+// State is updated to x[lengths[b]-1] for each batch.
+// Empty sequences (lengths[b]=0) preserve the input state.
 // ============================================================================
 
 __global__ void kernel_channel_mix_state_f32(
-    const float* __restrict__ x,          // [C, T, B, 1] - input tensor
+    const float* __restrict__ x,          // packed input tensor
     const float* __restrict__ state_in,   // [C, B, 1, 1] - previous state per batch
     const float* __restrict__ x_k,        // [C, 1, 1, 1] - mixing factor
-    float* __restrict__ output,           // [C, T, B, 1] - output
-    float* __restrict__ state_out,        // [C, B, 1, 1] - new state per batch
-    int C,                                 // Channel dimension
-    int T,                                 // Number of tokens
-    int B                                  // Batch size
-) {
-    // Each thread handles one (channel, batch) pair
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = C * B;
-    if (idx >= total) return;
-
-    int c = idx % C;        // Channel index
-    int b = idx / C;        // Batch index
-
-    float mix_val = x_k[c];
-    // state_in is [C, B, 1, 1] so element (c, b) is at b*C + c
-    float prev = state_in[b * C + c];
-
-    // Process each token in sequence for this (channel, batch)
-    for (int t = 0; t < T; t++) {
-        // x is [C, T, B, 1] so element (c, t, b) is at b*T*C + t*C + c
-        int offset = b * T * C + t * C + c;
-        float curr = x[offset];
-
-        // Token shift: blend current with previous (RWKV convention)
-        // lerp(curr, prev, mix) = curr + mix * (prev - curr)
-        // mix=0 -> curr (use current), mix=1 -> prev (use previous)
-        output[offset] = curr + mix_val * (prev - curr);
-
-        prev = curr;
-    }
-
-    // State out is the last token for this batch
-    state_out[b * C + c] = prev;
-}
-
-hipError_t launch_channel_mix_state_f32(
-    const float* x,
-    const float* state_in,
-    const float* x_k,
-    float* output,
-    float* state_out,
-    int C,
-    int T,
-    int B,
-    hipStream_t stream
-) {
-    if (C <= 0 || T <= 0 || B <= 0) {
-        return hipSuccess;
-    }
-
-    int total = C * B;
-    int block_size = 256;
-    int grid_size = (total + block_size - 1) / block_size;
-
-    hipLaunchKernelGGL(kernel_channel_mix_state_f32, dim3(grid_size), dim3(block_size), 0, stream,
-                       x, state_in, x_k, output, state_out, C, T, B);
-
-    return hipGetLastError();
-}
-
-// ============================================================================
-// Length-Masked Channel Mix State Kernel
-// Same as channel_mix_state but respects per-batch sequence lengths.
-// Only processes tokens [0, lengths[b]) for each batch, so state_out
-// contains x[lengths[b]-1] instead of x[T-1].
-// ============================================================================
-
-__global__ void kernel_channel_mix_state_f32_masked(
-    const float* __restrict__ x,          // [C, T, B, 1] - input tensor
-    const float* __restrict__ state_in,   // [C, B, 1, 1] - previous state per batch
-    const float* __restrict__ x_k,        // [C, 1, 1, 1] - mixing factor
-    float* __restrict__ output,           // [C, T, B, 1] - output
+    float* __restrict__ output,           // packed output tensor
     float* __restrict__ state_out,        // [C, B, 1, 1] - new state per batch
     const int* __restrict__ lengths,      // [B] - real sequence length per batch
+    const int* __restrict__ batch_offsets, // [B] - token offset for each batch
     int C,                                 // Channel dimension
-    int T,                                 // Number of tokens (padded)
     int B                                  // Batch size
 ) {
     // Each thread handles one (channel, batch) pair
@@ -174,6 +104,7 @@ __global__ void kernel_channel_mix_state_f32_masked(
     int c = idx % C;        // Channel index
     int b = idx / C;        // Batch index
     int real_len = lengths[b];
+    int bos = batch_offsets[b];
 
     // Handle empty sequences - preserve input state
     if (real_len <= 0) {
@@ -186,7 +117,7 @@ __global__ void kernel_channel_mix_state_f32_masked(
 
     // Process only real tokens for this (channel, batch)
     for (int t = 0; t < real_len; t++) {
-        int offset = b * T * C + t * C + c;
+        int offset = (bos + t) * C + c;
         float curr = x[offset];
 
         // Token shift: blend current with previous
@@ -198,19 +129,19 @@ __global__ void kernel_channel_mix_state_f32_masked(
     state_out[b * C + c] = prev;
 }
 
-hipError_t launch_channel_mix_state_f32_masked(
+hipError_t launch_channel_mix_state_f32(
     const float* x,
     const float* state_in,
     const float* x_k,
     float* output,
     float* state_out,
     const int* lengths,
+    const int* batch_offsets,
     int C,
-    int T,
     int B,
     hipStream_t stream
 ) {
-    if (C <= 0 || T <= 0 || B <= 0) {
+    if (C <= 0 || B <= 0) {
         return hipSuccess;
     }
 
@@ -218,8 +149,8 @@ hipError_t launch_channel_mix_state_f32_masked(
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
 
-    hipLaunchKernelGGL(kernel_channel_mix_state_f32_masked, dim3(grid_size), dim3(block_size), 0, stream,
-                       x, state_in, x_k, output, state_out, lengths, C, T, B);
+    hipLaunchKernelGGL(kernel_channel_mix_state_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       x, state_in, x_k, output, state_out, lengths, batch_offsets, C, B);
 
     return hipGetLastError();
 }
@@ -741,8 +672,9 @@ __global__ void kernel_channel_mix_state_f16(
     const __half* __restrict__ x_k,
     __half* __restrict__ output,
     __half* __restrict__ state_out,
+    const int* __restrict__ lengths,
+    const int* __restrict__ batch_offsets,
     int C,
-    int T,
     int B
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -751,12 +683,19 @@ __global__ void kernel_channel_mix_state_f16(
 
     int c = idx % C;
     int b = idx / C;
+    int real_len = lengths[b];
+    int bos = batch_offsets[b];
+
+    if (real_len <= 0) {
+        state_out[b * C + c] = state_in[b * C + c];
+        return;
+    }
 
     float mix_val = f16_to_f32(x_k[c]);
     float prev = f16_to_f32(state_in[b * C + c]);
 
-    for (int t = 0; t < T; t++) {
-        int offset = b * T * C + t * C + c;
+    for (int t = 0; t < real_len; t++) {
+        int offset = (bos + t) * C + c;
         float curr = f16_to_f32(x[offset]);
         float out = curr + mix_val * (prev - curr);
         output[offset] = f32_to_f16(out);
@@ -772,80 +711,20 @@ hipError_t launch_channel_mix_state_f16(
     const __half* x_k,
     __half* output,
     __half* state_out,
+    const int* lengths,
+    const int* batch_offsets,
     int C,
-    int T,
     int B,
     hipStream_t stream
 ) {
-    if (C <= 0 || T <= 0 || B <= 0) {
+    if (C <= 0 || B <= 0) {
         return hipSuccess;
     }
     int total = C * B;
     int block_size = 256;
     int grid_size = (total + block_size - 1) / block_size;
     hipLaunchKernelGGL(kernel_channel_mix_state_f16, dim3(grid_size), dim3(block_size), 0, stream,
-                       x, state_in, x_k, output, state_out, C, T, B);
-    return hipGetLastError();
-}
-
-__global__ void kernel_channel_mix_state_f16_masked(
-    const __half* __restrict__ x,
-    const __half* __restrict__ state_in,
-    const __half* __restrict__ x_k,
-    __half* __restrict__ output,
-    __half* __restrict__ state_out,
-    const int* __restrict__ lengths,
-    int C,
-    int T,
-    int B
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = C * B;
-    if (idx >= total) return;
-
-    int c = idx % C;
-    int b = idx / C;
-    int real_len = lengths[b];
-
-    if (real_len <= 0) {
-        state_out[b * C + c] = state_in[b * C + c];
-        return;
-    }
-
-    float mix_val = f16_to_f32(x_k[c]);
-    float prev = f16_to_f32(state_in[b * C + c]);
-
-    for (int t = 0; t < real_len; t++) {
-        int offset = b * T * C + t * C + c;
-        float curr = f16_to_f32(x[offset]);
-        float out = curr + mix_val * (prev - curr);
-        output[offset] = f32_to_f16(out);
-        prev = curr;
-    }
-
-    state_out[b * C + c] = f32_to_f16(prev);
-}
-
-hipError_t launch_channel_mix_state_f16_masked(
-    const __half* x,
-    const __half* state_in,
-    const __half* x_k,
-    __half* output,
-    __half* state_out,
-    const int* lengths,
-    int C,
-    int T,
-    int B,
-    hipStream_t stream
-) {
-    if (C <= 0 || T <= 0 || B <= 0) {
-        return hipSuccess;
-    }
-    int total = C * B;
-    int block_size = 256;
-    int grid_size = (total + block_size - 1) / block_size;
-    hipLaunchKernelGGL(kernel_channel_mix_state_f16_masked, dim3(grid_size), dim3(block_size), 0, stream,
-                       x, state_in, x_k, output, state_out, lengths, C, T, B);
+                       x, state_in, x_k, output, state_out, lengths, batch_offsets, C, B);
     return hipGetLastError();
 }
 
