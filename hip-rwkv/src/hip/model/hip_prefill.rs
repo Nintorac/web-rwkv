@@ -318,9 +318,9 @@ impl HipPrefill {
 
         // Get real lengths and validate
         let lens: Vec<usize> = tokens.iter().map(|s| s.len()).collect();
-        let max_len = *lens.iter().max().unwrap_or(&0);
+        let t_total: usize = lens.iter().sum();
 
-        if max_len == 0 {
+        if t_total == 0 {
             return Err(HipErrorKind {
                 code: -1,
                 message: "All sequences are empty".to_string(),
@@ -330,46 +330,19 @@ impl HipPrefill {
         // FLA requires T > 1 for chunked prefill.
         // For T=1, we still use FLA (it handles T=1 correctly via single-chunk path).
         // But the primary use case is T>1.
-
-        // Validate effective token count
-        let t_effective = if batch_size > 1 && max_len > 1 {
-            batch_size * max_len
-        } else {
-            lens.iter().sum()
-        };
-        if t_effective > chunk_size {
+        if t_total > chunk_size {
             return Err(HipErrorKind {
                 code: -1,
                 message: format!(
-                    "prefill() requires effective token count <= chunk_size ({} vs {})",
-                    t_effective, chunk_size
+                    "prefill() requires total token count <= chunk_size ({} vs {})",
+                    t_total, chunk_size
                 ),
             });
         }
 
-        // Pad sequences for B>1 prefill
-        let (dispatch_tokens_storage, dispatch_refs, dispatch_lens);
-        if batch_size > 1 && max_len > 1 {
-            let padded: Vec<Vec<u32>> = tokens
-                .iter()
-                .map(|seq| {
-                    let mut v = seq.to_vec();
-                    v.resize(max_len, 0);
-                    v
-                })
-                .collect();
-            dispatch_tokens_storage = padded;
-            dispatch_refs = dispatch_tokens_storage
-                .iter()
-                .map(|v| v.as_slice())
-                .collect::<Vec<_>>();
-            dispatch_lens = lens.clone();
-        } else {
-            dispatch_tokens_storage = vec![]; // unused but needed for lifetime
-            let _ = &dispatch_tokens_storage;
-            dispatch_refs = tokens.to_vec();
-            dispatch_lens = lens.clone();
-        }
+        // Packed layout: no padding needed. Tokens are concatenated flat.
+        let dispatch_refs: Vec<&[u32]> = tokens.to_vec();
+        let dispatch_lens = lens.clone();
 
         // Run FLA-only dispatch (borrows &mut self)
         self.dispatch_fla(&dispatch_refs, &dispatch_lens)?;
@@ -381,25 +354,16 @@ impl HipPrefill {
 
         let n_vocab = self.model.info.n_vocab;
         let staging = scratch.logits_staging.as_slice();
-        let t_total: usize = lens.iter().sum();
         let mut logits = Vec::with_capacity(t_total * n_vocab);
 
-        if batch_size > 1 && max_len > 1 {
-            for (b, &real_len) in lens.iter().enumerate() {
-                for t in 0..real_len {
-                    let offset = (b * max_len + t) * n_vocab;
-                    logits.extend_from_slice(&staging[offset..offset + n_vocab]);
-                }
+        // Packed layout: tokens are contiguous, extract logits sequentially
+        let mut token_offset = 0usize;
+        for &real_len in lens.iter() {
+            for t in 0..real_len {
+                let offset = (token_offset + t) * n_vocab;
+                logits.extend_from_slice(&staging[offset..offset + n_vocab]);
             }
-        } else {
-            let mut token_offset = 0usize;
-            for &real_len in lens.iter() {
-                for t in 0..real_len {
-                    let offset = (token_offset + t) * n_vocab;
-                    logits.extend_from_slice(&staging[offset..offset + n_vocab]);
-                }
-                token_offset += real_len;
-            }
+            token_offset += real_len;
         }
 
         Ok(logits)
@@ -411,7 +375,7 @@ impl HipPrefill {
     /// kernel call. State is GPU-resident in scratch and updated in-place.
     fn dispatch_fla(&mut self, tokens: &[&[u32]], lens: &[usize]) -> Result<()> {
         let b = tokens.len();
-        let t = tokens[0].len();
+        let t: usize = lens.iter().sum(); // packed: total tokens
 
         let n_embd = self.model.info.n_embd;
         let n_head = self.model.info.n_head;
@@ -420,7 +384,8 @@ impl HipPrefill {
         let scratch = &mut self.scratch;
 
         // Always create FLA kernel (this is prefill-only, always FLA).
-        let mut fla_kernel = FlaChunkedWkv::new(scratch, head_size, n_head, t, b)?;
+        // Packed layout: seq_len = t_total, batch_size = 1 (buffer dim), n_seq = b (real sequences)
+        let mut fla_kernel = FlaChunkedWkv::new(scratch, head_size, n_head, t, 1, b)?;
 
         let ctx = &scratch.blas_ctx;
         let stream = ctx.stream();
@@ -464,20 +429,28 @@ impl HipPrefill {
         let mut lens_gpu = scratch.lens_gpu.resized_view_mut(lens_shape)?;
         lens_gpu.copy_from_slice(&lens_i32, stream)?;
 
-        // Rectangular batch_offsets: [0, T, 2T, ...]
-        let offsets_i32: Vec<i32> = (0..b).map(|i| (i * t) as i32).collect();
+        // Packed batch_offsets: cu_seqlens [0, len0, len0+len1, ...]
+        let offsets_i32: Vec<i32> = {
+            let mut cs = Vec::with_capacity(b);
+            let mut accum = 0i32;
+            for &l in lens.iter() {
+                cs.push(accum);
+                accum += l as i32;
+            }
+            cs
+        };
         let batch_offsets_gpu = TensorHip::from_slice(&offsets_i32, lens_shape, stream)?;
 
-        // Shapes for this forward pass
-        let std_shape = TensorShape::new(n_embd, t, b, 1);
-        let ffn_shape = TensorShape::new(n_hidden, t, b, 1);
-        let out_shape = TensorShape::new(n_vocab, t, b, 1);
+        // Packed shapes for this forward pass: [dim, t_total, 1, 1]
+        let std_shape = TensorShape::new(n_embd, t, 1, 1);
+        let ffn_shape = TensorShape::new(n_hidden, t, 1, 1);
+        let out_shape = TensorShape::new(n_vocab, t, 1, 1);
         let state_shape = TensorShape::new(n_embd, b, 1, 1);
-        let wkv_data_shape = TensorShape::new(head_size, n_head, t, b);
-        let lora_w_shape = TensorShape::new(lora_dims.w_dim, t, b, 1);
-        let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, b, 1);
-        let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, b, 1);
-        let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
+        let wkv_data_shape = TensorShape::new(head_size, n_head, t, 1);
+        let lora_w_shape = TensorShape::new(lora_dims.w_dim, t, 1, 1);
+        let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, 1, 1);
+        let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, 1, 1);
+        let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, 1, 1);
 
         // Create resized views of scratch buffers
         let mut x = scratch.x.resized_view_mut(std_shape)?;

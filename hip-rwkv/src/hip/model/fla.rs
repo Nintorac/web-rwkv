@@ -106,8 +106,9 @@ impl FlaChunkedWkv {
     /// * `scratch` - Mutable reference to the scratch pool
     /// * `head_size` - Head size (K, typically 64)
     /// * `n_head` - Number of heads (H)
-    /// * `seq_len` - Sequence length (T)
-    /// * `batch_size` - Batch size (B)
+    /// * `seq_len` - Total packed sequence length (T_total)
+    /// * `batch_size` - Tensor batch dimension (1 for packed layout)
+    /// * `n_seq` - Actual number of sequences (for chunk count calculation)
     #[allow(non_snake_case)]
     pub fn new(
         scratch: &mut PrefillScratch,
@@ -115,11 +116,14 @@ impl FlaChunkedWkv {
         n_head: usize,
         seq_len: usize,
         batch_size: usize,
+        n_seq: usize,
     ) -> Result<Self> {
         let chunk_size = scratch.config.fla_chunk_size;
-        let total_chunks = batch_size * ceil_div(seq_len, chunk_size);
+        // Packed layout: each sequence boundary can start a new chunk,
+        // so total_chunks = ceil_div(seq_len, C) + n_seq (safe upper bound).
+        let total_chunks = ceil_div(seq_len, chunk_size) + n_seq;
 
-        // Per-token shape: [K, H, T, B]
+        // Per-token shape: [K, H, T_total, 1] for packed layout
         let per_token_shape = TensorShape::new(head_size, n_head, seq_len, batch_size);
         // Per-chunk attention matrix shape: [C, C, H, total_chunks]
         let chunk_mat_shape = TensorShape::new(chunk_size, chunk_size, n_head, total_chunks);
@@ -186,11 +190,13 @@ impl FlaChunkedWkv {
         stream: &Stream,
     ) -> Result<()> {
         let t = self.seq_len;
-        let bb = self.batch_size;
         let c = self.chunk_size;
         let head_size = self.head_size;
         let n_head = self.n_head;
-        let n_seq = bb; // for equal-length batches, n_seq == batch_size
+        // n_seq = actual number of sequences from lengths, not the tensor batch dim.
+        // With packed layout, self.batch_size=1 (buffer dim) but lengths has the real count.
+        let n_seq = lengths.len();
+        let bb = n_seq;
 
         // ================================================================
         // Step 0: Compute chunk indices on CPU and upload to GPU
@@ -211,15 +217,12 @@ impl FlaChunkedWkv {
         };
 
         // Build batch_offsets for data addressing.
-        // For B=1: offset is [0] (only one sequence, no gaps).
-        // For B>1: sequences are padded to seq_len (T_max), so each batch
-        // element starts at b * seq_len in the time dimension. The tensor
-        // layout is [K, H, T_max, B], so batch_offsets = [0, T, 2T, ...].
-        let batch_offsets_host: Vec<i32> = if bb == 1 {
-            vec![0i32]
-        } else {
-            (0..bb).map(|b| (b * t) as i32).collect()
-        };
+        // Packed layout: batch_offsets = cu_seqlens (no padding gaps).
+        // Each sequence starts at cu_seqlens[b] in the packed time dimension.
+        let batch_offsets_host: Vec<i32> = cu_seqlens_host[..bb]
+            .iter()
+            .map(|&x| x as i32)
+            .collect();
 
         // Compute chunk indices and offsets on CPU
         let chunk_indices_host = prepare_chunk_indices(&cu_seqlens_host, c);
@@ -266,7 +269,8 @@ impl FlaChunkedWkv {
         // cumsum result.
 
         // Use a temporary view for gk that shares memory with fla_gi
-        let per_token_shape = TensorShape::new(head_size, n_head, t, bb);
+        // per_token_shape uses self.batch_size (=1 for packed) since buffers are [K,H,T,1]
+        let per_token_shape = TensorShape::new(head_size, n_head, t, self.batch_size);
         let mut gk = self.fla_gi.resized_view_mut(per_token_shape)?;
 
         // att_w is [K, H, T, B] in f16, gk is [K, H, T, B] in f32

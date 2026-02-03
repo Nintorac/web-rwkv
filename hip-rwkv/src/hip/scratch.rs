@@ -6,11 +6,12 @@
 //!
 //! # Memory Layout
 //!
-//! Buffers use web-rwkv conventions where shape[0] is the fastest-moving axis:
-//! - Standard buffers: `[n_embd, max_seq_len, batch_size]`
-//! - FFN hidden buffers: `[n_hidden, max_seq_len, batch_size]`
-//! - LoRA buffers: `[lora_dim, max_seq_len, batch_size]`
-//! - Output buffer: `[n_vocab, max_seq_len, batch_size]`
+//! Buffers use web-rwkv conventions where shape[0] is the fastest-moving axis.
+//! Prefill uses packed layout (sequences concatenated flat, batch dim = 1):
+//! - Standard buffers: `[n_embd, max_prefill_chunk, 1, 1]`
+//! - FFN hidden buffers: `[n_hidden, max_prefill_chunk, 1, 1]`
+//! - LoRA buffers: `[lora_dim, max_prefill_chunk, 1, 1]`
+//! - Output buffer: `[n_vocab, max_prefill_chunk, 1, 1]`
 
 use super::blas::HipBlasContext;
 use super::ffi::Result;
@@ -369,31 +370,34 @@ impl PrefillScratch {
         let h = info.n_hidden;
         let v = info.n_vocab;
 
-        // Standard shape [n_embd, T, B]
-        let std_shape = TensorShape::new(c, t, b, 1);
+        // Packed layout: standard buffers use [dim, T, 1, 1] instead of [dim, T, B, 1]
+        // because tokens are concatenated flat (T absorbs batch dimension).
+        let std_shape = TensorShape::new(c, t, 1, 1);
 
-        // FFN hidden shape [n_hidden, T, B]
-        let ffn_shape = TensorShape::new(h, t, b, 1);
+        // FFN hidden shape [n_hidden, T, 1, 1]
+        let ffn_shape = TensorShape::new(h, t, 1, 1);
 
-        // Output shape [n_vocab, T, B]
-        let out_shape = TensorShape::new(v, t, b, 1);
-        let out_size = v * t * b;
+        // Output shape [n_vocab, T, 1, 1]
+        let out_shape = TensorShape::new(v, t, 1, 1);
+        let out_size = v * t;
 
-        // LoRA shapes
-        let lora_w_shape = TensorShape::new(lora_dims.w_dim, t, b, 1);
-        let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, b, 1);
-        let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, b, 1);
-        let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, b, 1);
+        // LoRA shapes (packed)
+        let lora_w_shape = TensorShape::new(lora_dims.w_dim, t, 1, 1);
+        let lora_a_shape = TensorShape::new(lora_dims.a_dim, t, 1, 1);
+        let lora_g_shape = TensorShape::new(lora_dims.g_dim, t, 1, 1);
+        let lora_v_shape = TensorShape::new(lora_dims.v_dim.unwrap_or(1), t, 1, 1);
         let state_shape = TensorShape::new(c, b, 1, 1);
         let wkv_state_shape = TensorShape::new(info.head_size, info.head_size, info.n_head, b);
 
-        // FLA shapes
+        // FLA shapes (packed: per-token uses [K, H, T, 1])
         let fla_c = config.fla_chunk_size;
-        let max_total_chunks = b * ((t + fla_c - 1) / fla_c); // ceil_div(t, fla_c) * b
+        // Packed layout: each sequence boundary can start a new chunk fragment,
+        // so max_total_chunks = ceil_div(t, C) + batch_size (safe upper bound).
+        let max_total_chunks = (t + fla_c - 1) / fla_c + b;
         let head_size = info.head_size;
         let n_head = info.n_head;
-        // Per-token buffers: [head_size, n_head, max_prefill_chunk, batch_size]
-        let fla_per_token_shape = TensorShape::new(head_size, n_head, t, b);
+        // Per-token buffers: [head_size, n_head, max_prefill_chunk, 1]
+        let fla_per_token_shape = TensorShape::new(head_size, n_head, t, 1);
         // Per-chunk attention matrices: [C, C, n_head, max_total_chunks]
         let fla_chunk_mat_shape = TensorShape::new(fla_c, fla_c, n_head, max_total_chunks);
         // Per-chunk state buffers: [head_size, head_size, n_head, max_total_chunks]
@@ -493,14 +497,14 @@ impl PrefillScratch {
             logits_f32: TensorHip::new(out_shape)?,
             logits_staging: PinnedBuffer::new(out_size)?,
 
-            // Token staging buffer [T, B]
-            token_staging: TensorHip::new(TensorShape::new(t, b, 1, 1))?,
+            // Token staging buffer [T, 1, 1, 1] (packed)
+            token_staging: TensorHip::new(TensorShape::new(t, 1, 1, 1))?,
 
             // Sequence lengths buffer [B]
             lens_gpu: TensorHip::new(TensorShape::new(b, 1, 1, 1))?,
 
-            // Pinned host buffer for async embedding upload [n_embd * T * B]
-            emb_staging: PinnedBuffer::new(c * t * b)?,
+            // Pinned host buffer for async embedding upload [n_embd * T]
+            emb_staging: PinnedBuffer::new(c * t)?,
         })
     }
 
@@ -521,31 +525,32 @@ impl PrefillScratch {
     /// Calculate total GPU memory used by scratch buffers in bytes.
     pub fn memory_bytes(&self) -> usize {
         let t = self.config.max_prefill_chunk;
-        let b = self.config.batch_size;
         let c = self.n_embd;
         let h = self.n_hidden;
         let v = self.n_vocab;
         let ld = &self.lora_dims;
 
-        let std_size = c * t * b;
-        let ffn_size = h * t * b;
-        let out_size = v * t * b;
-        let token_size = t * b; // Token staging buffer
+        // Packed layout: buffers are [dim, T, 1, 1], no batch multiplier
+        let std_size = c * t;
+        let ffn_size = h * t;
+        let out_size = v * t;
+        let token_size = t; // Token staging buffer
 
         let std_count = 26; // Number of standard buffers
         let ffn_count = 2; // Number of FFN hidden buffers
 
-        let lora_size = (ld.w_dim + ld.a_dim + ld.g_dim + ld.v_dim.unwrap_or(0)) * t * b;
+        let lora_size = (ld.w_dim + ld.a_dim + ld.g_dim + ld.v_dim.unwrap_or(0)) * t;
 
         // FLA buffer sizes (all f32)
         // Reconstruct dimensions from stored shapes
         let fla_c = self.config.fla_chunk_size;
         let n_head = self.fla_gi.shape().dim(1);
         let head_size = if n_head > 0 { c / n_head } else { 0 };
-        let max_total_chunks = b * ((t + fla_c - 1) / fla_c);
+        let b = self.config.batch_size;
+        let max_total_chunks = (t + fla_c - 1) / fla_c + b;
         // 9 per-token buffers: fla_gi, fla_ge, fla_qg, fla_kg, fla_ag, fla_bg, fla_w_wy, fla_u_wy, fla_v_new
-        // Each is [head_size, n_head, T, B] = head_size * n_head * T * B elements
-        let fla_per_token_elements = 9 * head_size * n_head * t * b;
+        // Each is [head_size, n_head, T, 1] = head_size * n_head * T elements
+        let fla_per_token_elements = 9 * head_size * n_head * t;
         // 5 chunk-matrix buffers: fla_A_qk, fla_A_qb, fla_A_ab, fla_A_ak, fla_A_ab_inv
         // Each is [C, C, n_head, max_total_chunks]
         let fla_chunk_mat_elements = 5 * fla_c * fla_c * n_head * max_total_chunks;

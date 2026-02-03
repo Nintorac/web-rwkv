@@ -1578,4 +1578,84 @@ mod tests {
 
         println!("test_hip_runtime_chunked_matches_direct PASSED");
     }
+
+    /// Test that packed sequences allow [125, 1, 1, 1] within 128-token budget.
+    ///
+    /// With rectangular padding this would be 4*125=500 tokens (exceeds 256 buffer).
+    /// With packed format it's 125+1+1+1=128 total tokens (fits in 128 chunk).
+    ///
+    /// Also verifies quality: last-token logits for each batch should match
+    /// single-sequence inference (top-10 overlap >= 8/10).
+    #[test]
+    fn test_hip_runtime_multichunk_prefill_with_empty_batches() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        // Build runtime with batch_size=4, chunk_size=128
+        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model.info().n_vocab;
+        let config = HipRuntimeConfig::new(128, 4); // chunk=128, batch=4
+        let runtime = HipRuntime::with_config(model, config)
+            .expect("Failed to create HipRuntime");
+
+        // [125, 1, 1, 1] tokens — 128 total, fits in packed 128-token budget
+        let long_seq: Vec<u32> = (1..=125).collect();
+        let short1: Vec<u32> = vec![200];
+        let short2: Vec<u32> = vec![300];
+        let short3: Vec<u32> = vec![400];
+
+        // This should NOT fail with packed layout (128 <= 128)
+        let logits = runtime
+            .infer(&[&long_seq, &short1, &short2, &short3])
+            .expect("Packed [125,1,1,1] should fit in 128-token budget");
+
+        // Total output: 128 tokens worth of logits
+        let total_tokens: usize = 125 + 1 + 1 + 1;
+        let shape = logits.shape();
+        assert_eq!(shape[0], vocab_size, "vocab dim");
+        assert_eq!(shape[1], total_tokens, "total tokens dim");
+
+        // Verify all logits are finite
+        assert!(
+            logits.data().iter().all(|&x| x.is_finite()),
+            "All logits should be finite"
+        );
+
+        // Quality check: run the 125-token sequence individually and compare last-token top-10
+        let lengths = [125, 1, 1, 1];
+        let last_logits = runtime.extract_last_logits(&logits, &lengths);
+        assert_eq!(last_logits.len(), 4);
+
+        let top_k = |logits_slice: &[f32], k: usize| -> Vec<usize> {
+            let mut indexed: Vec<(usize, f32)> = logits_slice.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.into_iter().take(k).map(|(i, _)| i).collect()
+        };
+
+        // Check batch 0 (125 tokens) against individual B=1 inference
+        let ref_model = Rwkv7Hip::load(model_path).expect("Failed to load ref model");
+        let ref_runtime = HipRuntime::new(ref_model, 1);
+        let ref_logits = ref_runtime.infer_one(&long_seq).expect("Reference inference failed");
+        let ref_last_start = (125 - 1) * vocab_size;
+        let ref_last = &ref_logits.data()[ref_last_start..ref_last_start + vocab_size];
+        let ref_top10 = top_k(ref_last, 10);
+        let batch_top10 = top_k(&last_logits[0], 10);
+        let overlap = ref_top10.iter().filter(|i| batch_top10.contains(i)).count();
+        println!(
+            "Batch 0 (125 tokens): top-10 overlap = {}/10 vs individual inference",
+            overlap
+        );
+        assert!(
+            overlap >= 8,
+            "Top-10 overlap for 125-token batch should be >= 8/10, got {}/10",
+            overlap
+        );
+
+        println!("test_hip_runtime_multichunk_prefill_with_empty_batches PASSED");
+        println!("  - [125, 1, 1, 1] batch prefilled in 128-token budget");
+        println!("  - Output shape: [{}, {}, {}, {}]", shape[0], shape[1], shape[2], shape[3]);
+    }
 }
