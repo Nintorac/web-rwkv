@@ -115,7 +115,7 @@ pub use blaslt::{
 // Re-export model types
 pub use model::{
     AttentionHip, EmbedHip, FfnHip, HeadHip, HipState, LayerHip, LayerNormHip,
-    ModelLoadError, Rwkv7Hip, Rwkv7ModelInfo,
+    ModelLoadError, Rwkv7Hip, Rwkv7Model, Rwkv7ModelInfo, StateLayout,
 };
 
 #[cfg(test)]

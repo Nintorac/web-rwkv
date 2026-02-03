@@ -70,9 +70,9 @@ impl Rwkv7Hip {
         let b = tokens.len();
         let t = tokens[0].len();
 
-        let n_embd = self.info.n_embd;
-        let n_head = self.info.n_head;
-        let head_size = self.info.head_size;
+        let n_embd = self.model.info.n_embd;
+        let n_head = self.model.info.n_head;
+        let head_size = self.model.info.head_size;
 
         // Pre-create FLA kernel views before ctx borrows scratch.
         // FlaChunkedWkv::new takes &mut scratch to create non-owning views
@@ -92,9 +92,9 @@ impl Rwkv7Hip {
 
         let ctx = &scratch.blas_ctx;
         let stream = ctx.stream();
-        let n_layer = self.info.n_layer;
-        let n_hidden = self.info.n_hidden;
-        let n_vocab = self.info.n_vocab;
+        let n_layer = self.model.info.n_layer;
+        let n_hidden = self.model.info.n_hidden;
+        let n_vocab = self.model.info.n_vocab;
         let lora_dims = &scratch.lora_dims;
 
         // Initialize probe context (compiles out without feature)
@@ -180,8 +180,8 @@ impl Rwkv7Hip {
         {
             // Embedding lookup: tokens[b][t] -> x[c, t, b]
             // Embedding table is kept on CPU - use pinned staging buffer for async upload
-            let emb_data = &self.embed.w;
-            let emb_stride = self.embed.n_embd;
+            let emb_data = &self.model.embed.w;
+            let emb_stride = self.model.embed.n_embd;
             let x_host = scratch.emb_staging.as_slice_mut();
             for batch_idx in 0..b {
                 for time_idx in 0..t {
@@ -234,15 +234,15 @@ impl Rwkv7Hip {
                 #[cfg(feature = "hip-probes")]
                 { probe_ctx.layer = Some(layer_idx); }
 
-                let layer = &self.layers[layer_idx];
+                let layer = &self.model.layers[layer_idx];
 
                 // Apply ln0 for layer 0
                 if layer_idx == 0 {
                     {
                         layer_norm_f16(
                             &x,
-                            &self.embed.ln.weight,
-                            &self.embed.ln.bias,
+                            &self.model.embed.ln.weight,
+                            &self.model.embed.ln.bias,
                             &mut x_ln,
                             1e-5,
                             stream,
@@ -849,14 +849,14 @@ impl Rwkv7Hip {
                 // ==== Output Head ====
                 layer_norm_f16(
                     &x,
-                    &self.head.ln.weight,
-                    &self.head.ln.bias,
+                    &self.model.head.ln.weight,
+                    &self.model.head.ln.bias,
                     &mut x_ln,
                     1e-5,
                     stream,
                 )?;
 
-                ctx.hgemm_into(&self.head.w, &x_ln, &mut logits)?;
+                ctx.hgemm_into(&self.model.head.w, &x_ln, &mut logits)?;
             }
 
             // PostHeadLayerNorm probe (x_ln holds head layer norm output)
@@ -1024,8 +1024,8 @@ impl Rwkv7Hip {
             dispatch_lens = lens.clone();
         }
 
-        let n_vocab = self.info.n_vocab;
-        let n_layer = self.info.n_layer;
+        let n_vocab = self.model.info.n_vocab;
+        let n_layer = self.model.info.n_layer;
 
         // H2D: upload CPU state to scratch GPU buffers (or reset to zeros)
         match state {
@@ -1058,7 +1058,7 @@ impl Rwkv7Hip {
 
         // D2H: download scratch GPU buffers to a fresh HipState
         let stream_handle = scratch.blas_ctx.stream().handle();
-        let mut new_state = HipState::new(&self.info, batch_size)?;
+        let mut new_state = HipState::new(&self.model.info, batch_size)?;
         for i in 0..n_layer {
             unsafe {
                 new_state.att_shift_states[i].copy_from_device_async(
@@ -1199,7 +1199,7 @@ impl Rwkv7Hip {
             dispatch_lens = lens.clone();
         }
 
-        let n_vocab = self.info.n_vocab;
+        let n_vocab = self.model.info.n_vocab;
 
         // Run the forward pass (state stays GPU-resident, no H2D/D2H)
         self.dispatch(&dispatch_refs, scratch, &dispatch_lens)?;
@@ -1303,7 +1303,7 @@ mod tests {
         let (logits, _state) = model.step(&[&tokens], None).expect("step() failed");
 
         // Should return vocab_size * T logits
-        let expected_len = model.info.n_vocab * tokens.len();
+        let expected_len = model.info().n_vocab * tokens.len();
         assert_eq!(
             logits.len(),
             expected_len,
@@ -1360,7 +1360,7 @@ mod tests {
             .expect("batched step failed");
 
         // Batched output: [seq1 tokens, seq2 tokens] concatenated
-        let vocab = model1.info.n_vocab;
+        let vocab = model1.info().n_vocab;
         let b = 2;
         assert_eq!(batched_logits.len(), vocab * t * b);
 
@@ -1571,7 +1571,7 @@ mod tests {
             .expect("Failed to configure model");
 
         // State with batch_size=2, but provide 3 sequences
-        let state = HipState::new(&model.info, 2).expect("Failed to allocate state");
+        let state = HipState::new(model.info(), 2).expect("Failed to allocate state");
         let result = model.step(&[&[1u32], &[2u32], &[3u32]], Some(state));
 
         assert!(result.is_err(), "Should error on batch size mismatch");
@@ -1606,7 +1606,7 @@ mod tests {
         );
 
         let (logits, _) = result.unwrap();
-        let vocab = model.info.n_vocab;
+        let vocab = model.info().n_vocab;
         // Logits should have (3 + 2) * vocab elements
         assert_eq!(
             logits.len(),
@@ -1788,7 +1788,7 @@ mod tests {
         }
         let state_rec = state_rec_opt.unwrap();
 
-        let vocab = model_fla.info.n_vocab;
+        let vocab = model_fla.info().n_vocab;
 
         // Both should return the same number of logits
         assert_eq!(
@@ -1941,7 +1941,7 @@ mod tests {
             .step(&[&[decode_token]], state_b)
             .expect("Recurrent decode failed");
 
-        let vocab = model_a.info.n_vocab;
+        let vocab = model_a.info().n_vocab;
         assert_eq!(logits_decode_a.len(), vocab, "Decode A logits size");
         assert_eq!(logits_decode_b.len(), vocab, "Decode B logits size");
 
@@ -2126,7 +2126,7 @@ mod tests {
             .step(&[&tokens], None)
             .expect("FLA step failed");
 
-        let vocab = model_t1.info.n_vocab;
+        let vocab = model_t1.info().n_vocab;
         let n_real = tokens.len();
 
         // Both paths should produce correct number of logits
@@ -2201,7 +2201,7 @@ mod tests {
             state_rec = Some(new_state);
         }
 
-        let vocab = model_fla.info.n_vocab;
+        let vocab = model_fla.info().n_vocab;
 
         assert_eq!(logits_fla.len(), n_real * vocab);
         assert_eq!(logits_rec.len(), n_real * vocab);

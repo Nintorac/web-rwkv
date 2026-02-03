@@ -9,14 +9,14 @@ pub mod weights;
 // Re-export all public types from submodules
 pub use fla::FlaChunkedWkv;
 pub use prefill::{FusedT1Wkv, WaveReduceWkv, WkvInput, WkvKernel};
-pub use state::HipState;
+pub use state::{HipState, StateLayout};
 pub use weights::{
     AttentionHip, EmbedHip, FfnHip, HeadHip, LayerHip, LayerNormHip,
 };
 
 use half::f16;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::device::Stream;
 use super::ffi::{HipErrorKind, Result};
@@ -44,15 +44,40 @@ pub struct Rwkv7ModelInfo {
     pub n_hidden: usize,
 }
 
-/// RWKV7 model loaded into HIP memory.
+/// Shared model weights for RWKV7 on HIP.
 ///
-/// Weights are stored in managed memory for zero-copy APU access.
-/// Weights and activations use FP16; recurrent WKV state remains FP32.
-pub struct Rwkv7Hip {
+/// Contains the immutable weight data (embedding, layers, output head) that
+/// can be shared across multiple inference modules (e.g., HipPrefill, HipDecode)
+/// via `Arc<Rwkv7Model>`. Weights are stored in managed memory for zero-copy
+/// APU access. Weights use FP16; recurrent WKV state remains FP32.
+pub struct Rwkv7Model {
     pub info: Rwkv7ModelInfo,
     pub embed: EmbedHip,
     pub head: HeadHip,
     pub layers: Vec<LayerHip>,
+}
+
+impl std::fmt::Debug for Rwkv7Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rwkv7Model")
+            .field("info", &self.info)
+            .field("embed", &self.embed)
+            .field("head", &self.head)
+            .field("layers", &self.layers)
+            .finish()
+    }
+}
+
+/// RWKV7 model loaded into HIP memory.
+///
+/// Convenience wrapper around `Arc<Rwkv7Model>` that also owns scratch buffers
+/// and probe state. For shared access to model weights (e.g., from HipPrefill
+/// and HipDecode), use the `model()` method to get the `Arc<Rwkv7Model>`.
+///
+/// Weights and activations use FP16; recurrent WKV state remains FP32.
+pub struct Rwkv7Hip {
+    /// Shared model weights wrapped in Arc for multi-module sharing.
+    pub(crate) model: Arc<Rwkv7Model>,
 
     /// Lazily initialized scratch buffers for GPU-native forward pass.
     pub(crate) scratch: Mutex<Option<HipScratch>>,
@@ -64,10 +89,7 @@ pub struct Rwkv7Hip {
 impl std::fmt::Debug for Rwkv7Hip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("Rwkv7Hip");
-        s.field("info", &self.info)
-            .field("embed", &self.embed)
-            .field("head", &self.head)
-            .field("layers", &self.layers)
+        s.field("model", &self.model)
             .field(
                 "scratch",
                 &self.scratch.lock().unwrap().as_ref().map(|_| "initialized"),
@@ -115,18 +137,20 @@ impl From<std::io::Error> for ModelLoadError {
     }
 }
 
-impl Rwkv7Hip {
-    /// Load an RWKV7 model from a SafeTensors file.
+impl Rwkv7Model {
+    /// Load RWKV7 model weights from a SafeTensors file.
     ///
     /// Weights are loaded into managed (unified) memory for efficient APU access.
     /// Weights are stored as FP16; WKV state remains FP32.
+    ///
+    /// Returns `Arc<Rwkv7Model>` for shared ownership across inference modules.
     ///
     /// # Arguments
     /// * `path` - Path to the .st (SafeTensors) file
     ///
     /// # Returns
-    /// The loaded model with all weights in HIP memory, or an error.
-    pub fn load<P: AsRef<Path>>(path: P) -> std::result::Result<Self, ModelLoadError> {
+    /// The loaded model weights wrapped in Arc, or an error.
+    pub fn load<P: AsRef<Path>>(path: P) -> std::result::Result<Arc<Self>, ModelLoadError> {
         let data = std::fs::read(path.as_ref())?;
         let st = safetensors::SafeTensors::deserialize(&data).map_err(|e| {
             ModelLoadError::SafeTensor(format!("Failed to parse SafeTensors: {}", e))
@@ -206,38 +230,38 @@ impl Rwkv7Hip {
 
         log::info!("RWKV7 model loaded successfully");
 
-        Ok(Self {
+        Ok(Arc::new(Self {
             info,
             embed,
             head,
             layers,
-            scratch: Mutex::new(None),
-            #[cfg(feature = "hip-probes")]
-            probes: None,
-        })
+        }))
     }
 
-    /// Attach probes for capturing intermediate values.
+    /// Extract LoRA dimensions from the model weights.
     ///
-    /// Only available with `hip-probes` feature. Probes are called at each hook point
-    /// during forward pass, receiving the tensor data and context information.
+    /// These dimensions are needed to allocate scratch buffers for the forward pass.
+    /// LoRA dimensions are consistent across layers, so we read them from layer 0.
     ///
-    /// # Example
-    /// ```ignore
-    /// use web_rwkv::hip::{HipHook, HipProbeBuilder};
-    ///
-    /// let probes = HipProbeBuilder::new()
-    ///     .on(HipHook::PostAttLayerNorm, |data, ctx| {
-    ///         println!("Layer {:?}: PostAttLayerNorm shape {:?}", ctx.layer, ctx.shape);
-    ///     })
-    ///     .build();
-    ///
-    /// let model = Rwkv7Hip::load("model.st")?.with_probes(probes);
-    /// ```
-    #[cfg(feature = "hip-probes")]
-    pub fn with_probes(mut self, probes: HipProbeMap) -> Self {
-        self.probes = Some(std::sync::Arc::new(probes));
-        self
+    /// # Returns
+    /// `LoraDims` struct containing:
+    /// - `w_dim`: Decay LoRA rank
+    /// - `a_dim`: Adaptation LoRA rank
+    /// - `g_dim`: Gate LoRA rank
+    /// - `v_dim`: Value residual LoRA rank (Some for layers > 0, None if absent)
+    pub fn lora_dims(&self) -> LoraDims {
+        let layer = &self.layers[0];
+        LoraDims {
+            w_dim: layer.att.w1.shape().dim(0),
+            a_dim: layer.att.a1.shape().dim(0),
+            g_dim: layer.att.g1.shape().dim(0),
+            // v1/v2 are only present on layers > 0, check layer 1 if it exists
+            v_dim: if self.layers.len() > 1 {
+                self.layers[1].att.v1.as_ref().map(|v| v.shape().dim(0))
+            } else {
+                None
+            },
+        }
     }
 
     /// Get a reference to a specific weight tensor by name (for spot-checking).
@@ -329,31 +353,101 @@ impl Rwkv7Hip {
     pub fn get_embedding(&self) -> &[f16] {
         &self.embed.w
     }
+}
 
-    /// Extract LoRA dimensions from the model weights.
+impl Rwkv7Hip {
+    /// Load an RWKV7 model from a SafeTensors file.
     ///
-    /// These dimensions are needed to allocate scratch buffers for the forward pass.
-    /// LoRA dimensions are consistent across layers, so we read them from layer 0.
+    /// Weights are loaded into managed (unified) memory for efficient APU access.
+    /// Weights are stored as FP16; WKV state remains FP32.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the .st (SafeTensors) file
     ///
     /// # Returns
-    /// `LoraDims` struct containing:
-    /// - `w_dim`: Decay LoRA rank
-    /// - `a_dim`: Adaptation LoRA rank
-    /// - `g_dim`: Gate LoRA rank
-    /// - `v_dim`: Value residual LoRA rank (Some for layers > 0, None if absent)
-    pub fn lora_dims(&self) -> LoraDims {
-        let layer = &self.layers[0];
-        LoraDims {
-            w_dim: layer.att.w1.shape().dim(0),
-            a_dim: layer.att.a1.shape().dim(0),
-            g_dim: layer.att.g1.shape().dim(0),
-            // v1/v2 are only present on layers > 0, check layer 1 if it exists
-            v_dim: if self.layers.len() > 1 {
-                self.layers[1].att.v1.as_ref().map(|v| v.shape().dim(0))
-            } else {
-                None
-            },
+    /// The loaded model with all weights in HIP memory, or an error.
+    pub fn load<P: AsRef<Path>>(path: P) -> std::result::Result<Self, ModelLoadError> {
+        let model = Rwkv7Model::load(path)?;
+        Ok(Self {
+            model,
+            scratch: Mutex::new(None),
+            #[cfg(feature = "hip-probes")]
+            probes: None,
+        })
+    }
+
+    /// Create an Rwkv7Hip from a pre-loaded Arc<Rwkv7Model>.
+    ///
+    /// Useful when sharing model weights across multiple inference modules.
+    pub fn from_model(model: Arc<Rwkv7Model>) -> Self {
+        Self {
+            model,
+            scratch: Mutex::new(None),
+            #[cfg(feature = "hip-probes")]
+            probes: None,
         }
+    }
+
+    /// Get a clone of the shared model Arc.
+    ///
+    /// Use this to share model weights with other inference modules
+    /// (e.g., HipPrefill, HipDecode).
+    pub fn model(&self) -> Arc<Rwkv7Model> {
+        self.model.clone()
+    }
+
+    /// Access model info (dimensions, vocab size, etc.).
+    ///
+    /// Convenience accessor that delegates to `self.model.info`.
+    pub fn info(&self) -> &Rwkv7ModelInfo {
+        &self.model.info
+    }
+
+    /// Attach probes for capturing intermediate values.
+    ///
+    /// Only available with `hip-probes` feature. Probes are called at each hook point
+    /// during forward pass, receiving the tensor data and context information.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use web_rwkv::hip::{HipHook, HipProbeBuilder};
+    ///
+    /// let probes = HipProbeBuilder::new()
+    ///     .on(HipHook::PostAttLayerNorm, |data, ctx| {
+    ///         println!("Layer {:?}: PostAttLayerNorm shape {:?}", ctx.layer, ctx.shape);
+    ///     })
+    ///     .build();
+    ///
+    /// let model = Rwkv7Hip::load("model.st")?.with_probes(probes);
+    /// ```
+    #[cfg(feature = "hip-probes")]
+    pub fn with_probes(mut self, probes: HipProbeMap) -> Self {
+        self.probes = Some(std::sync::Arc::new(probes));
+        self
+    }
+
+    /// Delegate to `Rwkv7Model::get_weight()`.
+    pub fn get_weight(&self, name: &str) -> Option<&TensorHip<f16>> {
+        self.model.get_weight(name)
+    }
+
+    /// Delegate to `Rwkv7Model::read_weight_head()`.
+    pub fn read_weight_head(
+        &self,
+        name: &str,
+        n: usize,
+    ) -> std::result::Result<Vec<f32>, ModelLoadError> {
+        self.model.read_weight_head(name, n)
+    }
+
+    /// Delegate to `Rwkv7Model::get_embedding()`.
+    pub fn get_embedding(&self) -> &[f16] {
+        self.model.get_embedding()
+    }
+
+    /// Delegate to `Rwkv7Model::lora_dims()`.
+    pub fn lora_dims(&self) -> LoraDims {
+        self.model.lora_dims()
     }
 
     /// Configure the model with fixed scratch buffers.
@@ -370,8 +464,8 @@ impl Rwkv7Hip {
     /// let model = Rwkv7Hip::load("model.st")?.with_config(config)?;
     /// ```
     pub fn with_config(self, config: HipRuntimeConfig) -> Result<Self> {
-        let lora_dims = self.lora_dims();
-        let scratch = HipScratch::new(&self.info, lora_dims, config)?;
+        let lora_dims = self.model.lora_dims();
+        let scratch = HipScratch::new(&self.model.info, lora_dims, config)?;
         *self.scratch.lock().unwrap() = Some(scratch);
         Ok(self)
     }
@@ -462,6 +556,7 @@ impl Rwkv7Hip {
             att_shift_states,
             ffn_states,
             v_first: None,
+            layout: state::StateLayout::Decode,
         })
     }
 

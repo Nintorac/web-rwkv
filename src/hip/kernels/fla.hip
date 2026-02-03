@@ -1227,4 +1227,104 @@ hipError_t launch_fla_neg_exp_f16_to_f32(
     return hipGetLastError();
 }
 
+// ============================================================================
+// State transpose kernel (kernel_state_transpose)
+//
+// Transposes each 64x64 WKV state block between FLA layout [K_row, V_col]
+// and decode layout [V_row, K_col], or vice versa.
+//
+// Out-of-place: reads from src, writes to dst.
+//
+// State layout: [K, K, H, B] where each (h, b) pair has one K×K matrix.
+// FLA stores state[k * K + v] (K-rows, V-cols).
+// Decode reads state[v * K + k] (V-rows, K-cols).
+// Transposing converts between these two layouts.
+//
+// One block handles one K×K matrix (one head of one batch item).
+// Block dim: dim3(64, 16) = 1024 threads.
+// Thread (tx, ty) handles column tx, rows ty*4 .. ty*4+3 (4 elements each).
+//
+// Uses shared memory with +1 padding on the inner dimension to avoid bank
+// conflicts during the transposed write-back.
+//
+// Grid:  dim3(num_heads * batch_size, 1, 1)
+// Block: dim3(64, 16, 1)
+// ============================================================================
+
+__global__ __launch_bounds__(1024, 1)
+void kernel_state_transpose(
+    const float* __restrict__ src,   // [K, K, H, B] source state
+    float* __restrict__ dst,         // [K, K, H, B] destination state (transposed)
+    int K,                           // matrix dimension (64)
+    int num_heads,                   // H
+    int batch_size                   // B
+) {
+    // Each block handles one K×K matrix for a specific (head, batch) pair.
+    const int mat_idx = blockIdx.x;  // 0 .. H*B - 1
+    if (mat_idx >= num_heads * batch_size) return;
+
+    const int tx = threadIdx.x;  // column index (0..K-1)
+    const int ty = threadIdx.y;  // row group index (0..15)
+
+    // Base offset for this matrix in the flattened [K, K, H, B] array.
+    // Each matrix has K*K elements, matrices are packed as (h, b) pairs:
+    //   matrix (h, b) starts at offset (h + b * H) * K * K
+    const int mat_offset = mat_idx * K * K;
+
+    // Shared memory with +1 padding for bank conflict avoidance.
+    // smem[row][col+1_padding] — 64 × 65 floats = 16.25 KB.
+    __shared__ float smem[64][65];
+
+    // Step 1: Load src into shared memory (coalesced reads).
+    // src[row * K + col] for this matrix → smem[row][col]
+    // Each thread handles 4 rows: ty*4 .. ty*4+3
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        const int row = ty * 4 + r;
+        if (row < K && tx < K) {
+            smem[row][tx] = src[mat_offset + row * K + tx];
+        }
+    }
+
+    __syncthreads();
+
+    // Step 2: Write transposed from shared memory to dst (coalesced writes).
+    // dst[col * K + row] = smem[row][col]
+    // Equivalently: dst[tx * K + row] = smem[row][tx]
+    // But for coalesced writes, we want threads in a warp to write consecutive addresses.
+    // Thread (tx, ty) writes dst[row * K + tx] = smem[tx][row] (transposed read from smem).
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        const int row = ty * 4 + r;
+        if (row < K && tx < K) {
+            dst[mat_offset + row * K + tx] = smem[tx][row];
+        }
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for kernel_state_transpose
+// ============================================================================
+
+hipError_t launch_state_transpose(
+    const float* src,
+    float* dst,
+    int K,
+    int num_heads,
+    int batch_size,
+    hipStream_t stream
+) {
+    if (K <= 0 || num_heads <= 0 || batch_size <= 0) {
+        return hipSuccess;
+    }
+
+    dim3 grid(num_heads * batch_size, 1, 1);
+    dim3 block(64, 16, 1);
+
+    hipLaunchKernelGGL(kernel_state_transpose, grid, block, 0, stream,
+                       src, dst, K, num_heads, batch_size);
+
+    return hipGetLastError();
+}
+
 } // extern "C"

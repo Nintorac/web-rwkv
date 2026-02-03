@@ -8,6 +8,24 @@ use crate::hip::ffi::{check, hip_memcpy_d2h, hip_memcpy_h2d, HipErrorKind, Resul
 use crate::hip::pinned::PinnedBuffer;
 use crate::hip::tensor::TensorHip;
 
+/// Layout tag for WKV state matrices.
+///
+/// FLA (prefill) stores WKV state as `state[k * K + v]` (K-rows, V-cols).
+/// FusedT1Wkv (decode) reads `state[v * K + k]` (V-rows, K-cols).
+///
+/// When transferring state between prefill and decode modules, the WKV state
+/// must be transposed if the layouts differ. The `layout` field on [`HipState`]
+/// tracks which layout the state is currently in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateLayout {
+    /// FLA layout: `state[k * K + v]` — K-rows, V-cols.
+    /// Used by the chunked FLA prefill kernel.
+    Fla,
+    /// Decode layout: `state[v * K + k]` — V-rows, K-cols.
+    /// Used by the FusedT1Wkv single-token decode kernel.
+    Decode,
+}
+
 /// State for HIP RWKV7 batched inference.
 ///
 /// Holds the recurrent state needed to continue inference from a previous position.
@@ -48,6 +66,12 @@ pub struct HipState {
     /// Value residual from first layer for RWKV7, persisted across chunks: [n_embd * batch]
     /// Stored in pinned memory for fast GPU transfers.
     pub v_first: Option<PinnedBuffer<f16>>,
+    /// Layout of the WKV state matrices.
+    ///
+    /// Tracks whether `att_states` is in FLA layout (K-rows, V-cols) or
+    /// decode layout (V-rows, K-cols). Used by `load_state()` to determine
+    /// whether a transpose is needed.
+    pub layout: StateLayout,
 }
 
 impl HipState {
@@ -90,6 +114,7 @@ impl HipState {
             att_shift_states,
             ffn_states,
             v_first: None,
+            layout: StateLayout::Decode,
         })
     }
 
@@ -105,6 +130,7 @@ impl HipState {
             state.as_slice_mut().fill(f16::from_f32(0.0));
         }
         self.v_first = None;
+        self.layout = StateLayout::Decode;
     }
 
     // ========== Per-batch GPU state read/write ==========

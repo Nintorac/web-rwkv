@@ -13,7 +13,8 @@ use half::f16;
 use crate::hip::device::Stream;
 use crate::hip::ffi::{
     check, launch_fla_chunk_h, launch_fla_chunk_o, launch_fla_cumsum,
-    launch_fla_neg_exp_f16_to_f32, launch_fla_intra, launch_fla_wy_repr, HipErrorKind, Result,
+    launch_fla_neg_exp_f16_to_f32, launch_fla_intra, launch_fla_wy_repr,
+    launch_state_transpose, HipErrorKind, Result,
 };
 use crate::hip::tensor::TensorHip;
 
@@ -962,5 +963,215 @@ pub fn fla_neg_exp_f16_to_f32(
             n as c_int,
             stream.handle(),
         ))
+    }
+}
+
+/// Transpose each K x K WKV state matrix (out-of-place).
+///
+/// Converts WKV state between FLA layout `[K_row, V_col]` and decode layout
+/// `[V_row, K_col]`. The operation is its own inverse: applying it twice
+/// returns the original data (round-trip identity).
+///
+/// State tensor shape: `[K, K, H, B]` where K is the head size (64),
+/// H is the number of heads, and B is the batch size.
+///
+/// One GPU block handles one K x K matrix (one head of one batch item),
+/// using shared memory with +1 padding for bank conflict avoidance.
+///
+/// # Arguments
+/// * `src` - Source state tensor, shape `[K, K, H, B]` (f32)
+/// * `dst` - Destination state tensor (transposed), shape `[K, K, H, B]` (f32)
+/// * `num_heads` - Number of attention heads (H)
+/// * `batch_size` - Batch size (B)
+/// * `stream` - HIP stream for async execution
+///
+/// # Errors
+/// Returns error on shape mismatches, non-contiguity, or kernel launch failure.
+pub fn state_transpose(
+    src: &TensorHip<f32>,
+    dst: &mut TensorHip<f32>,
+    num_heads: usize,
+    batch_size: usize,
+    stream: &Stream,
+) -> Result<()> {
+    // Extract K from shape. State is [K, K, H, B], so shape[0] == K.
+    let k = src.shape()[0];
+
+    // Validate shapes match
+    if src.shape() != dst.shape() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_transpose: shape mismatch: src={}, dst={}",
+                src.shape(),
+                dst.shape()
+            ),
+        });
+    }
+
+    // Validate expected total size: K * K * H * B
+    let expected_len = k * k * num_heads * batch_size;
+    if src.len() < expected_len {
+        return Err(HipErrorKind {
+            code: -1,
+            message: format!(
+                "state_transpose: src too small: need {} elements (K={}, H={}, B={}), got {}",
+                expected_len, k, num_heads, batch_size, src.len()
+            ),
+        });
+    }
+
+    // Validate contiguity
+    if !src.is_contiguous() || !dst.is_contiguous() {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "state_transpose: both tensors must be contiguous".to_string(),
+        });
+    }
+
+    // Validate that src and dst do not alias (out-of-place only)
+    if src.as_ptr() == dst.as_ptr() as *const f32 {
+        return Err(HipErrorKind {
+            code: -1,
+            message: "state_transpose: src and dst must not alias (out-of-place only)".to_string(),
+        });
+    }
+
+    if num_heads == 0 || batch_size == 0 || k == 0 {
+        return Ok(());
+    }
+
+    unsafe {
+        check(launch_state_transpose(
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+            k as c_int,
+            num_heads as c_int,
+            batch_size as c_int,
+            stream.handle(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hip::device::Stream;
+    use crate::hip::tensor::TensorShape;
+
+    /// Round-trip transpose test: transpose(transpose(X)) == X.
+    ///
+    /// Creates a state tensor with known values, transposes it into a second buffer,
+    /// transposes back into a third buffer, and verifies exact equality with the
+    /// original. This validates:
+    /// 1. The kernel correctly transposes each K x K block.
+    /// 2. The transpose is its own inverse (round-trip identity).
+    /// 3. Multiple heads and batch items are handled independently.
+    #[test]
+    fn test_state_transpose_round_trip() {
+        let stream = Stream::null();
+
+        let k = 64_usize; // head_size
+        let h = 4_usize; // num_heads (small for fast test)
+        let b = 2_usize; // batch_size
+
+        let total = k * k * h * b;
+        let shape = TensorShape::new(k, k, h, b);
+
+        // Fill source with distinct values: index-based pattern so any corruption is obvious.
+        let src_data: Vec<f32> = (0..total)
+            .map(|i| (i as f32) * 0.001 + 1.0)
+            .collect();
+
+        let src_tensor = TensorHip::from_slice(&src_data, shape, &stream)
+            .expect("Failed to create src tensor");
+
+        // Allocate destination buffers for two transposes
+        let mut mid_tensor = TensorHip::<f32>::zeros(shape)
+            .expect("Failed to create mid tensor");
+        let mut dst_tensor = TensorHip::<f32>::zeros(shape)
+            .expect("Failed to create dst tensor");
+
+        // First transpose: src -> mid
+        state_transpose(&src_tensor, &mut mid_tensor, h, b, &stream)
+            .expect("First transpose failed");
+
+        // Second transpose: mid -> dst (should recover original)
+        state_transpose(&mid_tensor, &mut dst_tensor, h, b, &stream)
+            .expect("Second transpose failed");
+
+        // Read back results
+        stream.synchronize().expect("Stream sync failed");
+        let result = dst_tensor.to_vec(&stream).expect("Failed to read dst tensor");
+
+        // Verify exact equality (transpose of transpose should be bitwise identical)
+        assert_eq!(
+            result.len(),
+            src_data.len(),
+            "Result length mismatch"
+        );
+        for (i, (&expected, &actual)) in src_data.iter().zip(result.iter()).enumerate() {
+            assert_eq!(
+                expected, actual,
+                "Mismatch at index {}: expected {}, got {} (mat={}, row={}, col={})",
+                i,
+                expected,
+                actual,
+                i / (k * k),
+                (i % (k * k)) / k,
+                i % k
+            );
+        }
+    }
+
+    /// Verify that a single transpose actually changes the data (not a no-op).
+    ///
+    /// Uses a non-symmetric matrix so the transpose is visibly different from the
+    /// original. Then verifies the transposed values are correct by checking
+    /// specific elements.
+    #[test]
+    fn test_state_transpose_correctness() {
+        let stream = Stream::null();
+
+        let k = 64_usize;
+        let h = 1_usize;
+        let b = 1_usize;
+
+        let total = k * k * h * b;
+        let shape = TensorShape::new(k, k, h, b);
+
+        // Build a non-symmetric matrix: src[row][col] = row * 100 + col
+        // After transpose: dst[row][col] = src[col][row] = col * 100 + row
+        let mut src_data = vec![0.0f32; total];
+        for row in 0..k {
+            for col in 0..k {
+                src_data[row * k + col] = (row * 100 + col) as f32;
+            }
+        }
+
+        let src_tensor = TensorHip::from_slice(&src_data, shape, &stream)
+            .expect("Failed to create src tensor");
+
+        let mut dst_tensor = TensorHip::<f32>::zeros(shape)
+            .expect("Failed to create dst tensor");
+
+        state_transpose(&src_tensor, &mut dst_tensor, h, b, &stream)
+            .expect("Transpose failed");
+
+        stream.synchronize().expect("Stream sync failed");
+        let result = dst_tensor.to_vec(&stream).expect("Failed to read result");
+
+        // Verify: dst[row][col] should equal src[col][row]
+        for row in 0..k {
+            for col in 0..k {
+                let expected = (col * 100 + row) as f32; // src[col][row]
+                let actual = result[row * k + col];
+                assert_eq!(
+                    expected, actual,
+                    "Transpose wrong at ({}, {}): expected {}, got {}",
+                    row, col, expected, actual
+                );
+            }
+        }
     }
 }

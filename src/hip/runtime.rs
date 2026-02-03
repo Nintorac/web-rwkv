@@ -108,7 +108,7 @@ impl HipRuntime {
 
     /// Get model info.
     pub fn info(&self) -> &Rwkv7ModelInfo {
-        &self.model.info
+        self.model.info()
     }
 
     /// Get configured batch size.
@@ -158,7 +158,7 @@ impl HipRuntime {
         // Convert to TensorCpu
         // Output is flattened: [batch_0_tokens..., batch_1_tokens..., ...]
         // Each token has vocab_size logits
-        let vocab_size = self.model.info.n_vocab;
+        let vocab_size = self.model.info().n_vocab;
         let total_tokens: usize = sequences.iter().map(|s| s.len()).sum();
         let shape = crate::tensor::shape::Shape::new(vocab_size, total_tokens, 1, 1);
 
@@ -215,7 +215,7 @@ impl HipRuntime {
     /// # Returns
     /// Vec of logit slices, one per sequence (each of length vocab_size)
     pub fn extract_last_logits(&self, logits: &TensorCpu<f32>, lengths: &[usize]) -> Vec<Vec<f32>> {
-        let vocab_size = self.model.info.n_vocab;
+        let vocab_size = self.model.info().n_vocab;
         let data = logits.data();
 
         let mut results = Vec::with_capacity(lengths.len());
@@ -245,7 +245,7 @@ impl HipRuntime {
     /// Vec of logit vectors, one per sequence. Each inner vec has length
     /// `seq_len * vocab_size` containing logits for all tokens in that sequence.
     pub fn extract_all_logits(&self, logits: &TensorCpu<f32>, lengths: &[usize]) -> Vec<Vec<f32>> {
-        let vocab_size = self.model.info.n_vocab;
+        let vocab_size = self.model.info().n_vocab;
         let data = logits.data();
 
         let mut results = Vec::with_capacity(lengths.len());
@@ -272,7 +272,7 @@ impl HipRuntime {
         logits: &TensorCpu<f32>,
         redirect: &RnnRedirect,
     ) -> Result<RnnOutput, RuntimeError> {
-        let vocab_size = self.model.info.n_vocab;
+        let vocab_size = self.model.info().n_vocab;
         let data = logits.data();
 
         let mut outputs = Vec::with_capacity(redirect.outputs.len());
@@ -388,8 +388,8 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
-        let n_embd = model.info.n_embd;
+        let vocab_size = model.info().n_vocab;
+        let n_embd = model.info().n_embd;
 
         let runtime = HipRuntime::new(model, 4);
 
@@ -517,7 +517,7 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
+        let vocab_size = model.info().n_vocab;
         let runtime = HipRuntime::new(model, 1);
 
         // Run inference on a simple sequence
@@ -627,7 +627,7 @@ mod tests {
 
         // === HIP Backend ===
         let hip_model = Rwkv7Hip::load(model_path).expect("Failed to load HIP model");
-        let vocab_size = hip_model.info.n_vocab;
+        let vocab_size = hip_model.info().n_vocab;
         let hip_runtime = HipRuntime::new(hip_model, 1);
 
         let tokens: Vec<u32> = vec![1, 2, 3, 4];
@@ -944,7 +944,7 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
+        let vocab_size = model.info().n_vocab;
         let runtime = HipRuntime::new(model, 2);
 
         // Create mock logits in new format: [vocab_size, total_tokens, 1, 1]
@@ -995,7 +995,7 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
+        let vocab_size = model.info().n_vocab;
         let runtime = HipRuntime::new(model, 2);
 
         // New format: all batch 0 tokens, then all batch 1 tokens (no padding)
@@ -1131,7 +1131,7 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
+        let vocab_size = model.info().n_vocab;
         let runtime = HipRuntime::new(model, 1);
 
         // Create input with single sequence, RnnOption::Last
@@ -1170,7 +1170,7 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
+        let vocab_size = model.info().n_vocab;
         let runtime = HipRuntime::new(model, 2);
 
         // Create input with two sequences, different lengths and options
@@ -1216,7 +1216,7 @@ mod tests {
         }
 
         let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info.n_vocab;
+        let vocab_size = model.info().n_vocab;
         let runtime = HipRuntime::new(model, 2);
 
         // Create input with one non-empty and one empty sequence

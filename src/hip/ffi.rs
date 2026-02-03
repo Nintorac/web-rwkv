@@ -762,6 +762,18 @@ extern "C" {
         stream: HipStream,
     ) -> HipError;
 
+    /// State transpose: transposes each K×K WKV state matrix (out-of-place).
+    /// Converts between FLA layout [K_row, V_col] and decode layout [V_row, K_col].
+    /// One block per (head, batch) matrix, dim3(64, 16) = 1024 threads.
+    pub fn launch_state_transpose(
+        src: *const f32,
+        dst: *mut f32,
+        k: c_int,
+        num_heads: c_int,
+        batch_size: c_int,
+        stream: HipStream,
+    ) -> HipError;
+
     /// Stage 5: Output combination.
     /// Combines intra-chunk attention with inter-chunk state contributions:
     ///   o = qg @ h + A_qk @ v + A_qb @ v_new
