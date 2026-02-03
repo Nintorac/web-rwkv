@@ -653,11 +653,11 @@ fn test_fla_ground_truth_t2_chunked() {
         .with_config(rt_config)
         .expect("Failed to configure model");
 
-    let n_layer = model.info.n_layer;
+    let n_layer = model.info().n_layer;
 
     println!(
         "Model: n_layer={}, n_embd={}, n_head={}, head_size={}",
-        n_layer, model.info.n_embd, model.info.n_head, model.info.head_size
+        n_layer, model.info().n_embd, model.info().n_head, model.info().head_size
     );
     println!();
 

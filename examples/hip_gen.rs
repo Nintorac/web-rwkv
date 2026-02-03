@@ -273,7 +273,7 @@ fn main() {
     let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
     println!(
         "Model loaded: {} layers, {} embed, {} vocab",
-        model.info.n_layer, model.info.n_embd, model.info.n_vocab
+        model.info().n_layer, model.info().n_embd, model.info().n_vocab
     );
 
     // Create runtime with batch_size=1 for single-sequence examples

@@ -68,7 +68,7 @@ fn test_probe_captures_intermediates() {
         .with_config(config)
         .expect("Failed to configure model");
 
-    let n_layer = model.info.n_layer;
+    let n_layer = model.info().n_layer;
 
     // Run step
     let (_logits, _state) = model.step(&[&[0, 1, 2]], None).expect("Step failed");
@@ -171,7 +171,7 @@ fn test_probe_context() {
     let contexts = contexts.lock().unwrap();
 
     // Should have one context per layer
-    assert_eq!(contexts.len(), model.info.n_layer);
+    assert_eq!(contexts.len(), model.info().n_layer);
 
     // Check first layer context
     let (hook, layer, batch_size, seq_len, shape) = &contexts[0];
@@ -179,7 +179,7 @@ fn test_probe_context() {
     assert_eq!(*layer, Some(0));
     assert_eq!(*batch_size, 2);
     assert_eq!(*seq_len, 4);
-    assert_eq!(shape, &[model.info.n_embd, 4, 2]); // [C, T, B]
+    assert_eq!(shape, &[model.info().n_embd, 4, 2]); // [C, T, B]
 
     println!("Context test passed - captured {} contexts", contexts.len());
 }
@@ -215,7 +215,7 @@ fn test_probe_with_masked_step() {
         .with_config(config)
         .expect("Failed to configure model");
 
-    let n_layer = model.info.n_layer;
+    let n_layer = model.info().n_layer;
 
     // Use step with variable lengths (new API handles this automatically)
     let seq1 = vec![0u32, 1, 2]; // length 3

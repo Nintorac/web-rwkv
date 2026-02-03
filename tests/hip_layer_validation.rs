@@ -370,7 +370,7 @@ fn test_hip_layer_by_layer_step0() {
         .with_config(config)
         .expect("Failed to configure model");
 
-    let n_layer = model.info.n_layer;
+    let n_layer = model.info().n_layer;
 
     // Run step
     let (_logits, _state) = model
@@ -561,7 +561,7 @@ fn test_probe_coverage() {
         .with_config(config)
         .expect("Failed to configure model");
 
-    let n_layer = model.info.n_layer;
+    let n_layer = model.info().n_layer;
 
     // Run step
     let (_logits, _state) = model.step(&[&[0]], None).expect("Step failed");

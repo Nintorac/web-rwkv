@@ -58,7 +58,7 @@ async fn profile_decode(batch_size: usize, decode_steps: usize) -> Result<()> {
 
     // Load model
     let model = Rwkv7Hip::load(MODEL_PATH)?;
-    let info = &model.info;
+    let info = model.info();
 
     eprintln!("Model: {} v7", MODEL_PATH);
     eprintln!(

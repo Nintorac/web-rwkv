@@ -169,7 +169,7 @@ impl UnifiedRuntime {
     #[cfg(feature = "hip")]
     fn new_hip(model_path: &std::path::Path, batch_size: usize) -> Result<Self> {
         let model = Rwkv7Hip::load(model_path.to_str().unwrap())?;
-        let vocab_size = model.info.n_vocab;
+        let vocab_size = model.info().n_vocab;
         let runtime = HipRuntime::new(model, batch_size);
         Ok(Self {
             runtime: BackendRuntime::Hip(runtime),
