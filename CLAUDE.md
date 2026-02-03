@@ -119,7 +119,11 @@ When working on tickets, follow this process:
 5. **Comment on divergences**: If the implementation diverges from the plan or ticket description (e.g., different approach needed, unexpected dependency, extra work required), add a comment explaining why: `br comments add <id> "Diverged from plan: <reason>"`
 6. **Verify acceptance criteria**: Ensure ALL acceptance criteria in the ticket are met
 7. **Commit the changes**: Create a git commit with the ticket ID in the message (e.g., `(bd-2sh.2.1)`)
-8. **Close with a summary comment**: Add a comment summarizing what was done, then close:
+8. **Commit ticket updates**: After any `br` commands that modify ticket state (close, comment, update), commit `.beads/issues.jsonl` to keep the tracker in sync:
+   ```bash
+   git add .beads/issues.jsonl && git commit -m "Update beads"
+   ```
+9. **Close with a summary comment**: Add a comment summarizing what was done, then close:
    ```bash
    br comments add <id> "Summary of changes and any notes for downstream tickets"
    br close <id> --suggest-next
@@ -245,6 +249,102 @@ uv pip install -r requirements.txt
 python3 scripts/foo.py
 ```
 
+## Backward Compatibility
+
+Do NOT maintain backward compatibility unless explicitly requested. Delete old APIs, remove deprecated wrappers, and clean up dead code. Don't keep old code paths "just in case."
+
+## Parallel Ticket Work with Git Worktrees
+
+When an orchestrator agent farms out multiple tickets to sub-agents in parallel, each agent **MUST** work in its own git worktree to avoid stepping on each other's changes. This prevents:
+- One agent committing another agent's uncommitted changes
+- Test runs picking up partial changes from a sibling agent
+- Merge conflicts from concurrent edits to the same file
+
+### Orchestrator responsibilities
+
+The orchestrator (parent agent) manages the worktree lifecycle:
+
+```bash
+# Before launching parallel agents, create worktrees from the current branch:
+git worktree add /tmp/worktree-bd-TICKET_A hip   # or whatever the current branch is
+git worktree add /tmp/worktree-bd-TICKET_B hip
+
+# After agents complete, rebase their commits onto the main branch:
+# (orchestrator reviews, resolves conflicts, and integrates)
+```
+
+### Agent instructions (include in agent prompts)
+
+Tell each agent:
+
+1. **Work in your assigned worktree** — all file reads, writes, and git operations happen in the worktree directory (e.g., `/tmp/worktree-bd-TICKET_A/`), NOT in `/workspace/web-rwkv/`.
+2. **Create a feature branch** from the worktree:
+   ```bash
+   cd /tmp/worktree-bd-TICKET_A
+   git checkout -b ticket/bd-TICKET_A
+   ```
+3. **Commit only your own changes** — since the worktree starts clean, `git add .` is safe.
+4. **Run `cargo check` / tests from the worktree directory** so you only see your own changes.
+5. **Do NOT touch `/workspace/web-rwkv/`** — that is the orchestrator's workspace.
+
+### After agents complete
+
+The orchestrator rebases branches back (keep linear history, no merge commits):
+
+```bash
+# From the main workspace:
+cd /workspace/web-rwkv
+git cherry-pick <commit-hash>   # cherry-pick each agent's commit(s) onto hip
+
+# Clean up worktrees:
+git worktree remove /tmp/worktree-bd-TICKET_A
+git worktree remove /tmp/worktree-bd-TICKET_B
+```
+
+**IMPORTANT: Use rebase/cherry-pick, NOT merge.** We maintain linear history — no merge commits.
+
+If there are conflicts, the orchestrator resolves them before proceeding to dependent tickets.
+
+### When worktrees are NOT needed
+
+- Sequential ticket work (one at a time) — just work in `/workspace/web-rwkv/` directly
+- Tickets that touch completely disjoint files with no shared dependencies — still preferred to use worktrees for safety
+
+## Code Refactoring: Extract, Don't Rewrite
+
+When refactoring — moving code between files, extracting helper functions, or splitting modules — **never rewrite large blocks of code from scratch**. Instead:
+
+1. **Use `sed` to extract exact line ranges** from the source file:
+   ```bash
+   # Extract lines 100-200 from step.rs to see the code block
+   sed -n '100,200p' src/hip/model/step.rs
+   ```
+
+2. **Copy the extracted code** into the new file using the Write/Edit tools, preserving the original logic character-for-character.
+
+3. **Add function signatures and parameter lists** around the extracted blocks — this is the only new code you write.
+
+4. **Replace the original code** in the source file with calls to the new helpers using the Edit tool.
+
+Why this matters:
+- Rewriting 800 lines from memory introduces subtle transcription errors
+- Extracting preserves exact logic, operator precedence, and edge cases
+- It's faster, cheaper, and more reliable
+- Reviewers can verify the refactor is behavior-preserving
+
+**Anti-pattern** (do NOT do this):
+```
+Read step.rs, understand the logic, then write dispatch_helpers.rs from scratch
+with your understanding of what the code does.
+```
+
+**Correct pattern**:
+```
+sed -n '150,220p' src/hip/model/step.rs > extracted block
+Wrap extracted block in fn attention_block(...) { ... }
+Edit step.rs to replace lines 150-220 with: attention_block(args)
+```
+
 ## Platform Assumptions
 
 Never assume what tools, hardware, SDKs, or runtime features are available. Always investigate the actual system capabilities before planning or writing code. Check installed toolchains, device properties, available APIs, and supported features rather than guessing based on prior knowledge.
@@ -254,6 +354,8 @@ Never assume what tools, hardware, SDKs, or runtime features are available. Alwa
 When context is compacted, preserve:
 - The `br` issue tracker workflow (ready, show, claim, close)
 - **Ticket closure requirements** (commit before close, verify acceptance criteria)
+- **Parallel work requires git worktrees** — one worktree per agent, cherry-pick/rebase back (no merge commits, linear history)
+- **Refactoring = extract, don't rewrite** — use sed to extract code, not retype from memory
 - Current branch context and recent commits
 - References to plan documents (e.g., `docs/RWKV7_HIP_BACKEND_PLAN.md`)
 - Architectural decisions (e.g., column-major GEMM, tolerance specifications)
