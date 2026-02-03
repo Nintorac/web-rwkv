@@ -1,11 +1,19 @@
 //! HIP runtime implementation for RWKV7.
 //!
-//! This module provides `HipRuntime`, which wraps `Rwkv7Hip` and manages
-//! state with thread-safe access for integration with the web-rwkv runtime interface.
+//! This module provides `HipRuntime`, which coordinates `HipPrefill` and
+//! `HipDecode` for inference, dispatching based on sequence length:
+//! - T > 1: FLA chunked prefill via `HipPrefill`
+//! - T = 1: Fused single-token decode via `HipDecode`
+//!
+//! State is automatically transferred from prefill to decode on the first
+//! decode call after a prefill pass.
+
+use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 
-use super::scratch::HipRuntimeConfig;
+use super::model::{HipDecode, HipPrefill, Rwkv7Model};
+use super::scratch::{DecodeConfig, HipRuntimeConfig, PrefillConfig};
 use super::{HipState, Rwkv7Hip, Rwkv7ModelInfo};
 use crate::runtime::{
     infer::{Rnn, RnnInput, RnnOutput, RnnOutputBatch, RnnRedirect, Token},
@@ -55,14 +63,46 @@ pub fn softmax_one_cpu(input: TensorCpu<f32>) -> Result<TensorCpu<f32>, TensorEr
     TensorInit::from_data(shape, output)
 }
 
+/// Mutable state for HipRuntime, protected by a Mutex for thread-safe `&self` access.
+struct HipRuntimeInner {
+    /// FLA chunked prefill module (T>1).
+    prefill: HipPrefill,
+    /// FusedT1Wkv decode module (T=1).
+    decode: HipDecode,
+    /// Whether the next decode call needs a state transfer from prefill.
+    needs_state_transfer: bool,
+}
+
 /// HIP-based runtime for RWKV7 inference.
 ///
-/// Wraps a loaded `Rwkv7Hip` model and manages state with thread-safe access.
-/// This struct will implement `Runtime<Rnn>` to integrate with the web-rwkv
-/// runtime interface.
+/// Coordinates `HipPrefill` (FLA chunked prefill for T>1) and `HipDecode`
+/// (FusedT1Wkv for T=1) to provide a unified inference API. State is
+/// automatically transferred from prefill to decode on the first decode
+/// call after a prefill pass.
+///
+/// # Architecture
+///
+/// ```text
+/// HipRuntime
+///   ├── Arc<Rwkv7Model>    (shared weights, for info access)
+///   ├── HipPrefill         (FLA chunked prefill, T>1)
+///   ├── HipDecode          (FusedT1Wkv decode, T=1)
+///   └── needs_state_transfer: bool
+/// ```
+///
+/// # Dispatch Rules
+///
+/// - If **all** sequences have length 1 (T=1): uses `HipDecode`
+/// - Otherwise (any sequence has T>1): uses `HipPrefill`
+/// - On first decode after prefill: `get_state()` from prefill, `load_state()` into decode
 pub struct HipRuntime {
-    model: Rwkv7Hip,
+    /// Shared model weights (for info access).
+    model: Arc<Rwkv7Model>,
+    /// Mutable inference state (prefill, decode, state transfer flag).
+    inner: Mutex<HipRuntimeInner>,
+    /// Configured batch size.
     num_batch: usize,
+    /// Configured chunk size for prefill.
     chunk_size: usize,
 }
 
@@ -70,14 +110,14 @@ impl HipRuntime {
     /// Create a new HipRuntime with specified configuration.
     ///
     /// # Arguments
-    /// * `model` - Loaded RWKV7 HIP model
+    /// * `model` - Loaded RWKV7 HIP model (used to extract shared weights)
     /// * `config` - Runtime configuration (chunk size and batch size)
     ///
     /// # Example
     /// ```ignore
     /// let model = Rwkv7Hip::load("model.st")?;
     /// let config = HipRuntimeConfig::new(256, 4);  // chunk_size=256, batch=4
-    /// let runtime = HipRuntime::new(model, config)?;
+    /// let runtime = HipRuntime::with_config(model, config)?;
     /// ```
     pub fn with_config(
         model: Rwkv7Hip,
@@ -85,9 +125,27 @@ impl HipRuntime {
     ) -> Result<Self, super::HipErrorKind> {
         let num_batch = config.batch_size;
         let chunk_size = config.max_prefill_chunk;
-        let model = model.with_config(config)?;
+        let shared_model = model.model();
+
+        // Create prefill module with the full config
+        let prefill_config = PrefillConfig {
+            max_prefill_chunk: config.max_prefill_chunk,
+            batch_size: config.batch_size,
+            fla_chunk_size: config.fla_chunk_size,
+        };
+        let prefill = HipPrefill::new(shared_model.clone(), prefill_config)?;
+
+        // Create decode module with matching batch size
+        let decode_config = DecodeConfig::new(config.batch_size);
+        let decode = HipDecode::new(shared_model.clone(), decode_config)?;
+
         Ok(Self {
-            model,
+            model: shared_model,
+            inner: Mutex::new(HipRuntimeInner {
+                prefill,
+                decode,
+                needs_state_transfer: false,
+            }),
             num_batch,
             chunk_size,
         })
@@ -108,7 +166,7 @@ impl HipRuntime {
 
     /// Get model info.
     pub fn info(&self) -> &Rwkv7ModelInfo {
-        self.model.info()
+        &self.model.info
     }
 
     /// Get configured batch size.
@@ -122,21 +180,59 @@ impl HipRuntime {
     }
 
     /// Reset all state to initial values.
+    ///
+    /// Resets both prefill and decode modules and clears any pending
+    /// state transfer.
     pub fn reset_state(&self) {
-        self.model
-            .reset_resident_state()
-            .expect("Failed to reset HIP resident state");
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .prefill
+            .reset_state()
+            .expect("Failed to reset prefill state");
+        inner
+            .decode
+            .reset_state()
+            .expect("Failed to reset decode state");
+        inner.needs_state_transfer = false;
     }
 
     /// Get a snapshot of current state (for testing/debugging).
+    ///
+    /// Returns the prefill module's state (which is the authoritative
+    /// state after a prefill pass). If only decode has been used, the
+    /// decode state would need to be read separately.
     pub fn get_state_snapshot(&self) -> HipState {
-        self.model.read_state(0).expect("Failed to read GPU state")
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .prefill
+            .get_state()
+            .expect("Failed to read prefill state")
+    }
+
+    /// Transfer state from prefill to decode module.
+    ///
+    /// Called automatically on the first decode after a prefill pass.
+    /// Extracts state from `HipPrefill` (FLA layout) and loads it into
+    /// `HipDecode` (which transposes WKV state to decode layout).
+    ///
+    /// Caller must hold the inner lock.
+    fn transfer_state_to_decode(
+        inner: &mut HipRuntimeInner,
+    ) -> Result<(), super::HipErrorKind> {
+        let state = inner.prefill.get_state()?;
+        inner.decode.load_state(&state)?;
+        inner.needs_state_transfer = false;
+        Ok(())
     }
 
     /// Run inference on a batch of token sequences.
     ///
     /// Supports variable-length sequences - no manual padding required.
     /// State is preserved across calls for streaming inference.
+    ///
+    /// Dispatches to prefill (T>1) or decode (T=1) based on the maximum
+    /// sequence length. State is automatically transferred from prefill
+    /// to decode when switching modes.
     ///
     /// # Arguments
     /// * `sequences` - Batch of token sequences (can be variable length)
@@ -153,12 +249,27 @@ impl HipRuntime {
             });
         }
 
-        let logits = self.model.infer_resident(sequences)?;
+        let max_len = sequences.iter().map(|s| s.len()).max().unwrap_or(0);
+        let all_t1 = max_len == 1 && sequences.iter().all(|s| s.len() == 1);
+
+        let mut inner = self.inner.lock().unwrap();
+
+        let logits = if all_t1 {
+            // T=1 decode path
+            if inner.needs_state_transfer {
+                Self::transfer_state_to_decode(&mut inner)?;
+            }
+            inner.decode.decode(sequences)?
+        } else {
+            // T>1 prefill path
+            let result = inner.prefill.prefill(sequences)?;
+            // Mark that decode needs state transfer on next T=1 call
+            inner.needs_state_transfer = true;
+            result
+        };
 
         // Convert to TensorCpu
-        // Output is flattened: [batch_0_tokens..., batch_1_tokens..., ...]
-        // Each token has vocab_size logits
-        let vocab_size = self.model.info().n_vocab;
+        let vocab_size = self.model.info.n_vocab;
         let total_tokens: usize = sequences.iter().map(|s| s.len()).sum();
         let shape = crate::tensor::shape::Shape::new(vocab_size, total_tokens, 1, 1);
 
@@ -215,7 +326,7 @@ impl HipRuntime {
     /// # Returns
     /// Vec of logit slices, one per sequence (each of length vocab_size)
     pub fn extract_last_logits(&self, logits: &TensorCpu<f32>, lengths: &[usize]) -> Vec<Vec<f32>> {
-        let vocab_size = self.model.info().n_vocab;
+        let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
 
         let mut results = Vec::with_capacity(lengths.len());
@@ -245,7 +356,7 @@ impl HipRuntime {
     /// Vec of logit vectors, one per sequence. Each inner vec has length
     /// `seq_len * vocab_size` containing logits for all tokens in that sequence.
     pub fn extract_all_logits(&self, logits: &TensorCpu<f32>, lengths: &[usize]) -> Vec<Vec<f32>> {
-        let vocab_size = self.model.info().n_vocab;
+        let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
 
         let mut results = Vec::with_capacity(lengths.len());
@@ -272,7 +383,7 @@ impl HipRuntime {
         logits: &TensorCpu<f32>,
         redirect: &RnnRedirect,
     ) -> Result<RnnOutput, RuntimeError> {
-        let vocab_size = self.model.info().n_vocab;
+        let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
 
         let mut outputs = Vec::with_capacity(redirect.outputs.len());
@@ -334,7 +445,7 @@ impl HipRuntime {
             .collect();
         let token_refs: Vec<&[u32]> = token_vecs.iter().map(|v| v.as_slice()).collect();
 
-        // 4. Run step
+        // 4. Run step (infer takes &self, uses Mutex internally)
         let logits_tensor = self.infer(&token_refs).map_err(|_e| {
             // Convert HIP error to RuntimeError via TensorError
             RuntimeError::TensorError(TensorError::new(TensorErrorKind::Deduce))
