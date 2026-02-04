@@ -527,6 +527,15 @@ impl HipRuntime {
     /// Processes one chunk of tokens from the input, returning the remaining
     /// input and the output for this chunk.
     fn infer_rnn(&self, mut input: RnnInput) -> Result<(RnnInput, RnnOutput), RuntimeError> {
+        // 0. Pad empty batches with a single token so they participate in
+        //    chunking and redirect calculation. Must happen before iter/chunk
+        //    so the chunk info, redirect, and actual tokens stay consistent.
+        for batch in &mut input.batches {
+            if batch.tokens.is_empty() {
+                batch.tokens.push(Token::Token(0));
+            }
+        }
+
         // 1. Get chunk info - if None, input is exhausted
         let Some(info) = input.iter().next() else {
             return Err(RuntimeError::InputExhausted);
@@ -539,26 +548,26 @@ impl HipRuntime {
             return Err(RuntimeError::InputExhausted);
         }
 
-        // 3. Extract tokens from chunk (pad empty batches with token 0)
+        // 3. Extract tokens from chunk
         let token_vecs: Vec<Vec<u32>> = chunk
             .iter()
             .map(|batch| {
-                let tokens: Vec<u32> = batch
+                batch
                     .0
                     .iter()
                     .map(|t| match t {
                         Token::Token(id) => *id,
                         Token::Embed(_) => 0,
                     })
-                    .collect();
-                if tokens.is_empty() { vec![0] } else { tokens }
+                    .collect()
             })
             .collect();
         let token_refs: Vec<&[u32]> = token_vecs.iter().map(|v| v.as_slice()).collect();
 
         // 4. Run step (infer takes &self, uses Mutex internally)
-        let logits_tensor = self.infer(&token_refs).map_err(|_e| {
-            // Convert HIP error to RuntimeError via TensorError
+        let logits_tensor = self.infer(&token_refs).map_err(|e| {
+            eprintln!("infer_rnn: infer() failed: {:?}", e);
+            eprintln!("  token_refs lengths: {:?}", token_refs.iter().map(|s| s.len()).collect::<Vec<_>>());
             RuntimeError::TensorError(TensorError::new(TensorErrorKind::Deduce))
         })?;
 
@@ -1579,83 +1588,132 @@ mod tests {
         println!("test_hip_runtime_chunked_matches_direct PASSED");
     }
 
-    /// Test that packed sequences allow [125, 1, 1, 1] within 128-token budget.
+    /// Test multi-chunk prefill through infer_rnn with padded empty batches.
     ///
-    /// With rectangular padding this would be 4*125=500 tokens (exceeds 256 buffer).
-    /// With packed format it's 125+1+1+1=128 total tokens (fits in 128 chunk).
-    ///
-    /// Also verifies quality: last-token logits for each batch should match
-    /// single-sequence inference (top-10 overlap >= 8/10).
+    /// Simulates the ai00 server pattern: 4 batch slots, one with a long
+    /// prefill (> chunk_size tokens), the rest empty. The RnnInput gets
+    /// chunked across multiple infer_rnn calls. Verifies that the final
+    /// Last-token logits match a direct single-call inference.
     #[test]
     fn test_hip_runtime_multichunk_prefill_with_empty_batches() {
+        use web_rwkv::runtime::infer::{RnnInput, RnnInputBatch, RnnOption};
+        use web_rwkv::runtime::infer::rnn::RnnOutput;
+
         let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
         if !Path::new(model_path).exists() {
             eprintln!("Skipping test: model not found at {}", model_path);
             return;
         }
 
-        // Build runtime with batch_size=4, chunk_size=128
-        let model = Rwkv7Hip::load(model_path).expect("Failed to load model");
-        let vocab_size = model.info().n_vocab;
-        let config = HipRuntimeConfig::new(128, 4); // chunk=128, batch=4
-        let runtime = HipRuntime::with_config(model, config)
-            .expect("Failed to create HipRuntime");
+        let num_batch = 4;
+        let chunk_size: usize = 128;
+        // 200 tokens: forces 2 chunks (128 + 72) with chunk_size=128
+        let tokens: Vec<u32> = (1..=200).collect();
 
-        // [125, 1, 1, 1] tokens — 128 total, fits in packed 128-token budget
-        let long_seq: Vec<u32> = (1..=125).collect();
-        let short1: Vec<u32> = vec![200];
-        let short2: Vec<u32> = vec![300];
-        let short3: Vec<u32> = vec![400];
+        // === Direct inference (ground truth) ===
+        let model_direct = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let vocab_size = model_direct.info().n_vocab;
+        let runtime_direct = HipRuntime::new(model_direct, 1);
+        let direct_logits = runtime_direct
+            .infer_one(&tokens)
+            .expect("Direct inference failed");
+        // Last token's logits from direct path
+        let direct_data = direct_logits.data();
+        let direct_last_start = (tokens.len() - 1) * vocab_size;
+        let direct_last = &direct_data[direct_last_start..direct_last_start + vocab_size];
 
-        // This should NOT fail with packed layout (128 <= 128)
-        let logits = runtime
-            .infer(&[&long_seq, &short1, &short2, &short3])
-            .expect("Packed [125,1,1,1] should fit in 128-token budget");
+        // === Chunked via infer_rnn with 4 batch slots ===
+        let model_rnn = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let runtime_rnn = HipRuntime::new(model_rnn, num_batch);
 
-        // Total output: 128 tokens worth of logits
-        let total_tokens: usize = 125 + 1 + 1 + 1;
-        let shape = logits.shape();
-        assert_eq!(shape[0], vocab_size, "vocab dim");
-        assert_eq!(shape[1], total_tokens, "total tokens dim");
+        // Batch 0: long prefill, Last option (like ai00 prompt processing)
+        // Batches 1-3: empty (idle slots)
+        let batch0 = RnnInputBatch::new(tokens.clone(), RnnOption::Last);
+        let batch1 = RnnInputBatch::new(Vec::<u32>::new(), RnnOption::Last);
+        let batch2 = RnnInputBatch::new(Vec::<u32>::new(), RnnOption::Last);
+        let batch3 = RnnInputBatch::new(Vec::<u32>::new(), RnnOption::Last);
+        let mut input = RnnInput::new(vec![batch0, batch1, batch2, batch3], chunk_size);
 
-        // Verify all logits are finite
+        // Verify chunking will happen
         assert!(
-            logits.data().iter().all(|&x| x.is_finite()),
-            "All logits should be finite"
+            tokens.len() > chunk_size,
+            "Test requires tokens.len() > chunk_size to exercise multi-chunk path"
         );
 
-        // Quality check: run the 125-token sequence individually and compare last-token top-10
-        let lengths = [125, 1, 1, 1];
-        let last_logits = runtime.extract_last_logits(&logits, &lengths);
-        assert_eq!(last_logits.len(), 4);
+        // Run chunked inference loop (calls infer_rnn directly)
+        let mut chunk_count = 0;
+        let mut final_output: Option<RnnOutput> = None;
+        loop {
+            if input.num_token() == 0 {
+                break;
+            }
+            let (remaining, output) = runtime_rnn
+                .infer_rnn(input)
+                .unwrap_or_else(|e| panic!("Chunked inference failed on chunk {}: {:?}", chunk_count, e));
+            chunk_count += 1;
+            final_output = Some(output);
+            input = remaining;
+        }
 
-        let top_k = |logits_slice: &[f32], k: usize| -> Vec<usize> {
-            let mut indexed: Vec<(usize, f32)> = logits_slice.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        assert!(
+            chunk_count >= 2,
+            "Expected at least 2 chunks, got {}",
+            chunk_count
+        );
+
+        // The last chunk's output should contain batch 0's Last logits
+        let output = final_output.expect("Should have produced output");
+        assert_eq!(output.0.len(), num_batch, "Should have {} batch outputs", num_batch);
+
+        // Batch 0: Last option → should have exactly 1 output token
+        let batch0_out = &output.0[0].0;
+        assert_eq!(
+            batch0_out.shape()[1], 1,
+            "Batch 0 with Last should have 1 output token, got {}",
+            batch0_out.shape()[1]
+        );
+
+        // Batches 1-3: empty → should have 0 output tokens
+        for i in 1..num_batch {
+            assert_eq!(
+                output.0[i].0.shape()[1], 0,
+                "Empty batch {} should have 0 output tokens",
+                i
+            );
+        }
+
+        // Compare batch 0's logits against direct inference last-token logits
+        let rnn_last = batch0_out.data();
+        assert_eq!(rnn_last.len(), vocab_size, "Output should be vocab_size logits");
+
+        // Top-k comparison
+        let top_k = |logits: &[f32], k: usize| -> Vec<usize> {
+            let mut indexed: Vec<(usize, f32)> =
+                logits.iter().copied().enumerate().collect();
             indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
             indexed.into_iter().take(k).map(|(i, _)| i).collect()
         };
 
-        // Check batch 0 (125 tokens) against individual B=1 inference
-        let ref_model = Rwkv7Hip::load(model_path).expect("Failed to load ref model");
-        let ref_runtime = HipRuntime::new(ref_model, 1);
-        let ref_logits = ref_runtime.infer_one(&long_seq).expect("Reference inference failed");
-        let ref_last_start = (125 - 1) * vocab_size;
-        let ref_last = &ref_logits.data()[ref_last_start..ref_last_start + vocab_size];
-        let ref_top10 = top_k(ref_last, 10);
-        let batch_top10 = top_k(&last_logits[0], 10);
-        let overlap = ref_top10.iter().filter(|i| batch_top10.contains(i)).count();
+        let rnn_top10 = top_k(rnn_last, 10);
+        let direct_top10 = top_k(direct_last, 10);
+        let overlap = rnn_top10
+            .iter()
+            .filter(|i| direct_top10.contains(i))
+            .count();
+
         println!(
-            "Batch 0 (125 tokens): top-10 overlap = {}/10 vs individual inference",
-            overlap
+            "Multi-chunk prefill: {} chunks, top-10 overlap: {}/10",
+            chunk_count, overlap
         );
+        println!("  RNN top-10:    {:?}", rnn_top10);
+        println!("  Direct top-10: {:?}", direct_top10);
+
         assert!(
             overlap >= 8,
-            "Top-10 overlap for 125-token batch should be >= 8/10, got {}/10",
-            overlap
+            "Top-10 overlap too low: {}/10 (rnn={:?}, direct={:?})",
+            overlap, rnn_top10, direct_top10
         );
 
         println!("test_hip_runtime_multichunk_prefill_with_empty_batches PASSED");
-        println!("  - [125, 1, 1, 1] batch prefilled in 128-token budget");
-        println!("  - Output shape: [{}, {}, {}, {}]", shape[0], shape[1], shape[2], shape[3]);
     }
 }
