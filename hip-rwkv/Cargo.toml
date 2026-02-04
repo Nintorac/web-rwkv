@@ -1,0 +1,27 @@
+[package]
+name = "hip-rwkv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+web-rwkv = { version = "0.10.19", path = "..", default-features = false }
+half = { version = "2.7", features = ["bytemuck", "serde"] }
+bytemuck = { version = "1.24", features = ["extern_crate_alloc"] }
+safetensors = "0.6"
+memmap2 = "0.9"
+futures = "0.3"
+log = "0.4"
+
+[dev-dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+fastrand = "2.3"
+npyz = { version = "0.8.4", features = ["half", "npz"] }
+test-case = "3.3.1"
+tokio = { version = "1.41", features = ["full"] }
+web-rwkv = { version = "0.10.19", path = "..", features = ["native"] }
+wgpu = "28.0"
+
+[features]
+default = []
+hip-probes = []

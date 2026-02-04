@@ -1,0 +1,1330 @@
+// FLA (Flash Linear Attention) kernels for RWKV7 HIP backend.
+//
+// Stage 1: kernel_fla_cumsum — cumulative decay scan within each chunk.
+// Stage 2: kernel_fla_intra_gate + kernel_fla_intra_attn — intra-chunk attention.
+// Stage 3: kernel_fla_wy_inv + kernel_fla_wy_wu — WY representation.
+// Stage 4: kernel_fla_chunk_h — inter-chunk state recurrence.
+// Stage 5: kernel_fla_chunk_o — output combination.
+//
+// All per-token tensors use web-rwkv column-major layout [K, H, T, B] with K fastest.
+// For packed/varlen sequences, B=1 and T is total packed length.
+// Position t in sequence starting at bos, head h, element k:
+//   index = k + h * K + (bos + t) * H * K
+//
+// Attention matrices use layout [C, C, H, total_chunks]:
+//   A[i, j, h, chunk] = i + j*C + h*C*C + chunk*H*C*C
+//
+// Reference: repos/flash-linear-attention/fla/ops/generalized_delta_rule/dplr/chunk_A_fwd.py
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+extern "C" {
+
+// ============================================================================
+// Stage 1: Cumulative decay scan (kernel_fla_cumsum)
+//
+// Computes intra-chunk inclusive and exclusive cumulative sums of log-decay gk.
+//
+// For each chunk:
+//   gi[t] = sum(gk[chunk_start..=t])   (inclusive: add current before store)
+//   ge[t] = sum(gk[chunk_start..t])    (exclusive: store before adding current)
+//
+// The Triton reference computes this as matrix-vector products:
+//   oi = lower_triangular_inclusive @ s
+//   oe = lower_triangular_exclusive @ s
+//
+// For C=16 with K=64 threads, each thread handles one element of the head
+// dimension and loops sequentially over the C=16 positions in the chunk.
+// This is equivalent but simpler for small C.
+//
+// Grid:  dim3(total_chunks, H, 1)
+// Block: dim3(K) where K=64 (one thread per head-size element)
+// ============================================================================
+
+__global__ __launch_bounds__(64, 8)
+void kernel_fla_cumsum(
+    const float* __restrict__ gk,           // [K, H, T_packed, 1] input log-decay
+    float* __restrict__ gi,                 // [K, H, T_packed, 1] inclusive cumsum output
+    float* __restrict__ ge,                 // [K, H, T_packed, 1] exclusive cumsum output
+    const int* __restrict__ chunk_indices,  // [total_chunks * 2] flat: (seq_id, local_chunk_id)
+    const int* __restrict__ cu_seqlens,     // [N+1] cumulative sequence lengths
+    const int* __restrict__ batch_offsets,  // [N] data offsets per sequence
+    int K,                                  // head_size (64)
+    int H,                                  // n_heads
+    int C                                   // chunk_size (16)
+) {
+    const int chunk_flat = blockIdx.x;  // which chunk (0..total_chunks-1)
+    const int h = blockIdx.y;           // which head (0..H-1)
+    const int k = threadIdx.x;          // which head-size element (0..K-1)
+
+    if (h >= H || k >= K) return;
+
+    // Resolve chunk -> sequence mapping
+    const int seq_id      = chunk_indices[chunk_flat * 2];
+    const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
+
+    // Sequence boundaries
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
+
+    // Stride for advancing one token in column-major [K, H, T, B] layout
+    const int token_stride = H * K;
+
+    // Base offset for head h, element k, at sequence start
+    const int base = k + h * K + bos * token_stride;
+
+    // Sequential prefix sum over C positions in this chunk.
+    // C=16 is tiny so a simple loop is optimal (no shared memory needed).
+    float accum = 0.0f;
+
+    #pragma unroll
+    for (int t = 0; t < C; t++) {
+        const int t_abs = local_chunk * C + t;  // position within sequence
+
+        if (t_abs < T) {
+            const int idx = base + t_abs * token_stride;
+            const float val = gk[idx];
+
+            // Exclusive: store BEFORE adding current value
+            ge[idx] = accum;
+
+            accum += val;
+
+            // Inclusive: store AFTER adding current value
+            gi[idx] = accum;
+        }
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for kernel_fla_cumsum
+// ============================================================================
+
+hipError_t launch_fla_cumsum(
+    const float* gk,
+    float* gi,
+    float* ge,
+    const int* chunk_indices,
+    const int* cu_seqlens,
+    const int* batch_offsets,
+    int K,
+    int H,
+    int C,
+    int total_chunks,
+    hipStream_t stream
+) {
+    if (K <= 0 || H <= 0 || C <= 0 || total_chunks <= 0) {
+        return hipSuccess;
+    }
+
+    dim3 grid(total_chunks, H, 1);
+    dim3 block(K);
+
+    hipLaunchKernelGGL(kernel_fla_cumsum, grid, block, 0, stream,
+                       gk, gi, ge, chunk_indices, cu_seqlens, batch_offsets,
+                       K, H, C);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// Stage 2, Part A: Decay-scaled gating (kernel_fla_intra_gate)
+//
+// Computes gated versions of q, k, a, b using cumulative decays gi, ge:
+//   g_last = gi[last_valid_position_in_chunk]  (per K element)
+//   qg[t] = q[t] * exp(gi[t])
+//   kg[t] = k[t] * exp(-gi[t] + g_last)
+//   ag[t] = a[t] * exp(ge[t])
+//   bg[t] = b[t] * exp(-gi[t] + g_last)
+//
+// Inputs q, k, a, b are f16 [K, H, T, B].
+// Inputs gi, ge are f32 [K, H, T, B] (from Stage 1).
+// Outputs qg, kg, ag, bg are f32 [K, H, T, B].
+//
+// Grid:  dim3(total_chunks, H, 1)
+// Block: dim3(K) where K=64 (one thread per head-size element)
+// ============================================================================
+
+__global__ __launch_bounds__(64, 8)
+void kernel_fla_intra_gate(
+    const __half* __restrict__ q,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ k,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ a,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ b,              // [K, H, T_packed, 1] f16
+    const float*  __restrict__ gi,             // [K, H, T_packed, 1] inclusive cumsum
+    const float*  __restrict__ ge,             // [K, H, T_packed, 1] exclusive cumsum
+    float* __restrict__ qg_out,                // [K, H, T_packed, 1] decay-scaled query
+    float* __restrict__ kg_out,                // [K, H, T_packed, 1] decay-scaled key
+    float* __restrict__ ag_out,                // [K, H, T_packed, 1] decay-scaled a
+    float* __restrict__ bg_out,                // [K, H, T_packed, 1] decay-scaled b
+    const int* __restrict__ chunk_indices,     // [total_chunks * 2]
+    const int* __restrict__ cu_seqlens,        // [N+1]
+    const int* __restrict__ batch_offsets,     // [N] data offsets per sequence
+    int K_dim,                                 // head_size (64)
+    int H,                                     // n_heads
+    int C                                      // chunk_size (16)
+) {
+    const int chunk_flat = blockIdx.x;
+    const int h = blockIdx.y;
+    const int kk = threadIdx.x;  // head-size element index
+
+    if (h >= H || kk >= K_dim) return;
+
+    // Resolve chunk -> sequence mapping
+    const int seq_id      = chunk_indices[chunk_flat * 2];
+    const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
+
+    // Sequence boundaries
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
+
+    // Early exit for chunks entirely beyond sequence
+    if (local_chunk * C >= T) return;
+
+    // Stride for advancing one token in [K, H, T, B] layout
+    const int token_stride = H * K_dim;
+
+    // Base offset for head h, element kk, at sequence start
+    const int base = kk + h * K_dim + bos * token_stride;
+
+    // Compute g_last: inclusive cumsum at last valid position in this chunk
+    const int last_t_abs = min((local_chunk + 1) * C, T) - 1;
+    const float g_last = gi[base + last_t_abs * token_stride];
+
+    // Process each position in the chunk
+    #pragma unroll
+    for (int t = 0; t < C; t++) {
+        const int t_abs = local_chunk * C + t;
+
+        if (t_abs < T) {
+            const int idx = base + t_abs * token_stride;
+
+            // Load f16 inputs and convert to f32
+            const float q_val = __half2float(q[idx]);
+            const float k_val = __half2float(k[idx]);
+            const float a_val = __half2float(a[idx]);
+            const float b_val = __half2float(b[idx]);
+
+            // Load f32 cumulative decays
+            const float gi_val = gi[idx];
+            const float ge_val = ge[idx];
+
+            // Compute decay-scaled outputs
+            const float exp_gi     = expf(gi_val);
+            const float exp_neg_gi = expf(-gi_val + g_last);
+            const float exp_ge     = expf(ge_val);
+
+            qg_out[idx] = q_val * exp_gi;
+            kg_out[idx] = k_val * exp_neg_gi;
+            ag_out[idx] = a_val * exp_ge;
+            bg_out[idx] = b_val * exp_neg_gi;
+        }
+    }
+}
+
+// ============================================================================
+// Stage 2, Part B: Intra-chunk attention matrices (kernel_fla_intra_attn)
+//
+// Computes 4 CxC attention matrices per chunk using raw inputs with inline
+// decay factors (NOT the pre-gated vectors which include g_last offset):
+//   A_qk[i,j] = sum_k(q[i,k] * k[j,k] * exp(gi[i,k] - gi[j,k]))  for j <= i
+//   A_qb[i,j] = sum_k(q[i,k] * b[j,k] * exp(gi[i,k] - gi[j,k]))  for j <= i
+//   A_ak[i,j] = sum_k(a[i,k] * k[j,k] * exp(ge[i,k] - gi[j,k]))  for j < i
+//   A_ab[i,j] = sum_k(a[i,k] * b[j,k] * exp(ge[i,k] - gi[j,k]))  for j < i
+//
+// Inputs q, k, a, b are f16 [K, H, T, B].
+// Inputs gi, ge are f32 [K, H, T, B] (from Stage 1).
+// Outputs are f32 [C, C, H, total_chunks] (column-major: i fastest).
+//
+// Reference: repos/flash-linear-attention/fla/ops/generalized_delta_rule/dplr/chunk_A_fwd.py:109-133
+//
+// Grid:  dim3(total_chunks, H, 1)
+// Block: dim3(C) where C=16 (one thread per row i of the attention matrices)
+// ============================================================================
+
+__global__ __launch_bounds__(16, 16)
+void kernel_fla_intra_attn(
+    const __half* __restrict__ q,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ k,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ a,              // [K, H, T_packed, 1] f16
+    const __half* __restrict__ b,              // [K, H, T_packed, 1] f16
+    const float*  __restrict__ gi,             // [K, H, T_packed, 1] inclusive cumsum
+    const float*  __restrict__ ge,             // [K, H, T_packed, 1] exclusive cumsum
+    float* __restrict__ A_qk,                  // [C, C, H, total_chunks]
+    float* __restrict__ A_qb,                  // [C, C, H, total_chunks]
+    float* __restrict__ A_ak,                  // [C, C, H, total_chunks]
+    float* __restrict__ A_ab,                  // [C, C, H, total_chunks]
+    const int* __restrict__ chunk_indices,     // [total_chunks * 2]
+    const int* __restrict__ cu_seqlens,        // [N+1]
+    const int* __restrict__ batch_offsets,     // [N] data offsets per sequence
+    int K_dim,                                 // head_size (64)
+    int H,                                     // n_heads
+    int C                                      // chunk_size (16)
+) {
+    const int chunk_flat = blockIdx.x;
+    const int h = blockIdx.y;
+    const int i = threadIdx.x;  // row index within the CxC attention matrix
+
+    if (h >= H || i >= C) return;
+
+    // Resolve chunk -> sequence mapping
+    const int seq_id      = chunk_indices[chunk_flat * 2];
+    const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
+
+    // Sequence boundaries
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
+
+    // Absolute position of row i
+    const int i_abs = local_chunk * C + i;
+
+    // Token stride and base offset
+    const int token_stride = H * K_dim;
+    const int base_h = h * K_dim + bos * token_stride;
+
+    // Output base: [C, C, H, total_chunks], element (i, j, h, chunk)
+    //   = i + j*C + h*C*C + chunk*H*C*C
+    const int out_base = i + h * C * C + chunk_flat * H * C * C;
+
+    // Number of valid positions in this chunk
+    const int chunk_start = local_chunk * C;
+    const int valid_len = min(C, T - chunk_start);
+
+    // If row i is beyond sequence length, zero out the entire row
+    if (i_abs >= T) {
+        for (int j = 0; j < C; j++) {
+            const int out_idx = out_base + j * C;
+            A_qk[out_idx] = 0.0f;
+            A_qb[out_idx] = 0.0f;
+            A_ak[out_idx] = 0.0f;
+            A_ab[out_idx] = 0.0f;
+        }
+        return;
+    }
+
+    // Base offset for row i
+    const int row_i_base = base_h + i_abs * token_stride;
+
+    // Loop over columns j
+    for (int j = 0; j < C; j++) {
+        const int out_idx = out_base + j * C;
+        const int j_abs = chunk_start + j;
+
+        // Boundary check: j beyond valid positions
+        if (j >= valid_len) {
+            A_qk[out_idx] = 0.0f;
+            A_qb[out_idx] = 0.0f;
+            A_ak[out_idx] = 0.0f;
+            A_ab[out_idx] = 0.0f;
+            continue;
+        }
+
+        // Causal masks
+        const bool inclusive_mask = (i >= j);  // j <= i for A_qk, A_qb
+        const bool strict_mask   = (i > j);    // j < i  for A_ak, A_ab
+
+        // If both masks fail, all four are zero
+        if (!inclusive_mask) {
+            A_qk[out_idx] = 0.0f;
+            A_qb[out_idx] = 0.0f;
+            A_ak[out_idx] = 0.0f;
+            A_ab[out_idx] = 0.0f;
+            continue;
+        }
+
+        // Compute dot products across K dimension using raw inputs with inline decay
+        const int row_j_base = base_h + j_abs * token_stride;
+
+        float dot_qk = 0.0f;
+        float dot_qb = 0.0f;
+        float dot_ak = 0.0f;
+        float dot_ab = 0.0f;
+
+        #pragma unroll 16
+        for (int kk = 0; kk < K_dim; kk++) {
+            const float q_ik = __half2float(q[row_i_base + kk]);
+            const float k_jk = __half2float(k[row_j_base + kk]);
+            const float a_ik = __half2float(a[row_i_base + kk]);
+            const float b_jk = __half2float(b[row_j_base + kk]);
+            const float gi_ik = gi[row_i_base + kk];
+            const float gi_jk = gi[row_j_base + kk];
+            const float ge_ik = ge[row_i_base + kk];
+
+            const float decay_qk = expf(gi_ik - gi_jk);
+            const float decay_ak = expf(ge_ik - gi_jk);
+
+            dot_qk += q_ik * k_jk * decay_qk;
+            dot_qb += q_ik * b_jk * decay_qk;
+            dot_ak += a_ik * k_jk * decay_ak;
+            dot_ab += a_ik * b_jk * decay_ak;
+        }
+
+        // Store with causal masking applied
+        A_qk[out_idx] = dot_qk;  // inclusive_mask is true here
+        A_qb[out_idx] = dot_qb;
+
+        if (strict_mask) {
+            A_ak[out_idx] = dot_ak;
+            A_ab[out_idx] = dot_ab;
+        } else {
+            // j == i: strict lower triangular means zero
+            A_ak[out_idx] = 0.0f;
+            A_ab[out_idx] = 0.0f;
+        }
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for Stage 2 (both parts)
+// ============================================================================
+
+hipError_t launch_fla_intra(
+    const __half* q,
+    const __half* k,
+    const __half* a,
+    const __half* b,
+    const float* gi,
+    const float* ge,
+    float* qg,
+    float* kg,
+    float* ag,
+    float* bg,
+    float* A_qk,
+    float* A_qb,
+    float* A_ak,
+    float* A_ab,
+    const int* chunk_indices,
+    const int* cu_seqlens,
+    const int* batch_offsets,
+    int K,
+    int H,
+    int C,
+    int total_chunks,
+    hipStream_t stream
+) {
+    if (K <= 0 || H <= 0 || C <= 0 || total_chunks <= 0) {
+        return hipSuccess;
+    }
+
+    // Part A: Compute decay-scaled gated vectors
+    {
+        dim3 grid(total_chunks, H, 1);
+        dim3 block(K);
+
+        hipLaunchKernelGGL(kernel_fla_intra_gate, grid, block, 0, stream,
+                           q, k, a, b, gi, ge, qg, kg, ag, bg,
+                           chunk_indices, cu_seqlens, batch_offsets,
+                           K, H, C);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) return err;
+    }
+
+    // Part B: Compute CxC attention matrices using raw inputs with inline decay
+    {
+        dim3 grid(total_chunks, H, 1);
+        dim3 block(C);
+
+        hipLaunchKernelGGL(kernel_fla_intra_attn, grid, block, 0, stream,
+                           q, k, a, b, gi, ge,
+                           A_qk, A_qb, A_ak, A_ab,
+                           chunk_indices, cu_seqlens, batch_offsets,
+                           K, H, C);
+
+        return hipGetLastError();
+    }
+}
+
+// ============================================================================
+// Stage 3, Part A: Lower-triangular matrix inversion (kernel_fla_wy_inv)
+//
+// Computes A_ab_inv = (I - A_ab)^{-1} for each chunk.
+//
+// A_ab is strict lower triangular (zeros on diagonal and above), as produced
+// by Stage 2. The inverse of (I - L) where L is strict lower triangular is
+// computed via forward substitution: row by row, accumulate contributions
+// from previously-computed rows.
+//
+// Algorithm (matches prepare_wy_repr_fwd_kernel_chunk32 from FLA reference):
+//   1. Load A_ab into shared memory, enforce strict lower triangular
+//   2. For i = 1..C-1 (forward substitution):
+//      - Extract row i
+//      - row[i] += sum(row[i][m] * row[m][j] for m < i)
+//      - Write updated row back
+//   3. Add identity: A[k][k] += 1.0
+//   4. Store to A_ab_inv
+//
+// Input A_ab:  [C, C, H, total_chunks] column-major (i fastest)
+// Output A_ab_inv: [C, C, H, total_chunks] column-major
+//
+// Grid:  dim3(total_chunks, H, 1)
+// Block: dim3(C=16) (one thread per column j of the CxC matrix)
+// ============================================================================
+
+__global__ __launch_bounds__(16, 16)
+void kernel_fla_wy_inv(
+    const float* __restrict__ A_ab,       // [C, C, H, total_chunks]
+    float* __restrict__ A_ab_inv,         // [C, C, H, total_chunks]
+    int H,                                // n_heads
+    int C                                 // chunk_size (16)
+) {
+    const int chunk_flat = blockIdx.x;    // which chunk
+    const int h = blockIdx.y;             // which head
+    const int j = threadIdx.x;            // column index (0..C-1)
+
+    if (h >= H || j >= C) return;
+
+    // Base offset into the CxC matrix for this (h, chunk) pair:
+    // A[i, j, h, chunk] = i + j*C + h*C*C + chunk*H*C*C
+    const int mat_base = h * C * C + chunk_flat * H * C * C;
+
+    // Shared memory for the CxC matrix.
+    // Layout: smem[row][col] — row i, column j.
+    // Since C=16, this is 16*16 = 256 floats = 1 KB.
+    __shared__ float smem[16][16];
+
+    // Step 1: Load column j of A_ab into shared memory.
+    // In column-major A[i, j] = A_ab[mat_base + i + j*C], so we read
+    // elements with i = 0..C-1 for our column j.
+    // Enforce strict lower triangular: A[i,j] = 0 unless i > j.
+    #pragma unroll
+    for (int i = 0; i < C; i++) {
+        float val = 0.0f;
+        if (i > j) {
+            val = A_ab[mat_base + i + j * C];
+        }
+        smem[i][j] = val;
+    }
+    __syncthreads();
+
+    // Step 2: Forward substitution, row by row.
+    // For row i (i = 1..C-1):
+    //   For each column j < i:
+    //     b_a[j] = smem[i][j]   (current row i values)
+    //   Then: b_a[j] += sum_{m=0}^{i-1} b_a[m] * smem[m][j]  for j < i
+    //   Write updated row back.
+    //
+    // Each thread handles one column j. Thread j computes the updated
+    // value for position (i, j) in the matrix.
+    for (int i = 1; i < C; i++) {
+        // Only columns j < i have non-zero values in this row
+        // (strict lower triangular structure is preserved through forward sub)
+        float b_a_j = smem[i][j];  // Current value at (i, j)
+
+        if (j < i) {
+            // Forward substitution: accumulate contributions from rows m < i
+            // b_a[j] += sum_{m} b_a[m] * smem[m][j]
+            // But b_a[m] = smem[i][m] (the current row i values).
+            // So: b_a_j += sum_{m=0}^{i-1} smem[i][m] * smem[m][j]
+            float accum = 0.0f;
+            #pragma unroll
+            for (int m = 0; m < C; m++) {
+                if (m < i) {
+                    accum += smem[i][m] * smem[m][j];
+                }
+            }
+            b_a_j += accum;
+        }
+
+        __syncthreads();
+
+        // Write the updated row i back to shared memory
+        smem[i][j] = b_a_j;
+
+        __syncthreads();
+    }
+
+    // Step 3: Add identity: A[j][j] += 1.0
+    smem[j][j] += 1.0f;
+    __syncthreads();
+
+    // Step 4: Store the entire matrix column j to A_ab_inv
+    #pragma unroll
+    for (int i = 0; i < C; i++) {
+        A_ab_inv[mat_base + i + j * C] = smem[i][j];
+    }
+}
+
+// ============================================================================
+// Stage 3, Part B: Compute w and u (kernel_fla_wy_wu)
+//
+// Using A_ab_inv (from Part A) and A_ak (from Stage 2), plus ag and v:
+//
+//   compound = A_ab_inv @ A_ak           [C, C] @ [C, C] = [C, C]
+//   w[chunk_pos, k] = A_ab_inv @ ag      [C, C] @ [C, K] = [C, K]
+//   u[chunk_pos, k] = compound @ v       [C, C] @ [C, K] = [C, K]
+//
+// A_ab_inv is lower triangular, A_ak is strict lower triangular.
+// compound = A_ab_inv @ A_ak is also lower triangular (strict, actually).
+//
+// ag is f32 [K, H, T, B] (from Stage 2 gating).
+// v is f16 [K, H, T, B] (original value tensor).
+// w_wy and u_wy are f32 [K, H, T, B] outputs.
+//
+// Grid:  dim3(total_chunks, H, 1)
+// Block: dim3(C=16) (one thread per row i within chunk)
+//
+// Each thread computes one row of w and u across all K dimensions.
+// ============================================================================
+
+__global__ __launch_bounds__(16, 16)
+void kernel_fla_wy_wu(
+    const float*  __restrict__ A_ab_inv,        // [C, C, H, total_chunks]
+    const float*  __restrict__ A_ak,            // [C, C, H, total_chunks]
+    const float*  __restrict__ ag,              // [K, H, T_packed, 1] f32
+    const __half* __restrict__ v,               // [K, H, T_packed, 1] f16
+    float* __restrict__ w_wy,                   // [K, H, T_packed, 1] f32 output
+    float* __restrict__ u_wy,                   // [K, H, T_packed, 1] f32 output
+    const int* __restrict__ chunk_indices,      // [total_chunks * 2]
+    const int* __restrict__ cu_seqlens,         // [N+1]
+    const int* __restrict__ batch_offsets,      // [N] data offsets per sequence
+    int K_dim,                                  // head_size (64)
+    int H,                                      // n_heads
+    int C                                       // chunk_size (16)
+) {
+    const int chunk_flat = blockIdx.x;
+    const int h = blockIdx.y;
+    const int i = threadIdx.x;   // row index within chunk (0..C-1)
+
+    if (h >= H || i >= C) return;
+
+    // Resolve chunk -> sequence mapping
+    const int seq_id      = chunk_indices[chunk_flat * 2];
+    const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
+
+    // Sequence boundaries
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
+
+    // Absolute position of row i in the sequence
+    const int i_abs = local_chunk * C + i;
+
+    // Token stride in [K, H, T, B] layout
+    const int token_stride = H * K_dim;
+
+    // Matrix base: [C, C, H, total_chunks], element (i, j, h, chunk)
+    const int mat_base = h * C * C + chunk_flat * H * C * C;
+
+    // Shared memory for A_ab_inv and compound matrices
+    // smem_inv[row][col] = A_ab_inv[row, col]
+    // smem_compound[row][col] = compound[row, col]
+    __shared__ float smem_inv[16][16];
+    __shared__ float smem_compound[16][16];
+
+    // Step 1: Load row i of A_ab_inv with lower triangular mask (i >= j)
+    float inv_row[16];
+    #pragma unroll
+    for (int jj = 0; jj < C; jj++) {
+        float val = 0.0f;
+        if (i >= jj) {
+            // A_ab_inv[i, jj, h, chunk] = A_ab_inv[mat_base + i + jj*C]
+            val = A_ab_inv[mat_base + i + jj * C];
+        }
+        inv_row[jj] = val;
+        smem_inv[i][jj] = val;
+    }
+
+    // Step 2: Load row i of A_ak with strict lower triangular mask (i > j)
+    float ak_row[16];
+    #pragma unroll
+    for (int jj = 0; jj < C; jj++) {
+        float val = 0.0f;
+        if (i > jj) {
+            val = A_ak[mat_base + i + jj * C];
+        }
+        ak_row[jj] = val;
+    }
+    __syncthreads();
+
+    // Step 3: Compute compound[i, j] = sum_m(A_ab_inv[i, m] * A_ak[m, j])
+    // We need A_ak columns, which requires access to other threads' rows.
+    // Load A_ak into shared memory for this purpose.
+    __shared__ float smem_ak[16][16];
+    #pragma unroll
+    for (int jj = 0; jj < C; jj++) {
+        smem_ak[i][jj] = ak_row[jj];
+    }
+    __syncthreads();
+
+    // Now compute compound row i: compound[i, j] = sum_m inv_row[m] * smem_ak[m][j]
+    // Since A_ab_inv is lower triangular and A_ak is strict lower triangular,
+    // compound is strict lower triangular.
+    float compound_row[16];
+    #pragma unroll
+    for (int jj = 0; jj < C; jj++) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int m = 0; m < C; m++) {
+            sum += inv_row[m] * smem_ak[m][jj];
+        }
+        compound_row[jj] = sum;
+        smem_compound[i][jj] = sum;
+    }
+    __syncthreads();
+
+    // Step 4: If row i is beyond sequence length, write zeros and return.
+    if (i_abs >= T) {
+        // Write zeros for this row across all K
+        const int row_base = h * K_dim + (bos + i_abs) * token_stride;
+        for (int kk = 0; kk < K_dim; kk++) {
+            // Only write if within allocated buffer
+            // For partial chunks, rows beyond T should remain zero.
+            // But since i_abs >= T, we don't actually write to valid positions.
+            // The buffers are initialized or don't matter beyond T.
+        }
+        return;
+    }
+
+    // Base offset for per-token access: head h, element k, at position (bos + chunk_start)
+    const int chunk_start = local_chunk * C;
+    const int valid_len = (T - chunk_start < C) ? (T - chunk_start) : C;
+
+    // Step 5: Compute w[i, k] = sum_j(A_ab_inv[i, j] * ag[j, k]) for j=0..valid_len-1
+    //         Compute u[i, k] = sum_j(compound[i, j]  * v[j, k])  for j=0..valid_len-1
+    for (int kk = 0; kk < K_dim; kk++) {
+        float w_val = 0.0f;
+        float u_val = 0.0f;
+
+        #pragma unroll
+        for (int jj = 0; jj < C; jj++) {
+            const int j_abs = chunk_start + jj;
+            if (j_abs < T) {
+                // ag[kk, h, j_abs+bos, 0] = ag[kk + h*K + (bos+j_abs)*H*K]
+                const int tok_idx = kk + h * K_dim + (bos + j_abs) * token_stride;
+
+                const float ag_val = ag[tok_idx];
+                const float v_val  = __half2float(v[tok_idx]);
+
+                w_val += inv_row[jj] * ag_val;
+                u_val += compound_row[jj] * v_val;
+            }
+        }
+
+        // Store w_wy[kk, h, bos+i_abs, 0] and u_wy[kk, h, bos+i_abs, 0]
+        const int out_idx = kk + h * K_dim + (bos + i_abs) * token_stride;
+        w_wy[out_idx] = w_val;
+        u_wy[out_idx] = u_val;
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for Stage 3 (WY representation)
+// Launches kernel_fla_wy_inv then kernel_fla_wy_wu sequentially.
+// ============================================================================
+
+hipError_t launch_fla_wy_repr(
+    const float* A_ab,
+    const float* A_ak,
+    float* A_ab_inv,
+    const float* ag,
+    const __half* v,
+    float* w_wy,
+    float* u_wy,
+    const int* chunk_indices,
+    const int* cu_seqlens,
+    const int* batch_offsets,
+    int K,
+    int H,
+    int C,
+    int total_chunks,
+    hipStream_t stream
+) {
+    if (K <= 0 || H <= 0 || C <= 0 || total_chunks <= 0) {
+        return hipSuccess;
+    }
+
+    // Part A: Compute A_ab_inv (matrix inversion)
+    {
+        dim3 grid(total_chunks, H, 1);
+        dim3 block(C);
+
+        hipLaunchKernelGGL(kernel_fla_wy_inv, grid, block, 0, stream,
+                           A_ab, A_ab_inv, H, C);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess) return err;
+    }
+
+    // Part B: Compute w and u
+    {
+        dim3 grid(total_chunks, H, 1);
+        dim3 block(C);
+
+        hipLaunchKernelGGL(kernel_fla_wy_wu, grid, block, 0, stream,
+                           A_ab_inv, A_ak, ag, v, w_wy, u_wy,
+                           chunk_indices, cu_seqlens, batch_offsets,
+                           K, H, C);
+
+        return hipGetLastError();
+    }
+}
+
+// ============================================================================
+// Stage 4: Inter-chunk state recurrence (kernel_fla_chunk_h)
+//
+// The sequential bottleneck: propagates state across chunks within each
+// sequence.  One thread-block processes ALL chunks for a single
+// (head, sequence) pair.
+//
+// Grid:  dim3(N_seq * H, 1, 1)   — one block per (sequence, head).
+// Block: dim3(K=64)               — one thread per V-column of the state.
+//
+// Thread v (0..K-1) owns one column of the [K, V]==[K, K] state matrix
+// in registers (h_col[K]).  Shared memory is used for per-position data
+// that all threads need: w_row, kg_col, bg_col, g_last.
+//
+// Per chunk i_t (sequential over chunks for this sequence):
+//   1. Store current state to fla_h:
+//      fla_h[k, v, h, chunk_offset + i_t] = h_col[k]
+//   2. For each sub-chunk position i (0..C-1) inside the chunk:
+//      a. Compute b_v2[v] = sum_k( w_wy[i,k] * h_col[k] ) + u_wy[i,v]
+//      b. Store v_new[i,v] = b_v2[v]
+//      c. Accumulate hc_col[k] += kg[k,i] * v_orig[i,v]
+//                                + bg[k,i] * b_v2[v]
+//   3. Decay and update:
+//      g_last = gi at last valid position in chunk
+//      h_col[k] = h_col[k] * exp(g_last[k]) + hc_col[k]
+//
+// After all chunks: write final state to state_out.
+//
+// Buffer layouts (column-major, K fastest):
+//   state:      [K, K, H, B]            — h_col[k] = state[k + v*K + h*K*K + seq*H*K*K]
+//   fla_h:      [K, K, H, total_chunks] — same indexing with chunk_id instead of seq
+//   per-token:  [K, H, T, B]            — element(k, h, t) = k + h*K + t*H*K
+//
+// Reference: repos/flash-linear-attention/fla/ops/generalized_delta_rule/dplr/chunk_h_fwd.py
+// ============================================================================
+
+__global__ __launch_bounds__(64, 2)
+void kernel_fla_chunk_h(
+    const float*  __restrict__ kg,             // [K, H, T, B] decay-scaled key (f32)
+    const float*  __restrict__ bg,             // [K, H, T, B] decay-scaled b   (f32)
+    const __half* __restrict__ v_in,           // [K, H, T, B] original value   (f16)
+    const float*  __restrict__ w_wy,           // [K, H, T, B] WY w output      (f32)
+    const float*  __restrict__ u_wy,           // [K, H, T, B] WY u output      (f32)
+    const float*  __restrict__ gi,             // [K, H, T, B] inclusive cumsum  (f32)
+    float*        __restrict__ state,          // [K, K, H, B] state in/out
+    float*        __restrict__ h_out,          // [K, K, H, total_chunks] per-chunk states
+    float*        __restrict__ v_new,          // [K, H, T, B] corrected values output
+    const int*    __restrict__ chunk_offsets,  // [N+1] cumulative chunk counts
+    const int*    __restrict__ cu_seqlens,     // [N+1] sequence boundaries
+    const int*    __restrict__ batch_offsets,  // [N] data offsets per sequence
+    int K_dim,                                 // head_size (64)
+    int H,                                     // n_heads
+    int C                                      // chunk_size (16)
+) {
+    // Decode block index -> (sequence, head)
+    const int block_id = blockIdx.x;           // 0 .. N_seq*H - 1
+    const int i_h      = block_id % H;         // head
+    const int i_n      = block_id / H;         // sequence
+
+    const int v_col    = threadIdx.x;           // column index (0..K-1)
+
+    // Sequence boundaries
+    const int bos = batch_offsets[i_n];
+    const int T   = cu_seqlens[i_n + 1] - cu_seqlens[i_n];
+    if (T <= 0) return;
+
+    // Chunk range for this sequence
+    const int boh      = chunk_offsets[i_n];    // first chunk id
+    const int n_chunks = chunk_offsets[i_n + 1] - boh;
+
+    // Token stride in [K, H, T, B] layout: advance one token
+    const int token_stride = H * K_dim;
+
+    // State base offset: state[k, v, h, seq] = k*K + v + h*K*K + seq*H*K*K
+    // V (column) is fastest, matching recurrent WKV and Python fixture layout.
+    const int state_base = i_h * K_dim * K_dim + i_n * H * K_dim * K_dim;
+
+    // ---- Load initial state column into registers ----
+    float h_col[64];
+    #pragma unroll
+    for (int k = 0; k < 64; k++) {
+        h_col[k] = state[k * K_dim + v_col + state_base];
+    }
+
+    // Shared memory for data broadcast to all threads:
+    //   smem[0..63]  — w_row / kg_col / bg_col / g_last (reused per position)
+    __shared__ float smem[64];
+
+    // ---- Sequential loop over chunks ----
+    for (int i_t = 0; i_t < n_chunks; i_t++) {
+        const int chunk_id    = boh + i_t;
+        const int chunk_start = i_t * C;
+
+        // Step 1: Store current state column to fla_h
+        // fla_h layout: [K, K, H, total_chunks], V (column) fastest
+        // element (k, v, h, chunk_id) = k*K + v + h*K*K + chunk_id*H*K*K
+        const int h_out_base = i_h * K_dim * K_dim + chunk_id * H * K_dim * K_dim;
+        #pragma unroll
+        for (int k = 0; k < 64; k++) {
+            h_out[k * K_dim + v_col + h_out_base] = h_col[k];
+        }
+
+        // Zero the chunk contribution accumulator
+        float hc_col[64];
+        #pragma unroll
+        for (int k = 0; k < 64; k++) {
+            hc_col[k] = 0.0f;
+        }
+
+        // Step 2 & 3: Process each position in the chunk
+        const int valid_len = min(C, T - chunk_start);
+        for (int i_pos = 0; i_pos < valid_len; i_pos++) {
+            const int t_abs = chunk_start + i_pos;    // position within sequence
+            const int tok_offset = (bos + t_abs) * token_stride + i_h * K_dim;
+
+            // ---- Compute b_v2[v_col] = sum_k( w_wy[pos,k] * h_col[k] ) + u_wy[pos,v_col] ----
+            // Load w_row[k] into shared memory (one element per thread)
+            // w_wy per-token layout: w_wy[k, h, t, b] = w_wy[k + h*K + t*H*K]
+            if (v_col < K_dim) {
+                smem[v_col] = w_wy[v_col + tok_offset];
+            }
+            __syncthreads();
+
+            float dot = 0.0f;
+            #pragma unroll
+            for (int k = 0; k < 64; k++) {
+                dot += smem[k] * h_col[k];
+            }
+
+            // u_wy has the same per-token layout, using v_col as the K-element index
+            // (since K == V == 64, the layout is identical for the v dimension)
+            float b_v2 = dot + u_wy[v_col + tok_offset];
+
+            // Store v_new
+            v_new[v_col + tok_offset] = b_v2;
+            __syncthreads();
+
+            // ---- Accumulate hc_col ----
+            // Load kg[:, pos] into shared memory
+            if (v_col < K_dim) {
+                smem[v_col] = kg[v_col + tok_offset];
+            }
+            __syncthreads();
+
+            // v_in is f16 per-token: v_in[v_col + tok_offset]
+            float v_val = __half2float(v_in[v_col + tok_offset]);
+
+            // hc_col[k] += kg[k, pos] * v_val
+            #pragma unroll
+            for (int k = 0; k < 64; k++) {
+                hc_col[k] += smem[k] * v_val;
+            }
+            __syncthreads();
+
+            // Load bg[:, pos] into shared memory
+            if (v_col < K_dim) {
+                smem[v_col] = bg[v_col + tok_offset];
+            }
+            __syncthreads();
+
+            // hc_col[k] += bg[k, pos] * b_v2
+            #pragma unroll
+            for (int k = 0; k < 64; k++) {
+                hc_col[k] += smem[k] * b_v2;
+            }
+            __syncthreads();
+        }
+
+        // Step 4: Decay and update
+        // g_last = gi at last valid position in chunk
+        const int last_idx = min((i_t + 1) * C, T) - 1;
+        const int last_tok_offset = (bos + last_idx) * token_stride + i_h * K_dim;
+        if (v_col < K_dim) {
+            smem[v_col] = gi[v_col + last_tok_offset];
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < 64; k++) {
+            h_col[k] = h_col[k] * expf(smem[k]) + hc_col[k];
+        }
+        __syncthreads();
+    }
+
+    // ---- Write final state ----
+    // state[k, v, h, seq] = k*K + v + h*K*K + seq*H*K*K  (V fastest)
+    #pragma unroll
+    for (int k = 0; k < 64; k++) {
+        state[k * K_dim + v_col + state_base] = h_col[k];
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for Stage 4 (inter-chunk state recurrence)
+// ============================================================================
+
+hipError_t launch_fla_chunk_h(
+    const float*  kg,
+    const float*  bg,
+    const __half* v,
+    const float*  w_wy,
+    const float*  u_wy,
+    const float*  gi,
+    float*        state,
+    float*        h_out,
+    float*        v_new,
+    const int*    chunk_offsets,
+    const int*    cu_seqlens,
+    const int*    batch_offsets,
+    int K,
+    int H,
+    int C,
+    int N_seq,
+    hipStream_t   stream
+) {
+    if (K <= 0 || H <= 0 || C <= 0 || N_seq <= 0) {
+        return hipSuccess;
+    }
+
+    dim3 grid(N_seq * H, 1, 1);
+    dim3 block(K);
+
+    hipLaunchKernelGGL(kernel_fla_chunk_h, grid, block, 0, stream,
+                       kg, bg, v, w_wy, u_wy, gi,
+                       state, h_out, v_new,
+                       chunk_offsets, cu_seqlens, batch_offsets,
+                       K, H, C);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// Stage 5: Output combination (kernel_fla_chunk_o)
+//
+// Combines intra-chunk attention with inter-chunk state contributions to
+// produce the final WKV7 output.
+//
+// For each token at position i in chunk:
+//   o[i, :] = (qg[i, :] @ h[chunk])          -- state contribution via query
+//           + sum_j(A_qk[i,j] * v[j, :])      -- local attention (original values)
+//           + sum_j(A_qb[i,j] * v_new[j, :])  -- WY correction (corrected values)
+//
+// Where:
+// - qg is the decay-scaled query from Stage 2 [K, H, T, B] (f32)
+// - h is the per-chunk state from Stage 4 [K, K, H, total_chunks] (f32)
+// - A_qk is the causal QK attention matrix from Stage 2 [C, C, H, total_chunks]
+// - A_qb is the causal QB attention matrix from Stage 2 [C, C, H, total_chunks]
+// - v is the original value tensor [K, H, T, B] (f16)
+// - v_new is the corrected value tensor from Stage 4 [K, H, T, B] (f32)
+// - Output o is [K, H, T, B] (f16) matching existing WKV output layout
+//
+// Both A_qk and A_qb are applied with causal mask (i >= j) before use.
+// Positions beyond sequence length produce zero output.
+//
+// Grid:  dim3(total_chunks, H, 1)
+// Block: dim3(C=16) (one thread per row i within chunk)
+//
+// Reference: repos/flash-linear-attention/fla/ops/generalized_delta_rule/dplr/chunk_o_fwd.py
+// ============================================================================
+
+__global__ __launch_bounds__(16, 16)
+void kernel_fla_chunk_o(
+    const float*  __restrict__ qg,             // [K, H, T_packed, 1] decay-scaled query (f32)
+    const __half* __restrict__ v,              // [K, H, T_packed, 1] original value     (f16)
+    const float*  __restrict__ v_new,          // [K, H, T_packed, 1] corrected values   (f32)
+    const float*  __restrict__ A_qk,           // [C, C, H, total_chunks] causal attn QK
+    const float*  __restrict__ A_qb,           // [C, C, H, total_chunks] causal attn QB
+    const float*  __restrict__ h,              // [K, K, H, total_chunks] per-chunk states
+    __half*       __restrict__ o,              // [K, H, T_packed, 1] output (f16)
+    const int*    __restrict__ chunk_indices,  // [total_chunks * 2]
+    const int*    __restrict__ cu_seqlens,     // [N+1]
+    const int*    __restrict__ batch_offsets,  // [N] data offsets per sequence
+    int K_dim,                                 // head_size (64)
+    int H,                                     // n_heads
+    int C                                      // chunk_size (16)
+) {
+    const int chunk_flat = blockIdx.x;     // which chunk (0..total_chunks-1)
+    const int i_h = blockIdx.y;            // which head (0..H-1)
+    const int i = threadIdx.x;             // row index within chunk (0..C-1)
+
+    if (i_h >= H || i >= C) return;
+
+    // Resolve chunk -> sequence mapping
+    const int seq_id      = chunk_indices[chunk_flat * 2];
+    const int local_chunk = chunk_indices[chunk_flat * 2 + 1];
+
+    // Sequence boundaries
+    const int bos = batch_offsets[seq_id];
+    const int T   = cu_seqlens[seq_id + 1] - cu_seqlens[seq_id];
+
+    // Absolute position of this thread's token
+    const int i_abs = local_chunk * C + i;
+
+    // Token stride in [K, H, T, B] layout
+    const int token_stride = H * K_dim;
+
+    // If this position is beyond the sequence length, zero the output and return
+    if (i_abs >= T) {
+        // Zero output for out-of-bounds positions
+        const int out_base = i_h * K_dim + (bos + i_abs) * token_stride;
+        // Only write if the position is within the padded buffer
+        // (positions beyond T in the last chunk don't need writes since
+        // they are never read downstream, but we handle this defensively)
+        return;
+    }
+
+    // Token offset for this thread's position
+    const int tok_offset = (bos + i_abs) * token_stride + i_h * K_dim;
+
+    // Attention matrix base: [C, C, H, total_chunks]
+    // A[row_i, col_j, h, chunk] = row_i + col_j * C + h * C * C + chunk * H * C * C
+    const int mat_base = i_h * C * C + chunk_flat * H * C * C;
+
+    // Number of valid positions in this chunk
+    const int chunk_start = local_chunk * C;
+    const int valid_len = min(C, T - chunk_start);
+
+    // ---- State contribution base: h[K, K, H, total_chunks], V fastest ----
+    // h[k_row, k_col, h, chunk] = k_row * K + k_col + h * K * K + chunk * H * K * K
+    const int h_base = i_h * K_dim * K_dim + chunk_flat * H * K_dim * K_dim;
+
+    // Load A_qk row i and A_qb row i with causal mask (i >= j)
+    // These are small (C=16 elements each) so load into registers
+    float a_qk_row[16];
+    float a_qb_row[16];
+    #pragma unroll
+    for (int j = 0; j < C; j++) {
+        if (i >= j && j < valid_len) {
+            // A[i, j] = A[mat_base + i + j * C]
+            a_qk_row[j] = A_qk[mat_base + i + j * C];
+            a_qb_row[j] = A_qb[mat_base + i + j * C];
+        } else {
+            a_qk_row[j] = 0.0f;
+            a_qb_row[j] = 0.0f;
+        }
+    }
+
+    // Compute output for each K element
+    for (int kk = 0; kk < K_dim; kk++) {
+        // Term 1: qg[i, kk] @ h[chunk] -> dot product over K dimension
+        // qg @ h produces a [K]-element vector per token position.
+        // For output element kk (the V dimension), we compute:
+        //   sum over k_inner: qg[i, k_inner] * h[k_inner, kk, head, chunk]
+        //
+        // Use pairwise summation for better numerical precision (K_dim=64 elements).
+        float pairs[64];
+        #pragma unroll 16
+        for (int k_inner = 0; k_inner < K_dim; k_inner++) {
+            const float qg_val = qg[k_inner + tok_offset];
+            const float h_val = h[k_inner * K_dim + kk + h_base];
+            pairs[k_inner] = qg_val * h_val;
+        }
+        // Pairwise reduce: 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+        #pragma unroll
+        for (int stride = 32; stride >= 1; stride >>= 1) {
+            #pragma unroll
+            for (int idx = 0; idx < stride; idx++) {
+                pairs[idx] += pairs[idx + stride];
+            }
+        }
+        float state_dot = pairs[0];
+
+        // Term 2: sum_j(A_qk[i,j] * v[j, kk]) for j in valid positions
+        float local_attn = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            if (a_qk_row[j] != 0.0f) {
+                const int j_abs = chunk_start + j;
+                const int j_tok = kk + i_h * K_dim + (bos + j_abs) * token_stride;
+                const float v_val = __half2float(v[j_tok]);
+                local_attn += a_qk_row[j] * v_val;
+            }
+        }
+
+        // Term 3: sum_j(A_qb[i,j] * v_new[j, kk]) for j in valid positions
+        float wy_corr = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            if (a_qb_row[j] != 0.0f) {
+                const int j_abs = chunk_start + j;
+                const int j_tok = kk + i_h * K_dim + (bos + j_abs) * token_stride;
+                const float vn_val = v_new[j_tok];
+                wy_corr += a_qb_row[j] * vn_val;
+            }
+        }
+
+        // Combine all three terms and store as f16
+        const float result = state_dot + local_attn + wy_corr;
+        o[kk + tok_offset] = __float2half(result);
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for Stage 5 (output combination)
+// ============================================================================
+
+hipError_t launch_fla_chunk_o(
+    const float*  qg,
+    const __half* v,
+    const float*  v_new,
+    const float*  A_qk,
+    const float*  A_qb,
+    const float*  h,
+    __half*       o,
+    const int*    chunk_indices,
+    const int*    cu_seqlens,
+    const int*    batch_offsets,
+    int K,
+    int H,
+    int C,
+    int total_chunks,
+    hipStream_t   stream
+) {
+    if (K <= 0 || H <= 0 || C <= 0 || total_chunks <= 0) {
+        return hipSuccess;
+    }
+
+    dim3 grid(total_chunks, H, 1);
+    dim3 block(C);
+
+    hipLaunchKernelGGL(kernel_fla_chunk_o, grid, block, 0, stream,
+                       qg, v, v_new, A_qk, A_qb, h, o,
+                       chunk_indices, cu_seqlens, batch_offsets,
+                       K, H, C);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// Utility: f16 raw log-decay to f32 negative exponential (kernel_fla_neg_exp_f16_to_f32)
+//
+// Converts att_w (f16, raw log-domain decay = -softplus(...) - 0.5) to
+// gk (f32) = -exp(att_w).
+//
+// This avoids the precision-losing round-trip through f16 exp(-exp(w))
+// then log. The raw att_w is passed directly from the decay computation
+// in step.rs, before the exp(-exp(w)) conversion.
+// ============================================================================
+
+__global__ __launch_bounds__(256, 4)
+void kernel_fla_neg_exp_f16_to_f32(
+    const __half* __restrict__ att_w,     // [N] f16 raw log-domain decay (w = -softplus(...) - 0.5)
+    float* __restrict__ gk,               // [N] f32 output: gk = -exp(w)
+    int N
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N) {
+        gk[idx] = -expf(__half2float(att_w[idx]));
+    }
+}
+
+hipError_t launch_fla_neg_exp_f16_to_f32(
+    const __half* att_w,
+    float* gk,
+    int N,
+    hipStream_t stream
+) {
+    if (N <= 0) return hipSuccess;
+
+    const int block_size = 256;
+    const int grid_size = (N + block_size - 1) / block_size;
+
+    hipLaunchKernelGGL(kernel_fla_neg_exp_f16_to_f32, dim3(grid_size), dim3(block_size), 0, stream,
+                       att_w, gk, N);
+
+    return hipGetLastError();
+}
+
+// ============================================================================
+// State transpose kernel (kernel_state_transpose)
+//
+// Transposes each 64x64 WKV state block between FLA layout [K_row, V_col]
+// and decode layout [V_row, K_col], or vice versa.
+//
+// Out-of-place: reads from src, writes to dst.
+//
+// State layout: [K, K, H, B] where each (h, b) pair has one K×K matrix.
+// FLA stores state[k * K + v] (K-rows, V-cols).
+// Decode reads state[v * K + k] (V-rows, K-cols).
+// Transposing converts between these two layouts.
+//
+// One block handles one K×K matrix (one head of one batch item).
+// Block dim: dim3(64, 16) = 1024 threads.
+// Thread (tx, ty) handles column tx, rows ty*4 .. ty*4+3 (4 elements each).
+//
+// Uses shared memory with +1 padding on the inner dimension to avoid bank
+// conflicts during the transposed write-back.
+//
+// Grid:  dim3(num_heads * batch_size, 1, 1)
+// Block: dim3(64, 16, 1)
+// ============================================================================
+
+__global__ __launch_bounds__(1024, 1)
+void kernel_state_transpose(
+    const float* __restrict__ src,   // [K, K, H, B] source state
+    float* __restrict__ dst,         // [K, K, H, B] destination state (transposed)
+    int K,                           // matrix dimension (64)
+    int num_heads,                   // H
+    int batch_size                   // B
+) {
+    // Each block handles one K×K matrix for a specific (head, batch) pair.
+    const int mat_idx = blockIdx.x;  // 0 .. H*B - 1
+    if (mat_idx >= num_heads * batch_size) return;
+
+    const int tx = threadIdx.x;  // column index (0..K-1)
+    const int ty = threadIdx.y;  // row group index (0..15)
+
+    // Base offset for this matrix in the flattened [K, K, H, B] array.
+    // Each matrix has K*K elements, matrices are packed as (h, b) pairs:
+    //   matrix (h, b) starts at offset (h + b * H) * K * K
+    const int mat_offset = mat_idx * K * K;
+
+    // Shared memory with +1 padding for bank conflict avoidance.
+    // smem[row][col+1_padding] — 64 × 65 floats = 16.25 KB.
+    __shared__ float smem[64][65];
+
+    // Step 1: Load src into shared memory (coalesced reads).
+    // src[row * K + col] for this matrix → smem[row][col]
+    // Each thread handles 4 rows: ty*4 .. ty*4+3
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        const int row = ty * 4 + r;
+        if (row < K && tx < K) {
+            smem[row][tx] = src[mat_offset + row * K + tx];
+        }
+    }
+
+    __syncthreads();
+
+    // Step 2: Write transposed from shared memory to dst (coalesced writes).
+    // dst[col * K + row] = smem[row][col]
+    // Equivalently: dst[tx * K + row] = smem[row][tx]
+    // But for coalesced writes, we want threads in a warp to write consecutive addresses.
+    // Thread (tx, ty) writes dst[row * K + tx] = smem[tx][row] (transposed read from smem).
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        const int row = ty * 4 + r;
+        if (row < K && tx < K) {
+            dst[mat_offset + row * K + tx] = smem[tx][row];
+        }
+    }
+}
+
+// ============================================================================
+// Host launch wrapper for kernel_state_transpose
+// ============================================================================
+
+hipError_t launch_state_transpose(
+    const float* src,
+    float* dst,
+    int K,
+    int num_heads,
+    int batch_size,
+    hipStream_t stream
+) {
+    if (K <= 0 || num_heads <= 0 || batch_size <= 0) {
+        return hipSuccess;
+    }
+
+    dim3 grid(num_heads * batch_size, 1, 1);
+    dim3 block(64, 16, 1);
+
+    hipLaunchKernelGGL(kernel_state_transpose, grid, block, 0, stream,
+                       src, dst, K, num_heads, batch_size);
+
+    return hipGetLastError();
+}
+
+} // extern "C"

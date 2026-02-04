@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>web-rwkv Benchmark Dashboard</title>
+    <link rel="stylesheet" href="style.css?v=20260212">
+    <!-- D3.js v7 for lightweight, flexible charting -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+</head>
+<body>
+    <header class="header">
+        <h1>web-rwkv Benchmark Dashboard</h1>
+        <span class="version">v0.1</span>
+    </header>
+
+    <main class="main-container">
+        <!-- File Loading Area -->
+        <section class="file-loading-area">
+            <!-- File Drop Zone -->
+            <div class="drop-zone" id="drop-zone">
+                <div class="drop-zone-content">
+                    <p class="drop-zone-text">Drop JSONL files here or click to browse</p>
+                    <input type="file" id="file-input" accept=".jsonl,.json" multiple hidden>
+                    <p class="drop-zone-hint">Supports multiple files</p>
+                </div>
+            </div>
+
+            <!-- Server Files Section -->
+            <div class="server-files-section" id="server-files-section">
+                <div class="server-files-header">
+                    <span class="server-files-title">Load from Server</span>
+                    <button class="server-refresh-btn" id="server-refresh-btn" title="Refresh file list">
+                        &#8635;
+                    </button>
+                </div>
+                <div class="server-files-content" id="server-files-content">
+                    <p class="server-files-status" id="server-files-status">Click refresh to load available files</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Filters Area -->
+        <section class="filters-panel" id="filters-panel">
+            <h2>Filters</h2>
+            <div class="filter-groups" id="filter-groups">
+                <!-- Filter groups will be populated dynamically -->
+                <p class="placeholder-text">Load benchmark data to enable filters</p>
+            </div>
+        </section>
+
+        <!-- Main Content Area -->
+        <section class="content-area" id="content-area">
+            <!-- Summary Stats -->
+            <div class="stats-bar" id="stats-bar">
+                <div class="stat-item">
+                    <span class="stat-label">Runs</span>
+                    <span class="stat-value" id="stat-runs">--</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Cases</span>
+                    <span class="stat-value" id="stat-cases">--</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Backends</span>
+                    <span class="stat-value" id="stat-backends">--</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Models</span>
+                    <span class="stat-value" id="stat-models">--</span>
+                </div>
+                <div class="stat-item stat-item-export">
+                    <button class="export-btn" id="export-btn" title="Export filtered data as JSONL" disabled>
+                        Export JSONL
+                    </button>
+                </div>
+            </div>
+
+            <!-- View Tabs -->
+            <nav class="view-tabs" id="view-tabs">
+                <button class="tab-button active" data-view="table">Summary Table</button>
+                <button class="tab-button" data-view="heatmap">Heatmap</button>
+                <button class="tab-button" data-view="line">Line Chart</button>
+                <button class="tab-button" data-view="distribution">Distribution</button>
+                <button class="tab-button" data-view="compare">Compare Runs</button>
+            </nav>
+
+            <!-- Chart/Table Container -->
+            <div class="view-container" id="view-container">
+                <div class="empty-state">
+                    <p>No data loaded</p>
+                    <p class="empty-hint">Drop a JSONL benchmark file above to get started</p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span>web-rwkv benchmarking infrastructure</span>
+        <span class="separator">|</span>
+        <a href="https://github.com/cryscan/web-rwkv" target="_blank" rel="noopener">GitHub</a>
+    </footer>
+
+    <script src="app.js?v=20260212"></script>
+</body>
+</html>

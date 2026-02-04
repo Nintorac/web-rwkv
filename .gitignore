@@ -2,7 +2,13 @@
 /trace
 /.vscode
 .DS_Store
-
+!.beads/
 Cargo.lock
 *.st
 *.safetensors
+
+__pycache__/
+repos/
+benchmarks/results/
+results*
+.rocprofv3/

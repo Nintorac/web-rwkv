@@ -1,0 +1,480 @@
+# web-rwkv Benchmark Configuration
+# ===================================
+# This file defines the benchmark matrix for performance testing.
+# All benchmark parameters are config-driven; code only understands scenario types,
+# how to execute them, and how to write JSONL output.
+
+# Schema version - bump on breaking changes
+schema_version: 1
+
+# =============================================================================
+# PROFILES
+# =============================================================================
+# Named presets that reference model/backend lists and scenario params.
+# Use `WEB_RWKV_BENCH_PROFILE` env var to select (default: smoke).
+
+profiles:
+  smoke:
+    description: "Quick sanity check (<1 min). Uses minimal parameters for fast iteration."
+    models:
+      - rwkv7_othello_9m
+    backends:
+      - wgpu
+    scenarios:
+      - decode_only
+      - prefill_uniform
+    batch_sizes: [1, 4]
+    token_chunk_sizes: [128]
+    decode_steps: [128]
+    seq_lens: [32, 128, 256]
+    warmup_runs: 1
+    repeats: 2
+
+  dev:
+    description: "Development profile (~5-10 min). Broader coverage for local testing."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+    backends:
+      - hip
+      - wgpu
+    scenarios:
+      - decode_only
+      - prefill_uniform
+      - prefill_mixed
+    batch_sizes: [16, 32]
+    token_chunk_sizes: [32]
+    decode_steps: [32, 64]
+    seq_lens: [32, 64]
+    warmup_runs: 0
+    repeats: 1
+
+  decode_batch_sweep:
+    description: "Decode-only batch sweep (fast). Single-step decode across large batch sizes."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+    backends:
+      - wgpu
+      - hip
+    scenarios:
+      - decode_only
+    # batch_sizes: [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    batch_sizes: [32, 64, 128, 256]
+    token_chunk_sizes: [1]
+    decode_steps: [8]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
+  ablation_all_sizes:
+    description: "Ablation across all model sizes (0.1b, 2.9b, 13.3b)."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+      - rwkv7_g0b_13.3b
+    backends:
+      - wgpu
+      - hip
+    scenarios:
+      - decode_only
+    batch_sizes: [1, 8, 32, 64, 128]
+    token_chunk_sizes: [1]
+    decode_steps: [16]
+    seq_lens: []
+    warmup_runs: 1
+    repeats: 1
+
+  ablation_quick:
+    description: "Quick ablation for HIP optimizations (0.1b and 2.9b, HIP only)."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+    backends:
+      - hip
+    scenarios:
+      - decode_only
+    batch_sizes: [64, 256]
+    token_chunk_sizes: [1]
+    decode_steps: [8]
+    seq_lens: []
+    warmup_runs: 1
+    repeats: 1
+
+  decode_batch_sweep_hip:
+    description: "Decode-only batch sweep (fast, hip only)."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+    backends:
+      - hip
+    scenarios:
+      - decode_only
+    # batch_sizes: [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    batch_sizes: [32, 64, 128, 256, 512, 1024]
+    token_chunk_sizes: [1]
+    decode_steps: [64]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
+  decode_batch_sweep_hip_large:
+    description: "Decode-only batch sweep (hip only, large batches)."
+    models:
+      - rwkv7_g1a_0.1b
+      # - rwkv7_g1c_2.9b
+    backends:
+      - hip
+    scenarios:
+      - decode_only
+    batch_sizes: [512, 1024, 2048, 4096, 8192, 16384, 32768]
+    token_chunk_sizes: [1]
+    decode_steps: [64]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
+  decode_dev:
+    description: "Decode-only dev loop (very fast). 0.1b only, small batch sweep."
+    models:
+      - rwkv7_g1a_0.1b
+    backends:
+      - hip
+    scenarios:
+      - decode_only
+    batch_sizes: [32, 64, 128, 256]
+    token_chunk_sizes: [1]
+    decode_steps: [4]
+    seq_lens: []
+    warmup_runs: 0
+    repeats: 1
+
+  full:
+    description: "Full benchmark suite (~30+ min). Comprehensive coverage for CI/nightly."
+    models:
+      - rwkv7_g1a_0.1b
+      - rwkv7_g1c_2.9b
+    backends:
+      - wgpu
+      - hip
+    scenarios:
+      - decode_only
+      - prefill_uniform
+      - prefill_mixed
+    batch_sizes: [1, 2, 4, 8, 16, 32]
+    token_chunk_sizes: [32, 128, 256, 512]
+    decode_steps: [128, 512, 2048]
+    seq_lens: [1, 8, 32, 64, 127, 128, 129, 256, 512, 1024, 2048]
+    warmup_runs: 2
+    repeats: 5
+
+# =============================================================================
+# MODELS
+# =============================================================================
+# List of model entries. Each entry defines identity, path, and optional overrides.
+
+models:
+  - model_id: "a667c2c8c5505ffefd3ee043927751793a95e82dd286d64e6f141759b91dcbe3"
+    model_name: "rwkv7_g1a_0.1b"
+    model_size: "0.1b"
+    path: "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st"
+    tags:
+      rwkv_version: "v7"
+      variant: "g1a"
+      ctx: 4096
+    max_batch_size: 65536
+    max_token_chunk_size: 4096
+    skip: false
+
+  - model_id: "cf1b7f37b346c6e44949c9ece3338aa99222a3acaeebe258b376745860e6d0ce"
+    model_name: "rwkv7_g1c_2.9b"
+    model_size: "2.9b"
+    path: "/workspace/models/rwkv7-g1c-2.9b-20251231-ctx8192.st"
+    tags:
+      rwkv_version: "v7"
+      variant: "g1c"
+      ctx: 8192
+    max_batch_size: 65536
+    max_token_chunk_size: 4096
+    skip: false
+
+  - model_id: "rwkv7_g0b_13.3b"
+    model_name: "rwkv7_g0b_13.3b"
+    model_size: "13.3b"
+    path: "/workspace/models/rwkv7-g0b-13.3b-20251130-ctx8192.st"
+    tags:
+      rwkv_version: "v7"
+      variant: "g0b"
+      ctx: 8192
+    max_batch_size: 256
+    max_token_chunk_size: 4096
+    skip: false
+
+  - model_id: "e06bcb54ba0c4421c5166f0c85e205e334e3161bc82bc636d4d87f18be7555f6"
+    model_name: "rwkv7_othello_9m"
+    model_size: "9m"
+    path: "assets/models/rwkv7_othello_9m_L10_D256_extended.st"
+    tags:
+      rwkv_version: "v7"
+      domain: "othello"
+      layers: 10
+      dim: 256
+    # Optional execution overrides
+    max_batch_size: 64
+    max_token_chunk_size: 1024
+    skip: false
+
+  - model_id: "6d61ed414617d58ae32c41ce23eeb52ecab8fd72caea10c34a9ee056f921f4cd"
+    model_name: "rwkv_puzzle15"
+    model_size: "8m"
+    path: "assets/models/rwkv-puzzle15.st"
+    tags:
+      rwkv_version: "v6"
+      domain: "puzzle"
+      variant: "finch"
+    # This model has custom ops; may need special handling
+    max_batch_size: 32
+    max_token_chunk_size: 512
+    skip: false
+
+# =============================================================================
+# BACKENDS
+# =============================================================================
+# Backend entries for wgpu and hip execution.
+
+backends:
+  - backend_id: "wgpu"
+    wgpu_backends:
+      - "Vulkan"
+      - "Dx12"
+      - "Metal"
+    adapter_selection: "auto_high_perf"
+    skip: false
+
+  - backend_id: "hip"
+    wgpu_backends: []  # Not applicable for hip
+    adapter_selection: "auto_high_perf"
+    skip: false
+
+# =============================================================================
+# SCENARIOS
+# =============================================================================
+# Definitions of benchmark scenario types and their default parameters.
+
+scenarios:
+  decode_only:
+    description: "Measure decode throughput in steady-state one-token-per-step mode."
+    # Kernel seq_len is always 1; measures repeated infer() calls
+    defaults:
+      decode_steps: [128, 512, 2048]
+      # Optional untimed prime prefill before decode
+      prime_prefill_len: 0
+      # Whether to sample per-step latencies (adds overhead)
+      record_per_step_latency: false
+
+  prefill_uniform:
+    description: "Measure prompt processing with uniform prompt lengths across batches."
+    # Each batch has the same prompt length L
+    defaults:
+      # Seq lens defined relative to token_chunk_size C:
+      # [1, C/4, C/2, C-1, C, C+1, 2C, 4C, 8C]
+      seq_len_pattern: "chunk_relative"
+      # Or use explicit list
+      seq_lens: [1, 32, 64, 128, 256, 512, 1024, 2048]
+
+  prefill_mixed:
+    description: "Measure batching behavior with different prompt lengths per batch element."
+    defaults:
+      # Named mixed cases - see mixed_cases section for definitions
+      mixed_case_ids:
+        - "staircase_8"
+        - "bimodal_half"
+        - "one_long_rest_short"
+        - "realistic_chat_scaled"
+
+# Mixed case definitions for prefill_mixed scenario
+mixed_cases:
+  staircase_8:
+    description: "Spread from very short to very long (8 elements)"
+    # Pattern relative to C (token_chunk_size):
+    # [C/16, C/8, C/4, C/2, 3C/4, C, 2C, 4C]
+    base_pattern_divisors: [16, 8, 4, 2, 1.333, 1, 0.5, 0.25]
+    adapt_rule: "truncate_or_repeat"
+
+  bimodal_half:
+    description: "Two buckets: short (C/8) and long (4C)"
+    short_divisor: 8
+    long_divisor: 0.25
+    # ceil(B/2) long, floor(B/2) short
+    distribution: "long_heavy"
+
+  one_long_rest_short:
+    description: "One very long prompt (8C), rest short (C/8)"
+    long_divisor: 0.125
+    short_divisor: 8
+    long_count: 1
+
+  realistic_chat_scaled:
+    description: "Hand-curated increasing pattern scaled from C=256 base"
+    # Base pattern for C=256
+    base_lengths: [32, 64, 96, 128, 192, 256, 384, 512]
+    base_chunk_size: 256
+    # Scale: len_i = max(1, base_i * C / 256)
+    scale_rule: "linear"
+
+# =============================================================================
+# SWEEPS
+# =============================================================================
+# Cartesian product definitions for benchmark matrix expansion.
+
+sweeps:
+  # Default sweep used when profile doesn't override
+  default:
+    models: ["rwkv7_othello_9m"]
+    backends: ["wgpu"]
+    batch_sizes: [1, 2, 4, 8]
+    token_chunk_sizes: [128, 256]
+    seq_lens: [32, 128, 256, 512]
+    decode_steps: [128, 512]
+
+  # Smoke test sweep (minimal)
+  smoke:
+    models: ["rwkv7_othello_9m"]
+    backends: ["wgpu"]
+    batch_sizes: [1, 4]
+    token_chunk_sizes: [128]
+    seq_lens: [32, 128]
+    decode_steps: [128]
+
+  # Development sweep
+  dev:
+    models: ["rwkv7_g1a_0.1b", "rwkv7_g1c_2.9b"]
+    backends: ["wgpu"]
+    batch_sizes: [1, 2, 4, 8, 16]
+    token_chunk_sizes: [128, 256]
+    seq_lens: [1, 32, 64, 128, 256, 512]
+    decode_steps: [128, 512]
+
+  # Full sweep for CI
+  full:
+    models: ["rwkv7_g1a_0.1b", "rwkv7_g1c_2.9b"]
+    backends: ["wgpu", "hip"]
+    batch_sizes: [1, 2, 4, 8, 16, 32]
+    token_chunk_sizes: [32, 128, 256, 512]
+    seq_lens: [1, 8, 32, 64, 127, 128, 129, 256, 512, 1024, 2048]
+    decode_steps: [128, 512, 2048]
+
+# =============================================================================
+# OUTPUT
+# =============================================================================
+# JSONL output path configuration.
+
+output:
+  # Directory for benchmark results
+  directory: "benchmarks/results"
+
+  # File naming pattern
+  # Available placeholders: {profile}, {timestamp}, {git_sha}, {run_id}
+  filename_pattern: "bench_{profile}_{timestamp}.jsonl"
+
+  # Whether to append to existing file or create new
+  mode: "create_new"
+
+  # Enable compression (gzip) for output files
+  compress: false
+
+  # Include run header record at start of each output file
+  include_run_header: true
+
+  # Pretty-print JSON (one field per line) - disable for smaller files
+  pretty_print: false
+
+# =============================================================================
+# SKIP CONDITIONS
+# =============================================================================
+# Rules for skipping cases that would fail or are not meaningful.
+
+skip_conditions:
+  # Skip if batch_size exceeds model's max
+  skip_batch_exceeds_model_max: true
+
+  # Skip if token_chunk_size exceeds model's max
+  skip_chunk_exceeds_model_max: true
+
+  # Skip combinations known to fail (e.g., hip + certain models)
+  skip_known_failures: true
+
+  # Skip if estimated memory exceeds available GPU memory
+  skip_oom_predicted: true
+
+  # Custom skip rules (evaluated in order)
+  custom_rules:
+    - name: "skip_large_batch_large_seq"
+      description: "Skip batch_size > 16 when seq_len > 1024"
+      condition: "batch_size > 16 and seq_len > 1024"
+
+    - name: "skip_puzzle15_hip"
+      description: "Skip puzzle15 model on hip backend (custom ops not supported)"
+      condition: "model_name == 'rwkv_puzzle15' and backend_id == 'hip'"
+
+    - name: "skip_wgpu_large_batch"
+      description: "Skip large batch sizes on wgpu to avoid buffer size limits"
+      condition: "backend_id == 'wgpu' and batch_size > 256"
+
+# =============================================================================
+# LIMITS
+# =============================================================================
+# Global limits for benchmark execution.
+
+limits:
+  # Maximum total number of benchmark cases to run
+  max_total_cases: 10000
+
+  # Maximum total runtime in seconds (0 = unlimited)
+  max_runtime_seconds: 3600
+
+  # Stop on first error vs continue and log errors
+  fail_fast: false
+
+  # Maximum errors before aborting (0 = unlimited)
+  max_errors: 100
+
+  # Per-case timeout in seconds
+  case_timeout_seconds: 300
+
+  # Maximum memory usage threshold (percentage of available GPU memory)
+  max_memory_percent: 90
+
+# =============================================================================
+# SHARED CONTROLS
+# =============================================================================
+# Default values for all scenarios (can be overridden per-profile).
+
+shared_controls:
+  # Fixed PRNG seed for token generation (ensures reproducibility)
+  seed: 42
+
+  # Warmup configuration
+  warmup:
+    # Number of full repeats not recorded
+    warmup_runs: 1
+    # Per-repeat warmup steps for decode
+    warmup_steps: 64
+
+  # Number of recorded repeats per case
+  repeats: 5
+
+  # Timing configuration
+  timing:
+    # Use Instant::now() around measured loop only
+    exclude_model_load: true
+    # Device settle delay between repeats (milliseconds)
+    settle_delay_ms: 100
+
+  # Error handling policy
+  error_policy:
+    # Continue on error and write status=error records
+    continue_on_error: true
+    # Error classification for JSONL records
+    classify_errors: true
+    # Error kinds: oom, device_lost, unsupported_backend, file_missing, timeout

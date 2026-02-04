@@ -1,0 +1,6 @@
+# Fixture files are generated, not committed (too large)
+# Regenerate with: python scripts/generate_test_fixtures.py
+*.npz
+
+# Keep the .gitignore
+!.gitignore
