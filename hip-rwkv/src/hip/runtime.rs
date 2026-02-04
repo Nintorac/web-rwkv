@@ -264,6 +264,42 @@ impl HipRuntime {
         inner.prefill.get_state()
     }
 
+    /// Get the recurrent state for a single batch slot.
+    ///
+    /// Returns a `HipState` with `batch_size=1` containing only the state
+    /// for the specified batch index. This is the per-batch variant of
+    /// `get_state()`, used by `HipStateAdapter::back()` to extract state
+    /// for a specific server slot without touching other slots.
+    ///
+    /// # Arguments
+    /// * `batch_idx` - Index of the batch slot to extract (0-based)
+    pub fn get_state_batch(&self, batch_idx: usize) -> Result<HipState, super::HipErrorKind> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.prefill.get_state_batch(batch_idx)
+    }
+
+    /// Load a single-batch state into a specific batch slot.
+    ///
+    /// Writes the given state (must have `batch_size=1`) into the
+    /// specified batch index of the GPU state, leaving all other
+    /// batch slots untouched. This is the per-batch variant of
+    /// `load_state()`, used by `HipStateAdapter::load()` to restore
+    /// a specific server slot without clobbering other slots.
+    ///
+    /// # Arguments
+    /// * `batch_idx` - Destination batch slot index (0-based)
+    /// * `state` - Single-batch state to load
+    pub fn load_state_batch(
+        &self,
+        batch_idx: usize,
+        state: &HipState,
+    ) -> Result<(), super::HipErrorKind> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.prefill.load_state_batch(batch_idx, state)?;
+        inner.needs_state_transfer = true;
+        Ok(())
+    }
+
     /// Transfer state from prefill to decode module.
     ///
     /// Called automatically on the first decode after a prefill pass.
@@ -1714,5 +1750,248 @@ mod tests {
         );
 
         println!("test_hip_runtime_multichunk_prefill_with_empty_batches PASSED");
+    }
+
+    /// Regression test for per-batch state save/restore.
+    ///
+    /// Simulates the ai00 server's multi-step prefill pattern:
+    ///   1. Infer chunk 1 on all 4 batches (32 tokens each)
+    ///   2. Save state for batch 3 only
+    ///   3. Infer chunk 2 on all 4 batches (32 more tokens each, advances all states)
+    ///   4. Restore batch 3's saved state (should not affect batches 0-2)
+    ///   5. Infer chunk 3 on all 4 batches (16 more tokens)
+    ///
+    /// Verifies that batch 0's final logits match ground truth (single-shot
+    /// 80-token inference), proving the save/restore of batch 3 did not corrupt
+    /// batch 0's state.
+    ///
+    /// This test exercises `get_state_batch`/`load_state_batch` which are the
+    /// per-batch methods that `HipStateAdapter.load()`/`.back()` must use.
+    /// The old code used all-batch `get_state`/`load_state`, which rolled back
+    /// every batch when restoring just one.
+    #[test]
+    fn test_per_batch_state_save_restore() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let num_batch = 4;
+        let total_tokens = 80;
+        let target_batch: usize = 3;
+        // Use different tokens per batch to ensure distinct states
+        let batch_tokens: Vec<Vec<u32>> = (0..num_batch)
+            .map(|b| {
+                (1..=total_tokens as u32)
+                    .map(|t| t + (b as u32) * 1000)
+                    .collect()
+            })
+            .collect();
+
+        // Use chunk_size=512 for both runtimes (large enough for any single infer call).
+        // The "chunking" is done manually by the test to simulate the server's pattern.
+        let chunk_size = 512;
+
+        // === Ground truth: process all 80 tokens on all 4 batches in one shot ===
+        let model_gt = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config_gt = HipRuntimeConfig::new(chunk_size, num_batch);
+        let runtime_gt = HipRuntime::with_config(model_gt, config_gt)
+            .expect("Failed to create ground truth runtime");
+
+        let gt_refs: Vec<&[u32]> = batch_tokens.iter().map(|v| v.as_slice()).collect();
+        let gt_logits = runtime_gt.infer(&gt_refs).expect("Ground truth inference failed");
+
+        // Extract last-token logits for each batch from ground truth
+        let lengths: Vec<usize> = batch_tokens.iter().map(|v| v.len()).collect();
+        let gt_last_logits = runtime_gt.extract_last_logits(&gt_logits, &lengths);
+
+        // === Test path: per-batch save/restore for batch 3 ===
+        let model_test = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config_test = HipRuntimeConfig::new(chunk_size, num_batch);
+        let runtime_test = HipRuntime::with_config(model_test, config_test)
+            .expect("Failed to create test runtime");
+
+        // Step 1: Infer first 32 tokens on ALL 4 batches
+        let chunk1: Vec<&[u32]> = batch_tokens.iter().map(|v| &v[..32]).collect();
+        let _logits1 = runtime_test.infer(&chunk1).expect("Chunk 1 failed");
+
+        // Step 2: Save batch 3 state using per-batch method
+        let saved_state = runtime_test
+            .get_state_batch(target_batch)
+            .expect("get_state_batch failed");
+
+        // Step 3: Infer tokens 32..64 on ALL 4 batches (advances all states)
+        let chunk2: Vec<&[u32]> = batch_tokens.iter().map(|v| &v[32..64]).collect();
+        let _logits2 = runtime_test.infer(&chunk2).expect("Chunk 2 failed");
+
+        // Step 4: Restore batch 3 state using per-batch method.
+        // Only batch 3 is rolled back; batches 0-2 keep their state at 64 tokens.
+        runtime_test
+            .load_state_batch(target_batch, &saved_state)
+            .expect("load_state_batch failed");
+
+        // Step 5: Infer remaining tokens 64..80 on ALL 4 batches
+        let chunk3: Vec<&[u32]> = batch_tokens.iter().map(|v| &v[64..80]).collect();
+        let logits3 = runtime_test.infer(&chunk3).expect("Chunk 3 failed");
+
+        // Extract last-token logits from the test path for batch 0
+        let chunk3_lengths: Vec<usize> = chunk3.iter().map(|v| v.len()).collect();
+        let test_last_logits = runtime_test.extract_last_logits(&logits3, &chunk3_lengths);
+
+        // Compare batch 0 logits: ground truth vs test path
+        let top_k = |logits: &[f32], k: usize| -> Vec<usize> {
+            let mut indexed: Vec<(usize, f32)> =
+                logits.iter().copied().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            indexed.into_iter().take(k).map(|(i, _)| i).collect()
+        };
+
+        // Batch 0 should match ground truth because per-batch save/restore
+        // only touched batch 3, leaving batch 0's state intact.
+        let gt_batch0_top10 = top_k(&gt_last_logits[0], 10);
+        let test_batch0_top10 = top_k(&test_last_logits[0], 10);
+        let overlap_batch0 = gt_batch0_top10
+            .iter()
+            .filter(|i| test_batch0_top10.contains(i))
+            .count();
+
+        println!("test_per_batch_state_save_restore:");
+        println!("  Batch 0 ground truth top-10: {:?}", gt_batch0_top10);
+        println!("  Batch 0 test path top-10:    {:?}", test_batch0_top10);
+        println!("  Top-10 overlap: {}/10", overlap_batch0);
+
+        assert!(
+            overlap_batch0 >= 8,
+            "Batch 0 top-10 overlap is {}/10 -- per-batch save/restore for batch {} \
+             should not corrupt batch 0's state!",
+            overlap_batch0,
+            target_batch,
+        );
+
+        println!("test_per_batch_state_save_restore PASSED");
+    }
+
+    /// Test state round-trip through get_state_batch -> load_state_batch.
+    ///
+    /// Bug: bd-2sh.8.19.6 -- Verifies that the Decode/FLA layout transpose
+    /// in get_state_batch/load_state_batch round-trips correctly when moving
+    /// state between different batch slots across runtimes.
+    ///
+    /// Flow:
+    ///   1. Process 20 tokens on batch 0 in runtime A
+    ///   2. Get batch 0's state via get_state_batch(0) -> single-batch HipState
+    ///   3. Create runtime B, load that state into batch 2 via load_state_batch(2)
+    ///   4. Process 10 more tokens on batch 0 (runtime A) and batch 2 (runtime B)
+    ///   5. Verify both produce the same logits
+    #[test]
+    fn test_state_batch_roundtrip_different_slots() {
+        let model_path = "/workspace/models/rwkv7-g1a-0.1b-20250728-ctx4096.st";
+        if !Path::new(model_path).exists() {
+            eprintln!("Skipping test: model not found at {}", model_path);
+            return;
+        }
+
+        let num_batch = 4;
+        let chunk_size = 128;
+        let prefix_tokens: Vec<u32> = (1..=20).collect();
+        let suffix_tokens: Vec<u32> = (21..=30).collect();
+        let empty: Vec<u32> = vec![];
+
+        // Runtime A: process prefix on batch 0
+        let model_a = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config_a = HipRuntimeConfig::new(chunk_size, num_batch);
+        let runtime_a = HipRuntime::with_config(model_a, config_a)
+            .expect("Failed to create runtime A");
+
+        let refs_prefix: Vec<&[u32]> = vec![
+            prefix_tokens.as_slice(),
+            empty.as_slice(),
+            empty.as_slice(),
+            empty.as_slice(),
+        ];
+        let _logits_prefix = runtime_a
+            .infer(&refs_prefix)
+            .expect("Prefix inference failed on runtime A");
+
+        // Save batch 0's state
+        let state_b0 = runtime_a
+            .get_state_batch(0)
+            .expect("get_state_batch(0) failed");
+        assert_eq!(state_b0.batch_size, 1);
+
+        // Runtime B: load batch 0's state into batch 2
+        let model_b = Rwkv7Hip::load(model_path).expect("Failed to load model");
+        let config_b = HipRuntimeConfig::new(chunk_size, num_batch);
+        let runtime_b = HipRuntime::with_config(model_b, config_b)
+            .expect("Failed to create runtime B");
+
+        runtime_b
+            .load_state_batch(2, &state_b0)
+            .expect("load_state_batch(2) failed");
+
+        // Process suffix tokens: batch 0 on runtime A, batch 2 on runtime B
+        let refs_suffix_a: Vec<&[u32]> = vec![
+            suffix_tokens.as_slice(),
+            empty.as_slice(),
+            empty.as_slice(),
+            empty.as_slice(),
+        ];
+        let logits_a = runtime_a
+            .infer(&refs_suffix_a)
+            .expect("Suffix inference failed on runtime A");
+
+        let refs_suffix_b: Vec<&[u32]> = vec![
+            empty.as_slice(),
+            empty.as_slice(),
+            suffix_tokens.as_slice(),
+            empty.as_slice(),
+        ];
+        let logits_b = runtime_b
+            .infer(&refs_suffix_b)
+            .expect("Suffix inference failed on runtime B");
+
+        // Extract last-token logits for the non-empty batches.
+        // Runtime A: only batch 0 has tokens, so extract_last_logits with just [len]
+        // Runtime B: only batch 2 has tokens, so extract_last_logits with just [len]
+        let last_a = runtime_a.extract_last_logits(
+            &logits_a,
+            &[suffix_tokens.len()],
+        );
+        let last_b = runtime_b.extract_last_logits(
+            &logits_b,
+            &[suffix_tokens.len()],
+        );
+
+        // Compare: runtime A batch 0 vs runtime B batch 2
+        let top_k = |logits: &[f32], k: usize| -> Vec<usize> {
+            let mut indexed: Vec<(usize, f32)> =
+                logits.iter().copied().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            indexed.into_iter().take(k).map(|(i, _)| i).collect()
+        };
+
+        let top10_a = top_k(&last_a[0], 10);
+        let top10_b = top_k(&last_b[0], 10);
+        let overlap = top10_a
+            .iter()
+            .filter(|i| top10_b.contains(i))
+            .count();
+
+        println!("test_state_batch_roundtrip_different_slots:");
+        println!("  Runtime A batch 0 top-10: {:?}", top10_a);
+        println!("  Runtime B batch 2 top-10: {:?}", top10_b);
+        println!("  Top-10 overlap: {}/10", overlap);
+
+        assert!(
+            overlap >= 8,
+            "State round-trip batch 0 -> batch 2 top-10 overlap too low: {}/10. \
+             Layout transpose in get_state_batch/load_state_batch may be broken.",
+            overlap,
+        );
+
+        println!("test_state_batch_roundtrip_different_slots PASSED");
     }
 }

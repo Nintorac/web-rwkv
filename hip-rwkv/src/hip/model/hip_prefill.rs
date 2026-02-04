@@ -176,6 +176,207 @@ impl HipPrefill {
         })
     }
 
+    /// Extract state for a single batch index from the GPU as a CPU-side `HipState`.
+    ///
+    /// Returns a `HipState` with `batch_size=1` containing only the state for
+    /// the specified batch item. The WKV state is transposed from FLA layout
+    /// (GPU-native) to Decode layout so that it matches the v7 WebGPU tensor
+    /// format used by `HipStateAdapter::hip_state_to_tensor()`. This ensures
+    /// correct round-trip: `get_state_batch` -> tensor -> `load_state_batch`.
+    ///
+    /// # Arguments
+    /// * `batch_idx` - Index of the batch item to extract (0-based)
+    ///
+    /// # Errors
+    /// Returns error if batch_idx is out of range or GPU-to-host copy fails.
+    pub fn get_state_batch(&mut self, batch_idx: usize) -> Result<HipState> {
+        let batch_size = self.scratch.config.batch_size;
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "get_state_batch: batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
+        }
+        let n_layer = self.model.info.n_layer;
+        let n_head = self.model.info.n_head;
+        let head_size = self.model.info.head_size;
+        let stream = self.scratch.blas_ctx.stream();
+
+        let fla_att_states = HipState::read_batch_wkv(
+            &self.scratch.wkv_state_gpu,
+            batch_idx,
+            batch_size,
+            stream,
+        )?;
+        let att_shift_states = HipState::read_batch_att_shift(
+            &self.scratch.att_shift_state_gpu,
+            batch_idx,
+            batch_size,
+            stream,
+        )?;
+        let ffn_states = HipState::read_batch_ffn(
+            &self.scratch.ffn_state_gpu,
+            batch_idx,
+            batch_size,
+            stream,
+        )?;
+
+        stream.synchronize()?;
+
+        assert_eq!(fla_att_states.len(), n_layer);
+        assert_eq!(att_shift_states.len(), n_layer);
+        assert_eq!(ffn_states.len(), n_layer);
+
+        // Transpose WKV state from FLA layout [k*K+v] to Decode layout [v*K+k]
+        // so it matches the v7 WebGPU tensor format for correct round-trip.
+        let elems_per_batch = head_size * head_size * n_head;
+        let mut att_states = Vec::with_capacity(n_layer);
+        for fla_buf in &fla_att_states {
+            let src = fla_buf.as_slice();
+            let mut decode_buf = PinnedBuffer::<f32>::new(elems_per_batch)?;
+            let dst = decode_buf.as_slice_mut();
+            for head in 0..n_head {
+                let offset = head * head_size * head_size;
+                for k in 0..head_size {
+                    for v in 0..head_size {
+                        dst[offset + v * head_size + k] = src[offset + k * head_size + v];
+                    }
+                }
+            }
+            att_states.push(decode_buf);
+        }
+
+        Ok(HipState {
+            batch_size: 1,
+            att_states,
+            att_shift_states,
+            ffn_states,
+            v_first: None,
+            layout: StateLayout::Decode,
+        })
+    }
+
+    /// Load a single-batch state into a specific batch slot on the GPU.
+    ///
+    /// The `state` must have `batch_size=1`. It is written into the
+    /// specified `batch_idx` within the multi-batch GPU state, leaving
+    /// all other batch slots untouched.
+    ///
+    /// Layout conversion is handled automatically:
+    /// - FLA layout: direct copy
+    /// - Decode layout: WKV state is transposed on host from [V_row, K_col]
+    ///   to [K_row, V_col] before uploading
+    ///
+    /// # Arguments
+    /// * `batch_idx` - Destination batch slot index (0-based)
+    /// * `state` - Single-batch state to load
+    ///
+    /// # Errors
+    /// Returns error if batch_idx is out of range, state.batch_size != 1,
+    /// or GPU copy fails.
+    pub fn load_state_batch(&mut self, batch_idx: usize, state: &HipState) -> Result<()> {
+        let batch_size = self.scratch.config.batch_size;
+        if batch_idx >= batch_size {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "load_state_batch: batch_idx {} out of range for batch_size {}",
+                    batch_idx, batch_size
+                ),
+            });
+        }
+        if state.batch_size != 1 {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "load_state_batch: state.batch_size must be 1, got {}",
+                    state.batch_size
+                ),
+            });
+        }
+        let n_layer = self.model.info.n_layer;
+        let n_head = self.model.info.n_head;
+        let head_size = self.model.info.head_size;
+        if state.att_states.len() != n_layer
+            || state.att_shift_states.len() != n_layer
+            || state.ffn_states.len() != n_layer
+        {
+            return Err(HipErrorKind {
+                code: -1,
+                message: format!(
+                    "load_state_batch: layer count mismatch (state has {}/{}/{}, model has {})",
+                    state.att_states.len(),
+                    state.att_shift_states.len(),
+                    state.ffn_states.len(),
+                    n_layer
+                ),
+            });
+        }
+
+        let stream = self.scratch.blas_ctx.stream();
+
+        // Write att_shift and ffn states for this batch slot
+        HipState::write_batch_att_shift(
+            &mut self.scratch.att_shift_state_gpu,
+            batch_idx,
+            batch_size,
+            &state.att_shift_states,
+            stream,
+        )?;
+        HipState::write_batch_ffn(
+            &mut self.scratch.ffn_state_gpu,
+            batch_idx,
+            batch_size,
+            &state.ffn_states,
+            stream,
+        )?;
+
+        // Write WKV state with optional transpose
+        if state.layout == StateLayout::Decode {
+            // Source is in Decode layout [V_row, K_col], need to transpose to
+            // FLA layout [K_row, V_col]. Transpose on host, then write to batch slot.
+            let elems_per_batch = head_size * head_size * n_head;
+            let mut transposed_bufs = Vec::with_capacity(n_layer);
+            for i in 0..n_layer {
+                let src = state.att_states[i].as_slice();
+                let mut transposed = PinnedBuffer::<f32>::new(elems_per_batch)?;
+                let dst = transposed.as_slice_mut();
+                // Transpose each head's KxK matrix: decode[v*K+k] -> fla[k*K+v]
+                for head in 0..n_head {
+                    let offset = head * head_size * head_size;
+                    for k in 0..head_size {
+                        for v in 0..head_size {
+                            dst[offset + k * head_size + v] = src[offset + v * head_size + k];
+                        }
+                    }
+                }
+                transposed_bufs.push(transposed);
+            }
+            HipState::write_batch_wkv(
+                &mut self.scratch.wkv_state_gpu,
+                batch_idx,
+                batch_size,
+                &transposed_bufs,
+                stream,
+            )?;
+        } else {
+            // Source is already in FLA layout, write directly to the batch slot
+            HipState::write_batch_wkv(
+                &mut self.scratch.wkv_state_gpu,
+                batch_idx,
+                batch_size,
+                &state.att_states,
+                stream,
+            )?;
+        }
+
+        stream.synchronize()?;
+        Ok(())
+    }
+
     /// Load state from a CPU-side `HipState` into the GPU scratch.
     ///
     /// Copies all per-layer state tensors (att_shift, ffn_shift, wkv_state)
