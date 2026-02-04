@@ -486,8 +486,9 @@ impl HipRuntime {
 
     /// Extract per-batch outputs based on RnnOption (Last vs Full).
     ///
-    /// Uses the redirect information to slice the flat logits tensor
-    /// into per-batch outputs with the correct shapes.
+    /// First applies the redirect header selection to gather the relevant
+    /// token positions from the raw logits tensor, then slices the gathered
+    /// result into per-batch outputs using the redirect output ranges.
     fn extract_rnn_outputs(
         &self,
         logits: &TensorCpu<f32>,
@@ -496,6 +497,16 @@ impl HipRuntime {
         let vocab_size = self.model.info.n_vocab;
         let data = logits.data();
 
+        // Step 1: Gather header-selected logits into a contiguous buffer.
+        // redirect.headers contains input positions to include in output;
+        // redirect.outputs contains ranges into this gathered buffer.
+        let mut selected = Vec::with_capacity(redirect.headers.len() * vocab_size);
+        for &pos in &redirect.headers {
+            let start = pos * vocab_size;
+            selected.extend_from_slice(&data[start..start + vocab_size]);
+        }
+
+        // Step 2: Slice the gathered buffer by per-batch output ranges.
         let mut outputs = Vec::with_capacity(redirect.outputs.len());
         for (out_start, out_end) in &redirect.outputs {
             let num_out_tokens = out_end - out_start;
@@ -506,10 +517,9 @@ impl HipRuntime {
                         .map_err(|e| RuntimeError::TensorError(e))?,
                 ));
             } else {
-                // Extract logits for this batch's output tokens
                 let start = out_start * vocab_size;
                 let end = out_end * vocab_size;
-                let batch_logits = data[start..end].to_vec();
+                let batch_logits = selected[start..end].to_vec();
                 outputs.push(RnnOutputBatch(
                     TensorInit::from_data(
                         Shape::new(vocab_size, num_out_tokens, 1, 1),
@@ -527,15 +537,6 @@ impl HipRuntime {
     /// Processes one chunk of tokens from the input, returning the remaining
     /// input and the output for this chunk.
     fn infer_rnn(&self, mut input: RnnInput) -> Result<(RnnInput, RnnOutput), RuntimeError> {
-        // 0. Pad empty batches with a single token so they participate in
-        //    chunking and redirect calculation. Must happen before iter/chunk
-        //    so the chunk info, redirect, and actual tokens stay consistent.
-        for batch in &mut input.batches {
-            if batch.tokens.is_empty() {
-                batch.tokens.push(Token::Token(0));
-            }
-        }
-
         // 1. Get chunk info - if None, input is exhausted
         let Some(info) = input.iter().next() else {
             return Err(RuntimeError::InputExhausted);
@@ -565,9 +566,7 @@ impl HipRuntime {
         let token_refs: Vec<&[u32]> = token_vecs.iter().map(|v| v.as_slice()).collect();
 
         // 4. Run step (infer takes &self, uses Mutex internally)
-        let logits_tensor = self.infer(&token_refs).map_err(|e| {
-            eprintln!("infer_rnn: infer() failed: {:?}", e);
-            eprintln!("  token_refs lengths: {:?}", token_refs.iter().map(|s| s.len()).collect::<Vec<_>>());
+        let logits_tensor = self.infer(&token_refs).map_err(|_| {
             RuntimeError::TensorError(TensorError::new(TensorErrorKind::Deduce))
         })?;
 
